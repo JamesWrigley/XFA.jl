@@ -18,4 +18,5 @@ UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
+InterProcessCommunication = "0.1"
 julia = "1.7"
