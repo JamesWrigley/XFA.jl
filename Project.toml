@@ -19,4 +19,5 @@ ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
 InterProcessCommunication = "0.1"
+JET = "0.6"
 julia = "1.7"
