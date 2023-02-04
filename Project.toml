@@ -20,4 +20,5 @@ ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 [compat]
 GLMakie = "0.7"
 InterProcessCommunication = "0.1"
+JET = "0.7"
 julia = "1.7"
