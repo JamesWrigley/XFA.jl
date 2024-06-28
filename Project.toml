@@ -22,7 +22,7 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
-CImGui = "~1.89"
+CImGui = "~1.89, 2"
 HTTP = "1"
 ImGuiGLFWBackend = "0.2"
 ImGuiOpenGLBackend = "0.2"
