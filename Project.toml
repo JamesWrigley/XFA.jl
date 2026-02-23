@@ -29,7 +29,7 @@ XfaEngine = {path = "XfaEngine"}
 [compat]
 CImGui = "7"
 CRC32c = "1"
-DimensionalData = "0.29.13"
+DimensionalData = "0.29.13, 0.30"
 GLFW = "3"
 GeometryBasics = "0.5.5"
 HTTP = "1"
