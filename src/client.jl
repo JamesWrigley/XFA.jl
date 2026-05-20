@@ -57,6 +57,12 @@ function ssh_initialize(state::GuiState)
     ssh_initialize_hop(state, 1, user)
 end
 
+# Pin every SSH session's actor + fd poller to one dedicated default-pool
+# thread so their per-poll notify/wait handshake stays thread-local instead of
+# thrashing the cross-thread scheduler. The last default thread tends to be
+# quieter than the first, which GUI/engine work lands on.
+ssh_pin_tid() = first(Threads.threadpooltids(:default))
+
 function ssh_initialize_hop(state, hop_idx, user)
     client = state.client
     ssh_state = client.ssh_hops[hop_idx]
@@ -65,14 +71,16 @@ function ssh_initialize_hop(state, hop_idx, user)
     if !isnothing(forwarder_idx) # hop_idx > firstindex(client.ssh_hops)
         # Connect to the forwarded port 22
         forwarder = client.ssh_hops[forwarder_idx].forwarder
-        session = ssh.Session(forwarder.localinterface, forwarder.localport; user)
+        session = ssh.Session(forwarder.localinterface, forwarder.localport;
+                               user, pin_tid=ssh_pin_tid())
 
         # Reset the host so that GSSAPI auth works
         session.host = ssh_state.address
 
         ssh_state.session = session
     else
-        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port; user)
+        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port;
+                                        user, pin_tid=ssh_pin_tid())
     end
 
     ssh_authenticate_hop(state, hop_idx)
