@@ -929,12 +929,13 @@ function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
             delete!(plot.pending_roi_updates, param_name)
         end
 
-        # Label above the top-left corner. In image plots y_max is the top, so
-        # the ROI top edge is at max(y1, y2). PlotText centers on (x, y), so
-        # shift right by half the text width to left-align at xlo, and up by
-        # half a line so the text sits above the rect.
+        # Label above the top-left corner. Image plots invert the Y axis so
+        # y_min is the top, meaning the ROI top edge is at min(y1, y2).
+        # PlotText centers on (x, y), so shift right by half the text width to
+        # left-align at xlo, and up by half a line so the text sits above the
+        # rect.
         xlo = min(x1[], x2[])
-        ytop = max(y1[], y2[])
+        ytop = min(y1[], y2[])
         base_size = unsafe_load(ig.GetStyle()).FontSizeBase
         ig.PushFont(C_NULL, base_size * 2)
         text_size = ig.CalcTextSize(param_name)
@@ -1051,11 +1052,14 @@ function draw_plot(plot::Plot, store, was_updated)
 
             plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
             if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
-                ImPlot.SetupAxes(store.xlabel, store.ylabel)
+                ImPlot.SetupAxis(ImPlot.ImAxis_X1, store.xlabel)
+                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel, ImPlot.ImPlotAxisFlags_Invert)
                 tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
                 # Matplotlib convention: first dim = row (vertical, top→bottom),
                 # second dim = col (horizontal, left→right). data[1,1] at plot
-                # top-left; data[rows,cols] at plot bottom-right.
+                # top-left; data[rows,cols] at plot bottom-right. Y axis is
+                # inverted so y_min sits at the top — pass swapped y bounds so
+                # the texture's data[1,:] row stays at the top.
                 has_x_axis = !isnothing(store.x_axis)
                 has_y_axis = !isnothing(store.y_axis)
                 x_min = has_x_axis ? first(store.x_axis) : 0
@@ -1063,8 +1067,8 @@ function draw_plot(plot::Plot, store, was_updated)
                 y_min = has_y_axis ? first(store.y_axis) : 0
                 y_max = has_y_axis ? last(store.y_axis) : rows
                 ImPlot.PlotImage("", tex_ref,
-                                 ImPlot.ImPlotPoint(x_min, y_min),
-                                 ImPlot.ImPlotPoint(x_max, y_max))
+                                 ImPlot.ImPlotPoint(x_min, y_max),
+                                 ImPlot.ImPlotPoint(x_max, y_min))
 
                 draw_roi_overlays(plot, x_min, x_max, y_min, y_max)
 
@@ -1072,7 +1076,7 @@ function draw_plot(plot::Plot, store, was_updated)
                 if ImPlot.IsPlotHovered()
                     mouse = ImPlot.GetPlotMousePos()
                     j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
-                    i = floor(Int, (y_max - mouse.y) / (y_max - y_min) * rows) + 1
+                    i = floor(Int, (mouse.y - y_min) / (y_max - y_min) * rows) + 1
                     if 1 <= i <= rows && 1 <= j <= cols
                         val = data[i, j]
                         ImPlot.AnnotationClamped(mouse.x, mouse.y,
