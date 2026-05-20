@@ -1362,6 +1362,12 @@ end
 
 """Start the XFA GUI."""
 function main(; test_engine=nothing)
+    # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
+    # point it at the system.
+    if !haskey(ENV, "XCURSOR_PATH")
+        ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
+    end
+
     gui_state = GuiState(load_settings())
 
     # Setup Dear ImGui context
