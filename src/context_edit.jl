@@ -40,21 +40,24 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
     return source
 end
 
-function rename_variable(state, old_name::String, new_name::String)
+# Apply a source transformation to the loaded context file. `transform` takes
+# the current source and returns the modified source (or the same source if
+# nothing changed). On change, writes the result to the context file and either
+# reloads the context or just updates the in-memory source.
+function apply_source_edit(state, transform; reload::Bool=true)
     client = state.client
     source = client.context.source
 
     if isempty(source)
-        @error "No context source available for renaming"
+        @error "No context source available for editing"
         return
     end
 
-    new_source = replace_variable_name(source, old_name, new_name)
+    new_source = transform(source)
     if new_source == source
         return
     end
 
-    # Write modified file back to server
     if client.embedded_engine
         write(client.context_path, new_source)
     else
@@ -63,9 +66,15 @@ function rename_variable(state, old_name::String, new_name::String)
         end
     end
 
-    # Reload the context
-    load_context(state)
+    if reload
+        load_context(state)
+    else
+        client.context.source = new_source
+    end
 end
+
+rename_variable(state, old_name::String, new_name::String) =
+    apply_source_edit(state, s -> replace_variable_name(s, old_name, new_name))
 
 """
 Find all descendant nodes matching a predicate.
@@ -312,6 +321,44 @@ function replace_constructor_kwarg(source::String, var_name::String,
     return source[1:first(br)-1] * new_value * source[last(br)+1:end]
 end
 
+# Format a parameter value as its Julia source representation for embedding as
+# a group constructor kwarg value or a Parameter positional argument. Returns
+# nothing for value types that aren't persistable to source.
+format_param_value(s::String) = "\"$(escape_string(s))\""
+format_param_value(roi::RectROI) =
+    "RectROI($(roi.corner_x), $(roi.corner_y), $(roi.width), $(roi.height))"
+format_param_value(_) = nothing
+
+# Replace the first positional argument of a `name = Parameter(...)` assignment.
+# Used for top-level parameters declared like `roi = Parameter(RectROI())`.
+function replace_parameter_value(source::String, var_name::String, new_value::String)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    assign_node = find_assignment_call(tree, var_name)
+    if isnothing(assign_node)
+        @warn "Could not find Parameter assignment for '$(var_name)'"
+        return source
+    end
+
+    call_node = children(assign_node)[2]
+    cs = children(call_node)
+    # cs[1] is the callee; the first non-parameters child after it is the
+    # positional value we want to replace.
+    arg_node = nothing
+    for c in cs[2:end]
+        if kind(c) != K"parameters"
+            arg_node = c
+            break
+        end
+    end
+    if isnothing(arg_node)
+        @warn "Parameter assignment for '$(var_name)' has no positional argument"
+        return source
+    end
+
+    br = byte_range(arg_node)
+    return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+end
+
 # Replace a dependency inside a group constructor's keyword argument.
 # Handles patterns like: `my_group = Foo(; x=karabo"A/B.prop")`
 function replace_group_dep(source::String, group_name::String,
@@ -320,58 +367,13 @@ function replace_group_dep(source::String, group_name::String,
                               parameter_dep_to_source(new_dep))
 end
 
-function set_group_param(state, var_name::String, kwarg_name::String, new_value::String;
-                         reload::Bool=true)
-    client = state.client
-    source = client.context.source
+set_group_param(state, var_name::String, kwarg_name::String, new_value::String; reload::Bool=true) =
+    apply_source_edit(state, s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value);
+                      reload)
 
-    if isempty(source)
-        @error "No context source available for editing"
-        return
-    end
-
-    new_source = replace_constructor_kwarg(source, var_name, kwarg_name, new_value)
-    if new_source == source
-        return
-    end
-
-    if client.embedded_engine
-        write(client.context_path, new_source)
-    else
-        open(client.context_path, client.sftp; write=true) do f
-            write(f, new_source)
-        end
-    end
-
-    if reload
-        load_context(state)
-    else
-        client.context.source = new_source
-    end
-end
+set_parameter_value(state, var_name::String, new_value::String; reload::Bool=true) =
+    apply_source_edit(state, s -> replace_parameter_value(s, var_name, new_value); reload)
 
 # Replace a dependency (Karabo or variable) in the source code and reload.
-function rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency)
-    client = state.client
-    source = client.context.source
-
-    if isempty(source)
-        @error "No context source available for editing"
-        return
-    end
-
-    new_source = replace_dep(source, variable_name, arg_name, new_dep)
-    if new_source == source
-        return
-    end
-
-    if client.embedded_engine
-        write(client.context_path, new_source)
-    else
-        open(client.context_path, client.sftp; write=true) do f
-            write(f, new_source)
-        end
-    end
-
-    load_context(state)
-end
+rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency) =
+    apply_source_edit(state, s -> replace_dep(s, variable_name, arg_name, new_dep))

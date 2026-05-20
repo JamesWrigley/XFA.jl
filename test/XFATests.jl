@@ -347,6 +347,44 @@ end
         end
     end
 
+    @testset "Edit RectROI parameter" begin
+        roi = XFA.XfaEngine.Context.RectROI(1.5, 2.5, 10.0, 20.0)
+        @test XFA.format_param_value(roi) == "RectROI(1.5, 2.5, 10.0, 20.0)"
+
+        # Top-level `roi = Parameter(RectROI())` assignment
+        source = """
+        roi = Parameter(RectROI())
+        """
+        @test XFA.replace_parameter_value(source, "roi", XFA.format_param_value(roi)) == """
+        roi = Parameter(RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Replaces the existing value, preserving the Parameter wrapper
+        source = """
+        roi = Parameter(RectROI(0.0, 0.0, 1.0, 1.0))
+        """
+        @test XFA.replace_parameter_value(source, "roi", XFA.format_param_value(roi)) == """
+        roi = Parameter(RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Inside a group constructor as a kwarg
+        source = """
+        my_group = MyGroup(; roi=RectROI())
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "roi",
+                                            XFA.format_param_value(roi)) == """
+        my_group = MyGroup(; roi=RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Missing assignment returns source unchanged with a warning
+        source = """
+        other = Parameter(RectROI())
+        """
+        @test_logs (:warn, r"Could not find Parameter assignment.*") begin
+            @test XFA.replace_parameter_value(source, "roi", "RectROI(1.0, 2.0, 3.0, 4.0)") == source
+        end
+    end
+
     @testset "Edit string group parameter" begin
         # Replace an existing string kwarg on a generic group constructor
         source = """

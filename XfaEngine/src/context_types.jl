@@ -70,6 +70,39 @@ group_parameter_dependency(group_type::String, parameter::String) = Dependency(k
 abstract type AbstractPostprocessor end
 function default_name end
 
+# Rectangular region-of-interest, used as a Parameter value type. The GUI
+# overlays a `RectROI`-valued Parameter on its variable's image plot when the
+# variable declares it via `@display`.
+struct RectROI
+    corner_x::Float64
+    corner_y::Float64
+    width::Float64
+    height::Float64
+end
+
+# Zero-initialized ROI; the GUI treats all-zero as uninitialized and picks a
+# default extent based on the image being plotted.
+RectROI() = RectROI(0.0, 0.0, 0.0, 0.0)
+
+Base.isassigned(roi::RectROI) = !(roi.corner_x == 0 && roi.corner_y == 0 && roi.width == 0 && roi.height == 0)
+
+function (r::RectROI)(image::AbstractMatrix)
+    corner_x = round(Int, r.corner_x)
+    corner_y = round(Int, r.corner_y)
+    width = round(Int, r.width)
+    height = round(Int, r.height)
+
+    x_range = axes(image, 2)
+    y_range = axes(image, 1)
+
+    min_x = clamp(corner_x, x_range)
+    max_x = clamp(min_x + width, x_range)
+    min_y = clamp(corner_y, y_range)
+    max_y = clamp(min_y + height, y_range)
+
+    @view image[min_y:max_y, min_x:max_x]
+end
+
 struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
 end
@@ -269,6 +302,9 @@ function _variable_reference(new_name, ref_expr, side_effects)
         Context.variable_postprocessors(::typeof($new_name)) = [(replace(pp[1], $orig_name_str => $new_name_str, count=1), pp[2])
                                                                 for pp in Context.variable_postprocessors($orig_func_expr)]
     end
+    displays_code = quote
+        Context.variable_displays(::typeof($new_name)) = Context.variable_displays($orig_func_expr)
+    end
 
     return esc(quote
         function $new_name(args...)
@@ -280,6 +316,7 @@ function _variable_reference(new_name, ref_expr, side_effects)
             $deps_code
             $subvars_code
             $postprocessors_code
+            $displays_code
         end
     end)
 end
@@ -323,13 +360,28 @@ function _variable(ctx_module, expr, side_effects)
         # Extract dependency information
         dependencies, new_args = _parse_function_args(args)
 
-        # Look through the body for @add_subvariable and @postprocess
-        # calls to register them. Only toplevel calls are allowed. Note that
-        # we capture the macro name and check it explicitly because MacroTools
-        # doesn't handle the underscore in the name properly.
+        # Identify the first typed arg, which (per _parse_function_args) is
+        # treated as a group binding. Its name lets @display g.field resolve
+        # to the right group type.
+        group_arg_name = nothing
+        group_type_name = nothing
+        for arg in args
+            if @capture(arg, (::T_) | (arg_name_::T_))
+                group_arg_name = isnothing(arg_name) ? nothing : string(arg_name)
+                group_type_name = string(T)
+                break
+            end
+        end
+
+        # Look through the body for @add_subvariable, @postprocess, and
+        # @display calls to register them. Only toplevel calls are allowed.
+        # Note that we capture the macro name and check it explicitly because
+        # MacroTools doesn't handle the underscore in the name properly.
         subvariables = String[]
         postprocessors = []  # (name_expr, pp_expr) tuples
         postprocessor_indices = Int[]
+        displays = String[]  # fully-qualified parameter names
+        display_indices = Int[]
         for (i, body_expr) in enumerate(body.args)
             if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
@@ -340,6 +392,18 @@ function _variable(ctx_module, expr, side_effects)
             elseif @capture(body_expr, @macroname_(pp_expr_)) && macroname == Symbol("@postprocess")
                 push!(postprocessors, (nothing, pp_expr))
                 push!(postprocessor_indices, i)
+            elseif @capture(body_expr, @macroname_(disp_expr_)) && macroname == Symbol("@display")
+                push!(display_indices, i)
+                if @capture(disp_expr, head_.tail_)
+                    if isnothing(group_arg_name) || string(head) != group_arg_name
+                        throw(ArgumentError("@display: '$(head)' is not the group argument of this @Variable"))
+                    end
+                    push!(displays, "$(group_type_name).$(tail)")
+                elseif disp_expr isa Symbol
+                    push!(displays, string(disp_expr))
+                else
+                    throw(ArgumentError("@display takes a parameter name or group.field, got: $(disp_expr)"))
+                end
             end
         end
 
@@ -353,8 +417,8 @@ function _variable(ctx_module, expr, side_effects)
             body_expr
         end
 
-        # Strip @postprocess calls from the body (they're metadata, not runtime code)
-        deleteat!(body.args, postprocessor_indices)
+        # Strip @postprocess and @display calls from the body (they're metadata, not runtime code)
+        deleteat!(body.args, sort!(vcat(postprocessor_indices, display_indices)))
 
         # Build the postprocessors expression. Each entry evaluates the
         # constructor once, then resolves the name — either from the
@@ -371,6 +435,7 @@ function _variable(ctx_module, expr, side_effects)
         # get interpolated/evaluated properly.
         dependencies_expr = Expr(:vect, dependencies...)
         subvariables_expr = Expr(:vect, subvariables...)
+        displays_expr = Expr(:vect, displays...)
         new_function = quote
             function $func_name($(new_args...))
                 $body
@@ -380,6 +445,7 @@ function _variable(ctx_module, expr, side_effects)
                 Context.variable_dependencies(::typeof($func_name)) = $dependencies_expr
                 Context.variable_subvariables(::typeof($func_name)) = $subvariables_expr
                 Context.variable_postprocessors(::typeof($func_name)) = $postprocessors_expr
+                Context.variable_displays(::typeof($func_name)) = $displays_expr
             end
         end
 
@@ -413,6 +479,10 @@ end
 
 macro postprocess(args...)
     error("The @postprocess macro may only be used inside of a @Variable block.")
+end
+
+macro display(args...)
+    error("The @display macro may only be used inside of a @Variable block.")
 end
 
 """
