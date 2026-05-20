@@ -1008,6 +1008,7 @@ function draw_plots()
         end
 
         new_tids = Set{Int}()
+        latest_array = nothing  # (tid, payload) — only the last array frame is kept
         while isready(store.updates)
             tid, x, type = take!(store.updates)
             push!(new_tids, tid)
@@ -1024,12 +1025,30 @@ function draw_plots()
                 end
                 push!(store.data, x)
                 push!(store.scalar_tids, tid)
-            elseif x isa AbstractArray
-                store.data = x
-                store.trainId = tid
-                if !isnothing(store.scalar_tids)
-                    empty!(store.scalar_tids)
+            else
+                # Arrays are latest-wins: discard intermediate frames and
+                # decompress only the most recent one after the loop.
+                latest_array = (tid, x)
+            end
+        end
+
+        if !isnothing(latest_array)
+            tid, x = latest_array
+            if x isa CompressedArray
+                ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
+                out = store.data
+                if out isa Array && eltype(out) === x.original_eltype && size(out) == Tuple(x.shape)
+                    decompress_array!(ws, out, x)
+                else
+                    out = decompress_array(ws, x)
                 end
+                store.data = out
+            else
+                store.data = x
+            end
+            store.trainId = tid
+            if !isnothing(store.scalar_tids)
+                empty!(store.scalar_tids)
             end
         end
 
@@ -1416,6 +1435,7 @@ function main(; test_engine=nothing)
         empty!(safe_input_text_cache)
         close(gui_state)
     end
+
     t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
