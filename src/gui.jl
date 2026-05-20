@@ -480,7 +480,7 @@ function draw_variable(name, var_data)
 
         if !isempty(label)
             if haskey(client.variable_data, output_name)
-                if plot_button("$(label)###plot_button", output_name)
+                if plot_button("$(label)###$(output_name)-plot_button", output_name)
                     push!(client.plots, Plot(output_name, client.plot_counter))
                     client.plot_counter += 1
                 end
