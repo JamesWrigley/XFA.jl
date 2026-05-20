@@ -369,8 +369,9 @@ function restart_engine(state)
     initialize_engine(state)
 end
 
-# Create a Int32 hash to use for ImNodes
-node_hash(x) = reinterpret(Cint, crc32c(x))
+# Create an Int32 hash, used for ImNodes ids and ImPlot drag-tool ids
+int32_hash(x) = reinterpret(Cint, crc32c(x))
+int32_hash(x, y) = reinterpret(Cint, crc32c(y, crc32c(x)))
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
@@ -393,7 +394,7 @@ function build_context_state(state, ctx_info)
             continue
         end
 
-        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
 
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
@@ -403,16 +404,16 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
 
         for dep_pair in deps
-            attr_id = node_hash("$(name).dependencies.$(dep_pair)")
+            attr_id = int32_hash("$(name).dependencies.$(dep_pair)")
             push!(ctx_state[name]["dependencies"], (attr_id, dep_pair))
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], OutputPin(node_hash("$(name).outputs."), ""))
+        push!(ctx_state[name]["outputs"], OutputPin(int32_hash("$(name).outputs."), ""))
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
-            subvar_id = node_hash("$(name).outputs.$(subvar)")
+            subvar_id = int32_hash("$(name).outputs.$(subvar)")
             if subvar in pp_names
                 pp_prefix = "$(subvar)."
                 pp_params = Dict{String, Any}()
@@ -439,7 +440,7 @@ function build_context_state(state, ctx_info)
     for name in ctx_info["groups"]
         group_filter = startswith("$(name).")
 
-        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :group
@@ -469,7 +470,7 @@ function build_context_state(state, ctx_info)
                 if dep isa Parameter
                     continue
                 end
-                attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
+                attr_id = int32_hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
                 field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
                 if !isnothing(field_name)
@@ -485,7 +486,7 @@ function build_context_state(state, ctx_info)
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
-            push!(ctx_state[name]["outputs"], OutputPin(node_hash(input_name), stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(int32_hash(input_name), stripped_name))
         end
 
         # Add group variables from the DAG as outputs
@@ -496,12 +497,12 @@ function build_context_state(state, ctx_info)
             stripped_name = chopprefix(var_name, "$(name).")
 
             # The variable itself
-            attr_id = node_hash("$(var_name).outputs.")
+            attr_id = int32_hash("$(var_name).outputs.")
             push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
 
             # Its subvariables
             for subvar in ctx_info["subvariables"][var_name]
-                subvar_id = node_hash("$(var_name).outputs.$(subvar)")
+                subvar_id = int32_hash("$(var_name).outputs.$(subvar)")
                 push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
@@ -523,9 +524,9 @@ function build_context_state(state, ctx_info)
         end
 
         if !haskey(ctx_info, name)
-            ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+            ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
             ctx_state[name]["dependencies"] = []
-            ctx_state[name]["outputs"] = [OutputPin(node_hash(name), name)]
+            ctx_state[name]["outputs"] = [OutputPin(int32_hash(name), name)]
             ctx_state[name]["type"] = :input
             ctx_state[name]["links"] = LinkInfo[]
         end
@@ -544,18 +545,18 @@ function build_context_state(state, ctx_info)
                 continue
             end
 
-            link_end_id = node_hash("$(name).dependencies.$(arg_name => dep)")
+            link_end_id = int32_hash("$(name).dependencies.$(arg_name => dep)")
 
             if dep isa Dependency && dep.kind == DepKind_Variable
                 if is_group_var(dep.name)
                     # Link from the group node's output pin for this variable
-                    link_start_id = node_hash("$(dep.name).outputs.")
+                    link_start_id = int32_hash("$(dep.name).outputs.")
                     dep_node = group_of(dep.name)
                 else
                     link_start_id = ctx_state[dep.name]["outputs"][1].id
                     dep_node = dep.name
                 end
-                link_id = node_hash("$(link_start_id)->$(link_end_id)")
+                link_id = int32_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 if dep_node != node_name
@@ -563,8 +564,8 @@ function build_context_state(state, ctx_info)
                 end
             elseif dep isa Dependency && dep.kind == DepKind_Karabo
                 input_name = ctx_info["dep_to_input"][dep.name]
-                link_start_id = node_hash(input_name)
-                link_id = node_hash("$(link_start_id)->$(link_end_id)")
+                link_start_id = int32_hash(input_name)
+                link_id = int32_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 input_node_name = split(input_name, ".")[1]
@@ -610,6 +611,11 @@ function build_context_state(state, ctx_info)
             state.client.parameter_states[param_name] = OptionalDimsState(param)
         end
     end
+
+    # Mirror the engine's parameter dict and @display map onto the client
+    # context so plot overlays can look up referenced parameters by name.
+    state.client.context.parameters = Dict{String, Parameter}(ctx_info["parameters"])
+    state.client.context.displays = Dict{String, Vector{String}}(get(ctx_info, "displays", Dict{String, Vector{String}}()))
 
     return ctx_state
 end
@@ -776,7 +782,7 @@ function store_variable_data!(client, variable::VariableData)
     store.received_bytes = received_bytes
 end
 
-@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor
+@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor ParameterOwner_Global
 
 struct ParameterOwner
     kind::ParameterOwnerKind
@@ -806,6 +812,11 @@ function find_parameter_owner(client, param_name::String)
                 end
             end
         end
+    end
+    # Top-level `name = Parameter(...)` — present in context.parameters but not
+    # nested under any group or postprocessor.
+    if haskey(client.context.parameters, param_name) && !occursin('.', param_name)
+        return ParameterOwner(ParameterOwner_Global, param_name, nothing, param_name)
     end
     return nothing
 end
@@ -910,6 +921,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
     elseif msg isa ParameterChanged
         param = msg.parameter
+        # Top-level dict covers globals (which aren't attached to any node).
+        # Group/postprocessor params share instances with the node dicts, so
+        # the walk below still updates them.
+        if haskey(client.context.parameters, param.name)
+            client.context.parameters[param.name].value = param.value
+        end
         # The same parameter may appear under a node's "parameters" dict (group
         # params) or inside a postprocessor's `params`. Walk every node and
         # update wherever the full name matches.
@@ -937,9 +954,13 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
 
         if client.pending_source_edit == param.name
             owner = find_parameter_owner(client, param.name)
-            if !isnothing(owner) && owner.kind == ParameterOwner_Group && param.value isa String
-                set_group_param(state, owner.var_name, owner.field_name,
-                                "\"$(escape_string(param.value))\""; reload=false)
+            new_value = isnothing(owner) ? nothing : format_param_value(param.value)
+            if !isnothing(new_value)
+                if owner.kind == ParameterOwner_Group
+                    set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)
+                elseif owner.kind == ParameterOwner_Global
+                    set_parameter_value(state, owner.var_name, new_value; reload=false)
+                end
             end
             client.pending_source_edit = nothing
         end

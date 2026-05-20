@@ -214,6 +214,13 @@ OutputPin(id, label) = OutputPin(id, label, false)
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 
+    # All parameters in the loaded context, keyed by fully-qualified name.
+    # Used by plot overlays to look up @display references without walking
+    # context_state. ParameterChanged messages mutate the shared values.
+    parameters::Dict{String, Parameter} = Dict()
+    # Variable name -> list of parameter names to overlay on its plot.
+    displays::Dict{String, Vector{String}} = Dict()
+
     # Latest per-channel (drops, size, capacity) snapshot from the engine,
     # keyed by (producer, consumer). Updated roughly once per second.
     channel_stats::Dict{Tuple{String, String}, XfaEngine.Context.ChannelStat} = Dict()

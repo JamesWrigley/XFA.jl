@@ -606,6 +606,11 @@ end
 
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
     dock_id::UInt32 = 0
+
+    # ROI parameter values updated locally during a drag, keyed by parameter
+    # name. Flushed to the engine when the user releases the mouse so we don't
+    # flood it with per-frame updates.
+    const pending_roi_updates::Dict{String, RectROI} = Dict{String, RectROI}()
 end
 
 Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
@@ -856,6 +861,91 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
     return changed
 end
 
+# Color palette cycled through when a plot has multiple ROI overlays.
+const ROI_COLORS = ImVec4[
+    ImVec4(1.00, 1.00, 1.00, 1.0),  # white
+    ImVec4(1.00, 0.20, 0.40, 1.0),  # red
+    ImVec4(1.00, 0.55, 0.20, 1.0),  # orange
+    ImVec4(1.00, 0.30, 0.85, 1.0),  # magenta
+    ImVec4(1.00, 0.65, 0.75, 1.0),  # salmon pink
+    ImVec4(0.75, 0.20, 1.00, 1.0),  # violet
+    ImVec4(0.85, 0.10, 0.10, 1.0),  # crimson
+    ImVec4(0.95, 0.75, 0.60, 1.0),  # peach
+    ImVec4(0.60, 0.30, 0.20, 1.0),  # brown
+    ImVec4(0.20, 0.20, 0.20, 1.0),  # near-black
+]
+
+# Treat an all-zero RectROI as uninitialized and seed a centered default
+# covering 1/4 of the visible area.
+function default_roi(x_min, x_max, y_min, y_max, idx=1)
+    w = (x_max - x_min) / 2
+    h = (y_max - y_min) / 2
+    cx = (x_min + x_max) / 2
+    cy = (y_min + y_max) / 2
+    # Stagger successive ROIs diagonally so they don't fully overlap.
+    step = (idx - 1) * 0.05
+    dx = (x_max - x_min) * step
+    dy = (y_max - y_min) * step
+    RectROI(cx - w / 2 + dx, cy - h / 2 + dy, w, h)
+end
+
+# Draw any RectROI parameters associated with `plot.name` via @display as
+# draggable rectangles on top of the image, with the parameter name labelled
+# above the top-left corner. Sends a ChangeParameter when the user drags.
+function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
+    client = state[].client
+    displays = get(client.context.displays, plot.name, String[])
+    for (idx, param_name) in enumerate(displays)
+        param = get(client.context.parameters, param_name, nothing)
+        if isnothing(param) || !(param.value isa RectROI)
+            continue
+        end
+        roi = param.value
+        if !isassigned(roi)
+            roi = default_roi(x_min, x_max, y_min, y_max, idx)
+        end
+        x1 = Ref(Cdouble(roi.corner_x))
+        y1 = Ref(Cdouble(roi.corner_y))
+        x2 = Ref(Cdouble(roi.corner_x + roi.width))
+        y2 = Ref(Cdouble(roi.corner_y + roi.height))
+        col = ROI_COLORS[mod1(idx, length(ROI_COLORS))]
+        rect_col = ImVec4(col.x, col.y, col.z, 0.75)
+        id = int32_hash(plot.id, param_name)
+        held = Ref(false)
+
+        if ImPlot.DragRect(id, x1, y1, x2, y2, rect_col, 0, C_NULL, C_NULL, held)
+            xlo, xhi = minmax(x1[], x2[])
+            ylo, yhi = minmax(y1[], y2[])
+            new_roi = RectROI(xlo, ylo, xhi - xlo, yhi - ylo)
+            if new_roi != param.value
+                param.value = new_roi
+                plot.pending_roi_updates[param_name] = new_roi
+            end
+        end
+
+        if !held[] && haskey(plot.pending_roi_updates, param_name)
+            client.pending_source_edit = param_name
+            change_parameter(Parameter(param_name, plot.pending_roi_updates[param_name]))
+            delete!(plot.pending_roi_updates, param_name)
+        end
+
+        # Label above the top-left corner. In image plots y_max is the top, so
+        # the ROI top edge is at max(y1, y2). PlotText centers on (x, y), so
+        # shift right by half the text width to left-align at xlo, and up by
+        # half a line so the text sits above the rect.
+        xlo = min(x1[], x2[])
+        ytop = max(y1[], y2[])
+        base_size = unsafe_load(ig.GetStyle()).FontSizeBase
+        ig.PushFont(C_NULL, base_size * 2)
+        text_size = ig.CalcTextSize(param_name)
+        ImPlot.PushStyleColor(ImPlot.ImPlotCol_InlayText, col)
+        ImPlot.PlotText(param_name, Cdouble(xlo), Cdouble(ytop),
+                        ImVec2(text_size.x / 2, -text_size.y / 2 - 2))
+        ImPlot.PopStyleColor()
+        ig.PopFont()
+    end
+end
+
 function draw_plot(plot::Plot, store::Nothing, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
@@ -975,6 +1065,8 @@ function draw_plot(plot::Plot, store, was_updated)
                 ImPlot.PlotImage("", tex_ref,
                                  ImPlot.ImPlotPoint(x_min, y_min),
                                  ImPlot.ImPlotPoint(x_max, y_max))
+
+                draw_roi_overlays(plot, x_min, x_max, y_min, y_max)
 
                 # Show pixel coordinates and intensity when hovering
                 if ImPlot.IsPlotHovered()

@@ -1,8 +1,9 @@
 module Context
 
-export @karabo_str, @Variable, @Input, @Group, @add_subvariable, Parameter, tryset, KaraboDevice,
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
-    karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency
+    karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
+    RectROI
 
 import Base.ScopedValues: @with
 
@@ -45,6 +46,7 @@ function input_dependencies end
 function group_fields end
 variable_subvariables(_) = String[]
 variable_postprocessors(_) = VariablePostprocessor[]
+variable_displays(_) = String[]
 
 # Returns the topic served by an input group, or nothing for generic inputs
 input_topic(::Any) = nothing
@@ -106,6 +108,9 @@ end
     dag::Dict{String, OrderedDict} = Dict()
     subvariables::Dict{String, Vector{String}} = Dict()
     variable_postprocessors::Dict{String, Vector{String}} = Dict()
+    # Variable name -> list of fully-qualified parameter names to overlay
+    # on the variable's plot. Populated from @display declarations.
+    displays::Dict{String, Vector{String}} = Dict()
     postprocessors::Dict{String, AbstractPostprocessor} = Dict()
     parameters::Dict{String, Parameter} = Dict()
     exprs::Vector{Expr} = Expr[]
@@ -373,6 +378,7 @@ function to_dict(ctx::XfaContext)
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
+                "displays" => ctx.displays,
                 "parameters" => parameters,
                 "inputs" => inputs,
                 "groups" => groups,
@@ -1284,10 +1290,39 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules
         worker_state.task_locks[name] = ReentrantLock()
     end
 
+    # Resolve @display references to fully-qualified parameter names. A
+    # reference with a dot ("GroupType.field") names a group field and is
+    # mapped to the instantiated group: variables in a group are named
+    # "$group_name.$func_name", so we use the variable's group_name prefix.
+    # A reference without a dot is a top-level Parameter binding name.
+    ctx_displays = Dict{String, Vector{String}}()
+    for var_name in keys(dag)
+        refs = variable_displays(functions[var_name])
+        if isempty(refs)
+            continue
+        end
+        resolved = String[]
+        for ref in refs
+            param_name = if occursin('.', ref)
+                _, field = split(ref, '.'; limit=2)
+                group_name, _ = split(var_name, '.'; limit=2)
+                "$(group_name).$(field)"
+            else
+                ref
+            end
+            if !haskey(parameters, param_name)
+                throw(XfaContextException("@display references unknown parameter '$(param_name)' (from '$(ref)' on variable '$(var_name)')"))
+            end
+            push!(resolved, param_name)
+        end
+        ctx_displays[var_name] = resolved
+    end
+
     ctx = XfaContext(; functions, group_types, groups, dag,
                      subvariables=ctx_subvariables,
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
+                     displays=ctx_displays,
                      parameters, exprs, inputs)
     ctx.dep_to_input = build_dep_routing(ctx, routing_rules)
     return ctx

@@ -1,3 +1,4 @@
+using Printf: @sprintf
 import Base.ScopedValues: ScopedValue, @with
 
 using CImGui: CImGui as ig, ImVec2, ImVec4, IM_COL32
@@ -11,7 +12,8 @@ include("imnodes.jl")
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer
-using Printf: @sprintf
+using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
+    ArrayMetadata, RectROI
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -19,8 +21,6 @@ using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
-using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
-    ArrayMetadata
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array
 include("states.jl")
@@ -180,7 +180,7 @@ end
 
 function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     client = state[].client
-    dep_key = node_hash(param.name)
+    dep_key = int32_hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
     device_props = if isnothing(dep_state.device)
         DeviceProperties()
@@ -226,7 +226,7 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Dependency})
     dep = param.value
-    dep_id = node_hash(param.name)
+    dep_id = int32_hash(param.name)
     edited, new_dep = draw_dep_editor("param-dep-$(param.name)", dep, dep_id)
     if edited
         return true, new_dep

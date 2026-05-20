@@ -820,6 +820,107 @@ end
     end
 end
 
+@testset "@display" begin
+    # Global parameter reference
+    ctx = Context.load_from_string(raw"""
+    roi = Parameter(Context.RectROI())
+
+    @Variable function img(data -> karabo"camera.data")
+        @display roi
+        return data
+    end
+    """)
+    @test invokelatest(Context.variable_displays, ctx.functions["img"]) == ["roi"]
+
+    # Group parameter reference; the stored name is qualified by the group
+    # type, not the (not-yet-known) instantiated group name.
+    ctx = Context.load_from_string(raw"""
+    @Group struct Cam
+        roi::Parameter{Context.RectROI} = Parameter(Context.RectROI())
+    end
+
+    @Variable function img(c::Cam)
+        @display c.roi
+        return 0
+    end
+
+    cam = Cam()
+    """)
+    img_func = only(f for (n, f) in ctx.functions if endswith(n, ".img"))
+    @test invokelatest(Context.variable_displays, img_func) == ["Cam.roi"]
+
+    # Multiple @display entries on one variable
+    ctx = Context.load_from_string(raw"""
+    a = Parameter(Context.RectROI())
+    b = Parameter(Context.RectROI())
+
+    @Variable function img(data -> karabo"camera.data")
+        @display a
+        @display b
+        return data
+    end
+    """)
+    @test invokelatest(Context.variable_displays, ctx.functions["img"]) == ["a", "b"]
+
+    # `head.tail` where `head` isn't the group arg is rejected
+    @test_throws "not the group argument" Context._variable(@__MODULE__, quote
+        function img(c::Cam)
+            @display other.roi
+            return 0
+        end
+    end, false)
+
+    # Non-symbol, non-qualified display expressions are rejected
+    @test_throws "@display takes" Context._variable(@__MODULE__, quote
+        function img(data -> karabo"camera.data")
+            @display 1 + 1
+            return data
+        end
+    end, false)
+
+    # @display outside a @Variable block errors
+    @test_throws "may only be used inside" eval(:(Context.@display foo))
+
+    # Full context-load resolution: global ref stays as-is, group ref becomes
+    # "$(instance).$(field)".
+    ctx = Context.load_from_string(raw"""
+    roi = Parameter(Context.RectROI())
+
+    @Group struct Cam
+        roi::Parameter{Context.RectROI} = Parameter(Context.RectROI())
+    end
+
+    @Variable function global_img(data -> karabo"camera.data")
+        @display roi
+        return data
+    end
+
+    @Variable function img(c::Cam)
+        @display c.roi
+        return 0
+    end
+
+    cam = Cam()
+    """)
+    @test ctx.displays["global_img"] == ["roi"]
+    @test ctx.displays["cam.img"] == ["cam.roi"]
+
+    # Reference to a missing parameter is rejected at load time
+    @test_throws "unknown parameter" Context.load_from_string(raw"""
+    @Variable function img(data -> karabo"camera.data")
+        @display nope
+        return data
+    end
+    """)
+
+    # @display references propagate across @Variable references
+    ctx = Context.load_from_string(raw"""
+    using Main: VariableLibrary
+    @Variable renamed -> VariableLibrary.normalize
+    """)
+    @test invokelatest(Context.variable_displays, ctx.functions["renamed"]) == String[]
+end
+
 @testset "Parameter" begin
     # Smoke tests for constructors
     @test Parameter(0) isa Parameter
@@ -1802,6 +1903,7 @@ end
         bridge._mock_sources = String[]
 
         period = Parameter(2π)
+        roi = Parameter(Context.RectROI())
 
         @Variable xgm -> karabo"xgm.intensity"
 
@@ -1810,6 +1912,7 @@ end
         @Variable function bar(data -> xgm)
             @add_subvariable("max_data", max(data))
             @postprocess(TestWindow(; size=5))
+            @display roi
             mean(data)
         end
         """)
@@ -1823,12 +1926,14 @@ end
                                                               "foo" => [],
                                                               "bar" => ["bar.max_data", "bar.window"]),
                                        "postprocessors" => Dict("bar" => ["bar.window"]),
+                                       "displays" => Dict("bar" => ["roi"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",
                                                          "bar" => "bar",
                                                          "bridge" => "XfaEngine.Context.KaraboBridge",
                                                          "bridge.stream" => "XfaEngine.Context.stream"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
+                                                            "roi" => Parameter("roi", Context.RectROI()),
                                                             "bar.window.size" => Parameter("bar.window.size", 5),
                                                             "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
