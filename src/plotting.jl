@@ -33,47 +33,50 @@ void main() {
 }
 """
 
-const HEATMAP_FRAGMENT_FLOAT = """
-#version 330 core
-precision mediump float;
-in vec2 Frag_UV;
-out vec4 Out_Color;
-uniform sampler1D colormap;
-uniform sampler2D heatmap;
-uniform float min_val;
-uniform float max_val;
-void main() {
-    float value = float(texture(heatmap, Frag_UV).r);
-    // NaN pixels become fully transparent
+# Body shared between the float and integer fragment shaders. The caller
+# provides the sampler type (sampler2D vs isampler2D) and whether to handle NaN
+# (only float samples can be NaN); everything after that — log10 remap,
+# colormap lookup with half-texel inset — is identical. In log mode
+# min_val/max_val are already log10'd on the CPU; non-positive samples have no
+# real log and become transparent.
+function heatmap_fragment_source(sampler::String, handle_nan::Bool)
+    nan_block = handle_nan ? """
     if (isnan(value)) {
         Out_Color = vec4(0.0, 0.0, 0.0, 0.0);
         return;
     }
-    // Half-texel inset avoids sampling beyond the colormap edges
-    float min_tex_offs = 0.5 / float(textureSize(colormap, 0));
-    float offset = (value - min_val) / (max_val - min_val);
-    offset = mix(min_tex_offs, 1.0 - min_tex_offs, clamp(offset, 0.0, 1.0));
-    Out_Color = texture(colormap, offset);
-}
-"""
+""" : ""
+    """
+    #version 330 core
+    precision mediump float;
+    in vec2 Frag_UV;
+    out vec4 Out_Color;
+    uniform sampler1D colormap;
+    uniform $(sampler) heatmap;
+    uniform float min_val;
+    uniform float max_val;
+    uniform bool use_log;
+    void main() {
+        float value = float(texture(heatmap, Frag_UV).r);
+    $(nan_block)
+        if (use_log) {
+            if (value <= 0.0) {
+                Out_Color = vec4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            value = log(value) / log(10.0);
+        }
+        // Half-texel inset avoids sampling beyond the colormap edges
+        float min_tex_offs = 0.5 / float(textureSize(colormap, 0));
+        float offset = (value - min_val) / (max_val - min_val);
+        offset = mix(min_tex_offs, 1.0 - min_tex_offs, clamp(offset, 0.0, 1.0));
+        Out_Color = texture(colormap, offset);
+    }
+    """
+end
 
-const HEATMAP_FRAGMENT_INT = """
-#version 330 core
-precision mediump float;
-in vec2 Frag_UV;
-out vec4 Out_Color;
-uniform sampler1D colormap;
-uniform isampler2D heatmap;
-uniform float min_val;
-uniform float max_val;
-void main() {
-    float min_tex_offs = 0.5 / float(textureSize(colormap, 0));
-    float value = float(texture(heatmap, Frag_UV).r);
-    float offset = (value - min_val) / (max_val - min_val);
-    offset = mix(min_tex_offs, 1.0 - min_tex_offs, clamp(offset, 0.0, 1.0));
-    Out_Color = texture(colormap, offset);
-}
-"""
+const HEATMAP_FRAGMENT_FLOAT = heatmap_fragment_source("sampler2D", true)
+const HEATMAP_FRAGMENT_INT = heatmap_fragment_source("isampler2D", false)
 
 # --- GL helpers ---
 
@@ -129,11 +132,13 @@ mutable struct HeatmapContext
     loc_max_float::GLint
     loc_heatmap_float::GLint
     loc_colormap_float::GLint
+    loc_log_float::GLint
 
     loc_min_int::GLint
     loc_max_int::GLint
     loc_heatmap_int::GLint
     loc_colormap_int::GLint
+    loc_log_int::GLint
 
     # 1D RGBA8 texture (256 entries) built from ImPlot's active colormap
     colormap_tex::GLuint
@@ -163,11 +168,13 @@ function create_heatmap_context()
     loc_max_float = glGetUniformLocation(shader_float, "max_val")
     loc_heatmap_float = glGetUniformLocation(shader_float, "heatmap")
     loc_colormap_float = glGetUniformLocation(shader_float, "colormap")
+    loc_log_float = glGetUniformLocation(shader_float, "use_log")
 
     loc_min_int = glGetUniformLocation(shader_int, "min_val")
     loc_max_int = glGetUniformLocation(shader_int, "max_val")
     loc_heatmap_int = glGetUniformLocation(shader_int, "heatmap")
     loc_colormap_int = glGetUniformLocation(shader_int, "colormap")
+    loc_log_int = glGetUniformLocation(shader_int, "use_log")
 
     # Allocate colormap texture (filled lazily by update_colormap!)
     colormap_tex_ref = Ref{GLuint}(0)
@@ -213,8 +220,8 @@ function create_heatmap_context()
 
     return HeatmapContext(
         shader_float, shader_int,
-        loc_min_float, loc_max_float, loc_heatmap_float, loc_colormap_float,
-        loc_min_int, loc_max_int, loc_heatmap_int, loc_colormap_int,
+        loc_min_float, loc_max_float, loc_heatmap_float, loc_colormap_float, loc_log_float,
+        loc_min_int, loc_max_int, loc_heatmap_int, loc_colormap_int, loc_log_int,
         colormap_tex, -1,
         vao, vbo,
     )
@@ -297,12 +304,12 @@ mutable struct GPUHeatmap
     # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
     # Avoids allocating a new array every frame.
     convert_buf::Vector{UInt8}
-    # Strided-sample scratch for approximate 1st/99th percentile estimation,
-    # avoiding a full copy + sort of the input every frame.
-    sample_buf::Vector{Float64}
-    # Cached scale limits for the colorbar (1st/99th percentile)
-    scale_min::Float64
-    scale_max::Float64
+    # Reused histogram bin counts for approximate 1st/99th percentile
+    # estimation, avoiding a full copy + sort of the input.
+    hist_buf::Vector{Int32}
+    # Whether the texture was last rendered in log mode — toggling this in the
+    # UI forces a re-render with fresh percentiles.
+    log_scale::Bool
 end
 
 function GPUHeatmap()
@@ -318,7 +325,7 @@ function GPUHeatmap()
     glGenFramebuffers(1, fbo_ref)
     fbo = fbo_ref[]
 
-    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Float64[], 0.0, 1.0)
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false)
 end
 
 function destroy!(h::GPUHeatmap)
@@ -422,33 +429,96 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
     end
 end
 
-# Approximate (p1, p99) of `data` via strided sampling (every 10th element for
-# inputs of >=1000 elements, non-finite values dropped) into `buf`, then two
-# quickselects sharing the partition. Returns `(0.0, 1.0)` if no finite samples;
-# always returns finite values.
-function sampled_pctile!(buf::Vector{Float64}, data::AbstractMatrix)
-    stride = length(data) < 1000 ? 1 : 10
-    resize!(buf, cld(length(data), stride))
+# Approximate (p1, p99) of `data` with no sorting. Samples every 10th element
+# (the whole array for small inputs) and estimates the percentiles with a
+# two-pass histogram: pass 1 gets the value range, pass 2 bins the sample, then
+# we walk the cumulative counts to the target rank with linear in-bin
+# interpolation. Non-finite samples are dropped (and non-positive ones in log
+# mode, which have no real log). Percentiles are invariant under a monotonic
+# transform, so log mode just log10's the two final results rather than
+# transforming every sample. `buf` is the reused bin-count scratch.
+# Returns `(0.0, 1.0)` if no usable samples; always returns finite, log10-space
+# values when `log` is set (matching the colormap's domain).
+const PCTILE_NBINS = 2048
 
-    n_valid = 0
-    @inbounds for i in 1:stride:length(data)
+# Min/max over the strided sample, dropping non-finite values (and non-positive
+# ones in log mode, which have no real log). Returns (Inf, -Inf) if nothing
+# qualifies.
+function finite_extrema(data::AbstractMatrix, stride::Int, log::Bool)
+    lo = Inf
+    hi = -Inf
+    n = length(data)
+
+    @inbounds for i in 1:stride:n
         x = Float64(data[i])
-        if isfinite(x)
-            n_valid += 1
-            buf[n_valid] = x
+        if log ? (isfinite(x) && x > 0) : isfinite(x)
+            lo = ifelse(x < lo, x, lo)
+            hi = ifelse(x > hi, x, hi)
         end
     end
 
-    if n_valid == 0
+    return (lo, hi)
+end
+
+function sampled_pctile!(buf::Vector{Int32}, data::AbstractMatrix, log::Bool=false)
+    n = length(data)
+    if n == 0
+        return (0.0, 1.0)
+    end
+    stride = n < 1000 ? 1 : 10
+
+    # Pass 1: value range over the valid sample.
+    lo, hi = finite_extrema(data, stride, log)
+    if !isfinite(lo) || !isfinite(hi)
+        return (0.0, 1.0)
+    end
+    if !(hi > lo)
+        if log
+            return hi > 0 ? (log10(hi), log10(hi)) : (0.0, 1.0)
+        end
+        return (lo, lo)
+    end
+
+    # Pass 2: histogram the sample into PCTILE_NBINS uniform bins.
+    if length(buf) != PCTILE_NBINS
+        resize!(buf, PCTILE_NBINS)
+    end
+    fill!(buf, 0)
+    scale = PCTILE_NBINS / (hi - lo)
+    total = 0
+    @inbounds for i in 1:stride:n
+        x = data[i]
+        if log ? (isfinite(x) && x > 0) : isfinite(x)
+            b = clamp(floor(Int, (x - lo) * scale) + 1, 1, PCTILE_NBINS)
+            buf[b] += Int32(1)
+            total += 1
+        end
+    end
+
+    if total == 0
         return (0.0, 1.0)
     end
 
-    v = @view buf[1:n_valid]
-    k1 = clamp(round(Int, 0.01 * (n_valid - 1)) + 1, 1, n_valid)
-    k99 = clamp(round(Int, 0.99 * (n_valid - 1)) + 1, 1, n_valid)
-    p1 = partialsort!(v, k1)
-    p99 = k99 > k1 ? partialsort!(@view(v[k1+1:end]), k99 - k1) : p1
-    return (p1, p99)
+    binwidth = (hi - lo) / PCTILE_NBINS
+    p1 = quantile_at(buf, 0.01 * total, lo, hi, binwidth)
+    p99 = quantile_at(buf, 0.99 * total, lo, hi, binwidth)
+    return log ? (log10(p1), log10(p99)) : (p1, p99)
+end
+
+# Walk the histogram's cumulative counts to the target rank, interpolating
+# within the straddling bin for a smoother estimate. Falls back to hi if the
+# target is past the last count.
+function quantile_at(buf::Vector{Int32}, target, lo, hi, binwidth)
+    cum = 0
+    @inbounds for b in 1:PCTILE_NBINS
+        c = buf[b]
+        if cum + c >= target
+            frac = c > 0 ? (target - cum) / c : 0.0
+            return lo + (b - 1 + frac) * binwidth
+        end
+        cum += c
+    end
+    return hi
 end
 
 """
@@ -457,7 +527,7 @@ data texture (unit 0) and colormap texture (unit 1), draws a fullscreen quad
 with the appropriate shader, then restores the previous GL state so we don't
 interfere with Dear ImGui's rendering.
 """
-function render_colormapped!(h::GPUHeatmap, ctx::HeatmapContext, min_val, max_val)
+function render_colormapped!(h::GPUHeatmap, ctx::HeatmapContext, min_val, max_val, use_log::Bool)
     h.width == 0 && return
 
     # Save GL state that we'll modify (Dear ImGui expects these unchanged)
@@ -479,12 +549,14 @@ function render_colormapped!(h::GPUHeatmap, ctx::HeatmapContext, min_val, max_va
         glUniform1f(ctx.loc_max_int, Float32(max_val))
         glUniform1i(ctx.loc_heatmap_int, 0)
         glUniform1i(ctx.loc_colormap_int, 1)
+        glUniform1i(ctx.loc_log_int, use_log)
     else
         glUseProgram(ctx.shader_float)
         glUniform1f(ctx.loc_min_float, Float32(min_val))
         glUniform1f(ctx.loc_max_float, Float32(max_val))
         glUniform1i(ctx.loc_heatmap_float, 0)
         glUniform1i(ctx.loc_colormap_float, 1)
+        glUniform1i(ctx.loc_log_float, use_log)
     end
 
     # Bind data texture to unit 0, colormap to unit 1
@@ -524,6 +596,7 @@ end
     # the colormap shader; `display_min`/`display_max` are the visible range
     # shown on the colorbar axis (>= clip range, controlled by mouse wheel).
     const autoscale_colorbar::Ref{Bool} = Ref(true)
+    const log_scale::Ref{Bool} = Ref(false)
     const colorbar_clip_min::Ref{Cdouble} = Ref(0.0)
     const colorbar_clip_max::Ref{Cdouble} = Ref(1.0)
     const colorbar_display_min::Ref{Cdouble} = Ref(0.0)
@@ -681,6 +754,9 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
     display_max = plot.colorbar_display_max[]
     clip_min = plot.colorbar_clip_min[]
     clip_max = plot.colorbar_clip_max[]
+    # In log mode all four refs hold log10(value); the colorbar renders that
+    # space directly and tick labels read as exponents.
+    tick_format = plot.log_scale[] ? "1e%g" : "%g"
 
     # ColormapScale itself does not consume mouse input — without an overlay
     # button, clicks fall through to the parent window and start a window
@@ -690,7 +766,7 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
     start_pos = ig.GetCursorScreenPos()
     ImPlot.ColormapScale("##colorbar_$(plot.id)",
                          display_min, display_max,
-                         size, "%g",
+                         size, tick_format,
                          ImPlot.ImPlotColormapScaleFlags_None,
                          ImPlot.ImPlotColormap_Viridis)
     rect_min = ig.GetItemRectMin()
@@ -853,17 +929,20 @@ function draw_plot(plot::Plot, store, was_updated)
             # Update colormap if needed (use Viridis as default, index 4)
             update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
 
-            if was_updated || needs_initial_upload
-                upload_data!(gpu, data)
-                dmin, dmax = sampled_pctile!(gpu.sample_buf, data)
-                gpu.scale_min = dmin
-                gpu.scale_max = dmax
-                if needs_initial_upload || plot.autoscale_colorbar[]
+            log = plot.log_scale[]
+            log_changed = !needs_initial_upload && gpu.log_scale != log
+            if was_updated || needs_initial_upload || log_changed
+                if was_updated || needs_initial_upload
+                    upload_data!(gpu, data)
+                end
+                if needs_initial_upload || log_changed || plot.autoscale_colorbar[]
+                    dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
                     plot.colorbar_clip_min[] = dmin
                     plot.colorbar_clip_max[] = dmax
                     # Don't stomp a manual zoom — only reset the visible range
-                    # if the user has not adjusted it themselves.
-                    if needs_initial_upload || !plot.colorbar_display_zoomed
+                    # if the user has not adjusted it themselves (or just
+                    # toggled log mode, which makes the old range meaningless).
+                    if needs_initial_upload || log_changed || !plot.colorbar_display_zoomed
                         margin = 0.1 * (dmax - dmin)
                         plot.colorbar_display_min[] = dmin - margin
                         plot.colorbar_display_max[] = dmax + margin
@@ -871,7 +950,9 @@ function draw_plot(plot::Plot, store, was_updated)
                 end
                 render_colormapped!(gpu, ctx,
                                     plot.colorbar_clip_min[],
-                                    plot.colorbar_clip_max[])
+                                    plot.colorbar_clip_max[],
+                                    log)
+                gpu.log_scale = log
             end
 
             # Reserve space for the colorbar on the right
@@ -916,7 +997,8 @@ function draw_plot(plot::Plot, store, was_updated)
             if interactive_colorbar(plot, ImVec2(colorbar_width, plot_size.y))
                 render_colormapped!(gpu, ctx,
                                     plot.colorbar_clip_min[],
-                                    plot.colorbar_clip_max[])
+                                    plot.colorbar_clip_max[],
+                                    plot.log_scale[])
             end
         end
 
@@ -932,6 +1014,8 @@ function draw_plot(plot::Plot, store, was_updated)
                         plot.colorbar_display_zoomed = false
                     end
                 end
+                ig.SameLine()
+                ig.Checkbox("Log##$(plot.id)", plot.log_scale)
             end
 
             if !is_scalar

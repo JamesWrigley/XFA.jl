@@ -449,28 +449,58 @@ end
 end
 
 @testset "sampled_pctile!" begin
-    buf = Float64[]
+    buf = Int32[]
+    # True 1st/99th percentiles of the valid subset, for the approximate
+    # histogram estimate to be checked against.
+    pct(v) = (XFA.nanpctile(v, 1), XFA.nanpctile(v, 99))
 
-    # Small array (<1000): stride=1, picks the 2nd and 99th order statistics
+    # Histogram estimate lands within a bin's width of the true percentiles.
+    # Small array (<1000) uses stride=1.
     small = reshape(collect(1.0:100.0), 10, 10)
-    @test XFA.sampled_pctile!(buf, small) == (2.0, 99.0)
+    e1, e99 = pct(vec(small))
+    p1, p99 = XFA.sampled_pctile!(buf, small)
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
 
-    # Large array (>=1000): strided, but a constant matrix gives exact result
-    large = fill(7.0, 100, 100)
-    @test XFA.sampled_pctile!(buf, large) == (7.0, 7.0)
+    # Constant matrix is exact (degenerate range), and exercises the strided
+    # path for a large (>=1000) input.
+    @test XFA.sampled_pctile!(buf, fill(7.0, 100, 100)) == (7.0, 7.0)
 
-    # Mixed finite + NaN/Inf: non-finite values are dropped
-    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 50.0 NaN 100.0]
+    # Non-finite samples (NaN, Inf, -Inf) are dropped.
+    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 25.0 NaN 100.0]
+    e1, e99 = pct(filter(isfinite, vec(mixed)))
     p1, p99 = XFA.sampled_pctile!(buf, mixed)
     @test isfinite(p1) && isfinite(p99)
-    @test p1 == 1.0 && p99 == 100.0
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
 
-    # All non-finite: fall back to (0.0, 1.0), still finite
-    nonfinite = [NaN Inf; -Inf NaN]
-    @test XFA.sampled_pctile!(buf, nonfinite) == (0.0, 1.0)
-
-    # Empty input: same fallback
+    # All non-finite / empty → fallback, still finite.
+    @test XFA.sampled_pctile!(buf, [NaN Inf; -Inf NaN]) == (0.0, 1.0)
     @test XFA.sampled_pctile!(buf, Matrix{Float64}(undef, 0, 0)) == (0.0, 1.0)
+
+    # Integer input filters nothing (no non-finite ints) but still works.
+    ints = reshape(collect(Int32(1):Int32(100)), 10, 10)
+    e1, e99 = pct(vec(ints))
+    p1, p99 = XFA.sampled_pctile!(buf, ints)
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
+
+    # Log mode: log10 of the positive-only percentiles.
+    small_pos = reshape(10.0 .^ collect(0.0:0.01:0.99), 10, 10)
+    e1, e99 = pct(vec(small_pos))
+    p1, p99 = XFA.sampled_pctile!(buf, small_pos, true)
+    @test p1 ≈ log10(e1) atol = 0.05
+    @test p99 ≈ log10(e99) atol = 0.05
+
+    # Non-positive samples are dropped before log10.
+    mixed_log = [-1.0 0.0 NaN; 1.0 10.0 NaN; 100.0 1000.0 NaN]
+    e1, e99 = pct(filter(x -> isfinite(x) && x > 0, vec(mixed_log)))
+    p1, p99 = XFA.sampled_pctile!(buf, mixed_log, true)
+    @test p1 ≈ log10(e1) atol = 0.1
+    @test p99 ≈ log10(e99) atol = 0.1
+
+    # No positive samples → fallback, never NaN/-Inf from log10(≤0).
+    @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
 end
 
 @testset "GUI" begin
