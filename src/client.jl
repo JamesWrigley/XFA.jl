@@ -679,19 +679,12 @@ function store_variable_data!(client, variable::VariableData)
     compression_ratio = NaN
     received_bytes = data isa AbstractArray ? sizeof(data) : 0
     if data isa CompressedArray
-        # Allocate fresh — the decompressed array is queued onto `store.updates`
-        # and read by GUI consumers later, so reusing one buffer per variable
-        # would let later trains overwrite a not-yet-consumed payload.
-        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
-        decompressed = decompress_array(ws, data)
+        # Don't decompress here: the payload is queued onto `store.updates` and
+        # draw_plots decompresses only the most recent one, so frames that pile
+        # up between renders are dropped before the expensive ZFP decode.
         received_bytes = sizeof(data.data) + (isnothing(data.nonfinite_mask) ? 0 : sizeof(data.nonfinite_mask))
-        compression_ratio = sizeof(decompressed) / received_bytes
-        variable = VariableData(; tid=variable.tid, name=variable.name, data=decompressed,
-                                subvariables=variable.subvariables,
-                                title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
-                                xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                                fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
-        data = decompressed
+        decompressed_bytes = prod(data.shape) * sizeof(data.original_eltype)
+        compression_ratio = decompressed_bytes / received_bytes
     end
 
     # Unsubscribed array variables arrive as shape-only metadata. We store the
@@ -720,6 +713,10 @@ function store_variable_data!(client, variable::VariableData)
             client.variable_data[name] = VariableStore(; data=values, scalar_tids=tids)
         elseif data isa AbstractArray
             client.variable_data[name] = VariableStore(; data)
+        elseif data isa CompressedArray
+            # Seed with a buffer of the right eltype/shape so draw_plots can
+            # decompress into it in place rather than allocating per train.
+            client.variable_data[name] = VariableStore(; data=allocate_array(data))
         else
             @error "Unsupported variable type: $(typeof(data))"
             return
@@ -768,6 +765,8 @@ function store_variable_data!(client, variable::VariableData)
         VariableType_Vector
     elseif data isa AbstractArray
         VariableType_Array
+    elseif data isa CompressedArray
+        length(data.shape) == 1 ? VariableType_Vector : VariableType_Array
     else
         VariableType_Unknown
     end
