@@ -10,6 +10,7 @@ struct Point2d
 end
 
 include("util.jl")
+include("binning.jl")
 include("gui.jl")
 include("settings.jl")
 

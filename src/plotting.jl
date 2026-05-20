@@ -1146,7 +1146,11 @@ end
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
     const subscribed::Vector{String} = ["", ""]
+    # Motor-position binning resolution for scalar correlations. 0 disables
+    # binning; >0 routes samples through an AccuPairSequence keyed on x.
+    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
 
+    accu::Maybe{AccuPairSequence} = nothing
     trainId::Int = -1
     dock_id::UInt32 = 0
 end
@@ -1154,6 +1158,7 @@ end
 function clear_plot(plot::CorrelationPlot)
     empty!(plot.x_data)
     empty!(plot.y_data)
+    plot.accu = nothing
 end
 
 function CorrelationPlot(counter::Integer)
@@ -1251,6 +1256,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             plot.x_var[], plot.y_var[] = plot.y_var[], plot.x_var[]
             swap_arrays(plot.x_data, plot.y_data)
             reverse!(plot.subscribed)
+            plot.accu = nothing
         end
 
         ig.SameLine()
@@ -1261,6 +1267,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
         if x_changed || y_changed
             empty!(plot.x_data)
             empty!(plot.y_data)
+            plot.accu = nothing
         end
 
         region_avail = ig.GetContentRegionAvail()
@@ -1299,16 +1306,44 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                             xi = findfirst(==(tid), x.scalar_tids)
                             yi = findfirst(==(tid), y.scalar_tids)
                             if !isnothing(xi) && !isnothing(yi)
-                                push!(plot.x_data, x.data[xi])
-                                push!(plot.y_data, y.data[yi])
+                                xv = x.data[xi]
+                                yv = y.data[yi]
+                                push!(plot.x_data, xv)
+                                push!(plot.y_data, yv)
+                                if !isnothing(plot.accu)
+                                    append!(plot.accu, xv, yv)
+                                end
                             end
                         end
                     end
 
+                    # Sync accu with the current resolution: rebuild from the
+                    # raw sample history whenever the plot's resolution disagrees
+                    # with what's stored in accu (covers initial creation,
+                    # widget edits, swaps, and variable changes).
+                    res = plot.binning_resolution[]
+                    if res > 0 && (isnothing(plot.accu) || plot.accu.resolution != res)
+                        plot.accu = AccuPairSequence(plot.x_data, plot.y_data, res)
+                    elseif res <= 0 && !isnothing(plot.accu)
+                        plot.accu = nothing
+                    end
+
                     if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
-                        ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-                        ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
-                        ImPlot.PopStyleVar()
+                        label = "$(x_name) vs $(y_name)"
+                        if !isnothing(plot.accu)
+                            # Same label_id ties the band and line to one
+                            # legend entry, so ImPlot gives them matching
+                            # colors.
+                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+                            ImPlot.PlotShaded(label, plot.accu.x_values,
+                                              plot.accu.y_lower, plot.accu.y_upper)
+                            ImPlot.PopStyleVar()
+                            ImPlot.PlotLine(label, plot.accu.x_values, plot.accu.y_values)
+                        else
+                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+                            ImPlot.PlotScatter(label, plot.x_data, plot.y_data)
+                            ImPlot.PopStyleVar()
+                        end
                         check_plot_interaction!(plot)
                         ImPlot.EndPlot()
                     end
@@ -1344,6 +1379,15 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                         clear_variable_data(y)
                         clear_plot(plot)
                     end
+                end
+
+                if x.type == VariableType_Scalar
+                    ig.SameLine()
+                    ig.SetNextItemWidth(120)
+                    ig.DragFloat("Binning resolution##$(plot.id)",
+                                 plot.binning_resolution, 0.01f0,
+                                 0.0f0, typemax(Cfloat), "%.4f",
+                                 ig.ImGuiSliderFlags_AlwaysClamp)
                 end
             end
         end
