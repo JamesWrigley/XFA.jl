@@ -541,6 +541,72 @@ end
     @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
 end
 
+@testset "AccuPairSequence" begin
+    # Constructor validation.
+    @test_throws ArgumentError XFA.AccuPairSequence(0.0)
+    @test_throws ArgumentError XFA.AccuPairSequence(-1.0)
+    @test_throws ArgumentError XFA.AccuPairSequence(1.0; min_count=0)
+    @test_throws ArgumentError XFA.AccuPairSequence([1.0, 2.0], [1.0], 0.1)
+
+    # Bins within resolution merge; bin only appears once min_count is met,
+    # then updates in place as more samples arrive.
+    seq = XFA.AccuPairSequence(0.1; min_count=2)
+    append!(seq, 1.0, 10.0)
+    @test length(seq) == 0  # below min_count
+    @test isempty(seq.x_values)
+
+    append!(seq, 1.05, 20.0)
+    @test length(seq) == 1
+    @test seq.x_values[1] ≈ 1.025
+    @test seq.y_values[1] ≈ 15.0
+    # y_lower/y_upper are y_mean ± half the population std (5.0 for [10, 20]).
+    @test seq.y_lower[1] ≈ 12.5
+    @test seq.y_upper[1] ≈ 17.5
+
+    append!(seq, 0.95, 30.0)  # still within resolution of running mean
+    @test length(seq) == 1    # same bin, updated in place
+    @test seq.y_values[1] ≈ 20.0
+
+    # Motor moves to a new position: previous bin stays committed, new bin
+    # starts and is invisible until it reaches min_count.
+    append!(seq, 5.0, 100.0)
+    @test length(seq) == 1
+    append!(seq, 5.02, 200.0)
+    @test length(seq) == 2
+    @test seq.x_values[2] ≈ 5.01
+    @test seq.y_values[2] ≈ 150.0
+
+    # A bin that never reaches min_count is discarded when the motor moves on.
+    seq = XFA.AccuPairSequence(0.1; min_count=3)
+    append!(seq, 1.0, 1.0)
+    append!(seq, 1.05, 2.0)         # count=2, still below threshold
+    append!(seq, 10.0, 99.0)        # new bin — previous one had count<3, dropped
+    append!(seq, 10.0, 99.0)
+    append!(seq, 10.0, 99.0)        # this bin commits
+    @test length(seq) == 1
+    @test seq.x_values[1] ≈ 10.0
+
+    # min_count=1: bins are visible immediately; band collapses to the mean.
+    seq = XFA.AccuPairSequence(0.1; min_count=1)
+    append!(seq, 3.0, 7.0)
+    @test length(seq) == 1
+    @test seq.y_lower[1] == 7.0
+    @test seq.y_upper[1] == 7.0
+
+    # reset! clears everything.
+    XFA.reset!(seq)
+    @test length(seq) == 0
+    @test seq.cur_count == 0
+
+    # Array constructor matches incremental appends.
+    xs = [1.0, 1.02, 0.98, 5.0, 5.01, 5.0]
+    ys = [10.0, 20.0, 30.0, 100.0, 200.0, 300.0]
+    seq = XFA.AccuPairSequence(xs, ys, 0.1; min_count=2)
+    @test length(seq) == 2
+    @test seq.x_values ≈ [1.0, 5.0033333333] atol=1e-6
+    @test seq.y_values ≈ [20.0, 200.0]
+end
+
 @testset "GUI" begin
     config_dir = mktempdir()
     test_engine = te.CreateContext(; exit_on_completion=true)
