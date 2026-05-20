@@ -1097,6 +1097,13 @@ function draw_plot(plot::Plot, store, was_updated)
         if !no_data
             autoscale_buttons(plot)
 
+            if is_scalar
+                ig.SameLine()
+                if ig.Button("Clear##$(plot.id)")
+                    clear_variable_data(store)
+                end
+            end
+
             if data isa AbstractMatrix
                 ig.SameLine()
                 ig.Checkbox("Fixed aspect", plot.fixed_aspect)
@@ -1325,6 +1332,15 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                 end
 
                 autoscale_buttons(plot)
+
+                if x.type == VariableType_Scalar
+                    ig.SameLine()
+                    if ig.Button("Clear##$(plot.id)")
+                        clear_variable_data(x)
+                        clear_variable_data(y)
+                        clear_plot(plot)
+                    end
+                end
             end
         end
 

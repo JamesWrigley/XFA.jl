@@ -278,29 +278,37 @@ end
 function plot_button(label, name; button=ig.Button)
     nd = variable_ndims(name)
     too_many_dims = !isnothing(nd) && nd > 2
+
     if too_many_dims
         ig.BeginDisabled()
     end
+
     clicked = button(label)
+
     if too_many_dims
         ig.EndDisabled()
         if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
             ig.SetTooltip("Plotting arrays with more than 2 dimensions is not supported")
         end
     end
+
     return clicked
+end
+
+function clear_variable_data(store)
+    if store.data isa AbstractVector
+        empty!(store.data)
+    end
+    if !isnothing(store.scalar_tids)
+        empty!(store.scalar_tids)
+    end
 end
 
 function clear_variables()
     client = state[].client
 
     for store in values(client.variable_data)
-        if store.data isa AbstractVector
-            empty!(store.data)
-        end
-        if !isnothing(store.scalar_tids)
-            empty!(store.scalar_tids)
-        end
+        clear_variable_data(store)
     end
 
     for plot in client.plots
