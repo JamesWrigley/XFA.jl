@@ -582,6 +582,102 @@ end
 
 # --- Plot struct with optional GPU heatmap ---
 
+const FIT_TYPES = ["None", "Line", "Gaussian", "erf"]
+
+# Per-plot fit configuration. Shared between Plot and CorrelationPlot so the
+# side-panel fitting UI can be driven from a single struct.
+@kwdef mutable struct FitSettings
+    fit_type::Ref{Cint} = Ref(Cint(0))
+    popt::Maybe{Vector{Float64}} = nothing
+    retcode::Maybe{Symbol} = nothing
+    # Sampled model curve, refreshed by compute_fit! on each successful fit so
+    # the GUI can overlay it without re-evaluating per frame.
+    const model_x::Vector{Float64} = Float64[]
+    const model_y::Vector{Float64} = Float64[]
+end
+
+# Parameter names per fit type, matching the order returned by the fit_* funcs.
+fit_param_names(name::AbstractString) = if name == "Line"
+    ("slope", "intercept")
+elseif name == "Gaussian"
+    ("y0", "A", "mu", "sigma")
+elseif name == "erf"
+    ("y0", "A", "center", "width")
+else
+    ()
+end
+
+# Re-run the selected fit against the plot's current X/Y samples. Called from
+# the draw_plot data-update path so the popt stays in sync with what's shown.
+function compute_fit!(fit::FitSettings, ydata::AbstractVector,
+                      xdata::Maybe{AbstractVector}=nothing)
+    name = FIT_TYPES[fit.fit_type[] + 1]
+    if name == "Line"
+        fit.popt, fit.retcode = fit_line(ydata, xdata)
+    elseif name == "Gaussian"
+        fit.popt, fit.retcode = fit_gaussian(ydata, xdata)
+    elseif name == "erf"
+        fit.popt, fit.retcode = fit_erf(ydata, xdata)
+    else
+        fit.popt = nothing
+        fit.retcode = nothing
+    end
+
+    update_fit_curve!(fit, ydata, xdata)
+end
+
+# Sample `model(x)` onto `xs`/`ys` over n evenly spaced points in [xmin, xmax].
+function sample_model!(xs::Vector{Float64}, ys::Vector{Float64},
+                       model, xmin::Float64, xmax::Float64, n::Int)
+    resize!(xs, n)
+    resize!(ys, n)
+    step = (xmax - xmin) / (n - 1)
+    @inbounds for i in 1:n
+        x = xmin + (i - 1) * step
+        xs[i] = x
+        ys[i] = model(x)
+    end
+end
+
+# Refresh fit.model_x/fit.model_y from the current popt so the GUI can overlay
+# the fitted curve without re-evaluating per frame. Clears the buffers if
+# there's no popt or the X range is degenerate.
+function update_fit_curve!(fit::FitSettings, ydata::AbstractVector,
+                           xdata::Maybe{AbstractVector})
+    if isnothing(fit.popt)
+        empty!(fit.model_x)
+        empty!(fit.model_y)
+        return
+    end
+
+    xs = isnothing(xdata) ? eachindex(ydata) : xdata
+    xmin, xmax = Float64(minimum(xs)), Float64(maximum(xs))
+    if !isfinite(xmin) || !isfinite(xmax) || xmin == xmax
+        empty!(fit.model_x)
+        empty!(fit.model_y)
+        return
+    end
+
+    p = fit.popt
+    name = FIT_TYPES[fit.fit_type[] + 1]
+    model = if name == "Line"
+        x -> p[1] * x + p[2]
+    elseif name == "Gaussian"
+        x -> gaussian(x, p[1], p[2], p[3], p[4])
+    elseif name == "erf"
+        x -> erf(x, p[1], p[2], p[3], p[4])
+    end
+    sample_model!(fit.model_x, fit.model_y, model, xmin, xmax, 200)
+end
+
+# Overlay the fitted model curve on the current ImPlot plot, if any.
+function draw_fit_overlay(fit::FitSettings)
+    if !isempty(fit.model_x)
+        name = FIT_TYPES[fit.fit_type[] + 1]
+        ImPlot.PlotLine("$(name) fit", fit.model_x, fit.model_y)
+    end
+end
+
 @kwdef mutable struct Plot
     const name::String
     const id::String
@@ -589,7 +685,8 @@ end
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
     const fixed_aspect::Ref{Bool} = Ref(true)
-    const show_compression_settings::Ref{Bool} = Ref(false)
+    const show_side_panel::Ref{Bool} = Ref(false)
+    const fit::FitSettings = FitSettings()
     const precision::Ref{Cint} = Ref(Cint(-1))
 
     # Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
@@ -713,38 +810,27 @@ function apply_autoscale(plot)
     end
 end
 
-# Compression settings checkbox + (when expanded) zfp precision input, ratio,
-# and throughput readout. Reusable across plot window types — `id` namespaces
-# the imgui widgets, `name` is the qualified variable name to retune.
-function draw_compression_settings(id, name, show_settings::Ref{Bool},
-                                   precision::Ref{Cint}, store)
-    ig.Checkbox("Compression settings##$(id)", show_settings)
-    if show_settings[]
-        compressed = isfinite(store.compression_ratio)
-        if !compressed
-            ig.BeginDisabled()
-        end
-        ig.SetNextItemWidth(120)
-        if ig.InputInt("zfp precision##$(id)", precision)
-            set_subscription_precision(state[], name, Int(precision[]))
-        end
-        if !compressed
-            ig.EndDisabled()
-        end
-        if compressed
-            ig.SameLine()
-            ig.AlignTextToFramePadding()
-            ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
-        elseif store.received_bytes > 0
-            ig.SameLine()
-            ig.AlignTextToFramePadding()
-            ig.TextDisabled("Variable is not compressed")
-        end
-        if store.received_bytes > 0
-            ig.SameLine()
-            ig.AlignTextToFramePadding()
-            ig.TextDisabled(@sprintf("%.1f MB/s @ 10Hz", store.received_bytes * 10 / 1e6))
-        end
+# zfp precision input, ratio, and throughput readout. `id` namespaces the
+# imgui widgets, `name` is the qualified variable name to retune.
+function draw_compression_settings(id, name, precision::Ref{Cint}, store)
+    compressed = isfinite(store.compression_ratio)
+    if !compressed
+        ig.BeginDisabled()
+    end
+    ig.SetNextItemWidth(120)
+    if ig.InputInt("zfp precision##$(id)", precision)
+        set_subscription_precision(state[], name, Int(precision[]))
+    end
+    if !compressed
+        ig.EndDisabled()
+    end
+    if compressed
+        ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
+    elseif store.received_bytes > 0
+        ig.TextDisabled("Variable is not compressed")
+    end
+    if store.received_bytes > 0
+        ig.TextDisabled(@sprintf("%.1f MB/s @ 10Hz", store.received_bytes * 10 / 1e6))
     end
 end
 
@@ -947,6 +1033,124 @@ function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
     end
 end
 
+# Draw a thin semi-transparent tab on the right edge of the plot region
+# (`plot_min`/`plot_max` are screen-space corners). Renders via draw list + manual
+# hit-testing so it doesn't perturb the parent's layout cursor. Toggles
+# `plot.show_side_panel`.
+function side_panel_tab(plot, plot_min::ImVec2, plot_max::ImVec2)
+    tab_w = 14.0f0
+    tab_h = 56.0f0
+    x0 = plot_max.x - tab_w
+    y0 = plot_min.y + (plot_max.y - plot_min.y - tab_h) / 2
+    rect_min = ImVec2(x0, y0)
+    rect_max = ImVec2(x0 + tab_w, y0 + tab_h)
+
+    hovered = ig.IsMouseHoveringRect(rect_min, rect_max)
+    active = hovered && ig.IsMouseDown(ig.ImGuiMouseButton_Left)
+    clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
+
+    base = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Button))
+    alpha = active ? 1.0f0 : (hovered ? 0.75f0 : 0.35f0)
+    col = ig.GetColorU32(ImVec4(base.x, base.y, base.z, alpha))
+
+    draw_list = ig.GetWindowDrawList()
+    rounding = unsafe_load(ig.GetStyle().FrameRounding)
+    ig.AddRectFilled(draw_list, rect_min, rect_max, col, rounding)
+
+    glyph = plot.show_side_panel[] ? ">" : "<"
+    text_size = ig.CalcTextSize(glyph)
+    text_pos = ImVec2(rect_min.x + (tab_w - text_size.x) / 2,
+                      rect_min.y + (tab_h - text_size.y) / 2)
+    text_col = ig.GetColorU32(ig.ImGuiCol_Text)
+    ig.AddText(draw_list, text_pos, text_col, glyph)
+
+    if clicked
+        plot.show_side_panel[] = !plot.show_side_panel[]
+    end
+end
+
+function draw_fitting_settings(id, fit::FitSettings)
+    if ig.CollapsingHeader("Fitting##$(id)")
+        ig.SetNextItemWidth(150)
+        if ig.Combo("Fit type##$(id)", fit.fit_type, FIT_TYPES, length(FIT_TYPES))
+            # Stale popt/retcode would mismatch the new fit type's parameter list.
+            fit.popt = nothing
+            fit.retcode = nothing
+            empty!(fit.model_x)
+            empty!(fit.model_y)
+        end
+
+        name = FIT_TYPES[fit.fit_type[] + 1]
+        names = fit_param_names(name)
+        if name == "None"
+            # nothing to show
+        elseif !isnothing(fit.popt) && length(fit.popt) == length(names)
+            flags = ig.ImGuiInputTextFlags_ReadOnly
+            for (i, pname) in enumerate(names)
+                # Re-fill the buffer each frame so the value stays in sync with
+                # the latest fit (cheap — only a few short strings per panel).
+                text = @sprintf("%g", fit.popt[i])
+                buf = zeros(UInt8, 64)
+                Util.strcpy!(buf, text)
+                ig.SetNextItemWidth(150)
+                ig.InputText("$(pname)##fit-$(id)", pointer(buf), length(buf), flags)
+            end
+        elseif !isnothing(fit.retcode)
+            ig.TextWrapped("Fit failed: $(fit.retcode)")
+        end
+    end
+end
+
+function draw_side_panel(plot::Plot, store, is_scalar::Bool, is_matrix::Bool)
+    if !is_scalar && ig.CollapsingHeader("Compression##$(plot.id)")
+        draw_compression_settings(plot.id, plot.name, plot.precision, store)
+    end
+    # Fitting only makes sense for 1D data.
+    if is_matrix
+        ig.BeginDisabled()
+        ig.CollapsingHeader("Fitting##$(plot.id)")
+        ig.EndDisabled()
+    else
+        draw_fitting_settings(plot.id, plot.fit)
+    end
+end
+
+# Begin the plot-area child, shrunk to leave room for the side panel when open.
+# Returns (plot_size, plot_area_h) for use inside the child. Must be paired
+# with end_plot_area!.
+function begin_plot_area!(plot, side_panel_width, bottom_row_h=30)
+    region_avail = ig.GetContentRegionAvail()
+    plot_area_h = max(region_avail.y - bottom_row_h, 100)
+    spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+    plot_w = plot.show_side_panel[] ?
+        max(region_avail.x - side_panel_width - spacing, 100f0) : region_avail.x
+
+    ig.BeginChild("##plot-area-$(plot.id)", ImVec2(plot_w, plot_area_h))
+    inner_avail = ig.GetContentRegionAvail()
+    return ImVec2(inner_avail.x, inner_avail.y), plot_area_h
+end
+
+# Closes the plot-area child opened by begin_plot_area!. Draws the tab over the
+# plot (when show_tab) so it captures clicks before being clipped, then if the
+# panel is open draws it alongside via the caller-supplied `draw_panel`.
+function end_plot_area!(plot, side_panel_width, plot_area_h, show_tab::Bool, draw_panel)
+    if show_tab
+        win_pos = ig.GetWindowPos()
+        win_size = ig.GetWindowSize()
+        side_panel_tab(plot, win_pos, ImVec2(win_pos.x + win_size.x, win_pos.y + win_size.y))
+    end
+    ig.EndChild()
+
+    if plot.show_side_panel[]
+        ig.SameLine()
+        if ig.BeginChild("##sidepanel-$(plot.id)", ImVec2(side_panel_width, plot_area_h),
+                         ig.ImGuiChildFlags_Borders)
+            draw_panel()
+        end
+        ig.EndChild()
+    end
+end
+
 function draw_plot(plot::Plot, store::Nothing, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
 
@@ -960,6 +1164,7 @@ end
 
 function draw_plot(plot::Plot, store, was_updated)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+    side_panel_width = 300f0
 
     data = store.data
     if ig.Begin("$(store.title)##$(plot.id)", plot.open)
@@ -971,15 +1176,23 @@ function draw_plot(plot::Plot, store, was_updated)
 
         apply_autoscale(plot)
 
-        region_avail = ig.GetContentRegionAvail()
-        plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
         no_data = is_metadata || length(data) == 0
-
+        plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
         if is_metadata
             ig.Text("Waiting for data: $(plot.name)")
         elseif no_data
             ig.Text("Array has length 0, nothing to plot")
         elseif data isa AbstractVector
+            if was_updated
+                if is_scalar
+                    compute_fit!(plot.fit, store.scalar_data_cache, store.scalar_tids_cache)
+                elseif is_dimarray
+                    compute_fit!(plot.fit, parent(data), parent(lookup(data)[1]))
+                else
+                    compute_fit!(plot.fit, data)
+                end
+            end
+
             if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
                 if is_scalar
                     tids = store.scalar_tids_cache
@@ -1002,6 +1215,7 @@ function draw_plot(plot::Plot, store, was_updated)
                         ImPlot.PlotLine(label, data)
                     end
                 end
+                draw_fit_overlay(plot.fit)
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
             end
@@ -1097,6 +1311,9 @@ function draw_plot(plot::Plot, store, was_updated)
                                     plot.log_scale[])
             end
         end
+        is_matrix = data isa AbstractMatrix
+        end_plot_area!(plot, side_panel_width, plot_area_h, !no_data,
+                       () -> draw_side_panel(plot, store, is_scalar, is_matrix))
 
         if !no_data
             autoscale_buttons(plot)
@@ -1120,13 +1337,6 @@ function draw_plot(plot::Plot, store, was_updated)
                 ig.SameLine()
                 ig.Checkbox("Log##$(plot.id)", plot.log_scale)
             end
-
-            if !is_scalar
-                ig.SameLine()
-                draw_compression_settings(plot.id, plot.name,
-                                          plot.show_compression_settings,
-                                          plot.precision, store)
-            end
         end
     end
 
@@ -1145,6 +1355,8 @@ end
     const y_data::Vector{Float64} = Float64[]
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
+    const show_side_panel::Ref{Bool} = Ref(false)
+    const fit::FitSettings = FitSettings()
     const subscribed::Vector{String} = ["", ""]
     # Motor-position binning resolution for scalar correlations. 0 disables
     # binning; >0 routes samples through an AccuPairSequence keyed on x.
@@ -1270,8 +1482,14 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             plot.accu = nothing
         end
 
-        region_avail = ig.GetContentRegionAvail()
-        plot_size = ImVec2(region_avail.x, max(region_avail.y - 30, 100))
+        side_panel_width = 300f0
+        plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
+
+        # Resolved on each frame when there's a variable selection; reused by
+        # the bottom-row controls after end_plot_area!.
+        x = y = nothing
+        x_name = y_name = ""
+        types_match = false
 
         if n_variables > 0
             x_name = plot.variable_names[plot.x_var[] + 1]
@@ -1293,9 +1511,11 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
             if x.type != y.type
                 ig.Text("Both variables must have the same type to correlate against each other.")
             else
+                types_match = true
                 apply_autoscale(plot)
 
                 if x.type == VariableType_Scalar
+                    data_updated = false
                     if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
                         new_tids = get(updated_variables, x_name, Set{Int}())
                         if haskey(updated_variables, y_name)
@@ -1313,8 +1533,13 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                                 if !isnothing(plot.accu)
                                     append!(plot.accu, xv, yv)
                                 end
+                                data_updated = true
                             end
                         end
+                    end
+
+                    if data_updated
+                        compute_fit!(plot.fit, plot.y_data, plot.x_data)
                     end
 
                     # Sync accu with the current resolution: rebuild from the
@@ -1344,6 +1569,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                             ImPlot.PlotScatter(label, plot.x_data, plot.y_data)
                             ImPlot.PopStyleVar()
                         end
+                        draw_fit_overlay(plot.fit)
                         check_plot_interaction!(plot)
                         ImPlot.EndPlot()
                     end
@@ -1357,42 +1583,50 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                         copyto!(plot.x_data, x.data)
                         copyto!(plot.y_data, y.data)
                         plot.trainId = x.trainId
+                        compute_fit!(plot.fit, plot.y_data, plot.x_data)
                     end
 
                     if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
                         ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
                         ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
                         ImPlot.PopStyleVar()
+                        draw_fit_overlay(plot.fit)
                         check_plot_interaction!(plot)
                         ImPlot.EndPlot()
                     end
                 else
                     ig.Text("Unsupported correlation of data type '$(x.type)'")
                 end
-
-                autoscale_buttons(plot)
-
-                if x.type == VariableType_Scalar
-                    ig.SameLine()
-                    if ig.Button("Clear##$(plot.id)")
-                        clear_variable_data(x)
-                        clear_variable_data(y)
-                        clear_plot(plot)
-                    end
-                end
-
-                if x.type == VariableType_Scalar
-                    ig.SameLine()
-                    ig.SetNextItemWidth(120)
-                    ig.DragFloat("Binning resolution##$(plot.id)",
-                                 plot.binning_resolution, 0.01f0,
-                                 0.0f0, typemax(Cfloat), "%.4f",
-                                 ig.ImGuiSliderFlags_AlwaysClamp)
-                end
             end
         end
 
+        end_plot_area!(plot, side_panel_width, plot_area_h, n_variables > 0,
+                       () -> draw_side_panel(plot))
+
+        if types_match
+            autoscale_buttons(plot)
+
+            if x.type == VariableType_Scalar
+                ig.SameLine()
+                if ig.Button("Clear##$(plot.id)")
+                    clear_variable_data(x)
+                    clear_variable_data(y)
+                    clear_plot(plot)
+                end
+
+                ig.SameLine()
+                ig.SetNextItemWidth(120)
+                ig.DragFloat("Binning resolution##$(plot.id)",
+                             plot.binning_resolution, 0.01f0,
+                             0.0f0, typemax(Cfloat), "%.4f",
+                             ig.ImGuiSliderFlags_AlwaysClamp)
+            end
+        end
     end
 
     ig.End()
+end
+
+function draw_side_panel(plot::CorrelationPlot)
+    draw_fitting_settings(plot.id, plot.fit)
 end

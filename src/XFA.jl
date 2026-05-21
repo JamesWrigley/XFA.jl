@@ -9,6 +9,7 @@ struct Point2d
     y::Float64
 end
 
+include("fits.jl")
 include("util.jl")
 include("binning.jl")
 include("gui.jl")

@@ -545,16 +545,16 @@ end
     # Constructor validation.
     @test_throws ArgumentError XFA.AccuPairSequence(0.0)
     @test_throws ArgumentError XFA.AccuPairSequence(-1.0)
-    @test_throws ArgumentError XFA.AccuPairSequence(1.0; min_count=0)
     @test_throws ArgumentError XFA.AccuPairSequence([1.0, 2.0], [1.0], 0.1)
 
-    # Bins within resolution merge; bin only appears once min_count is met,
-    # then updates in place as more samples arrive.
-    seq = XFA.AccuPairSequence(0.1; min_count=2)
+    # First sample creates a bin immediately with a degenerate band.
+    seq = XFA.AccuPairSequence(0.1)
     append!(seq, 1.0, 10.0)
-    @test length(seq) == 0  # below min_count
-    @test isempty(seq.x_values)
+    @test length(seq) == 1
+    @test seq.y_lower[1] == 10.0
+    @test seq.y_upper[1] == 10.0
 
+    # Samples within resolution merge into the same bin; running means update.
     append!(seq, 1.05, 20.0)
     @test length(seq) == 1
     @test seq.x_values[1] ≈ 1.025
@@ -563,48 +563,99 @@ end
     @test seq.y_lower[1] ≈ 12.5
     @test seq.y_upper[1] ≈ 17.5
 
-    append!(seq, 0.95, 30.0)  # still within resolution of running mean
-    @test length(seq) == 1    # same bin, updated in place
-    @test seq.y_values[1] ≈ 20.0
-
-    # Motor moves to a new position: previous bin stays committed, new bin
-    # starts and is invisible until it reaches min_count.
+    # Motor moves to a new position: a separate bin is created.
     append!(seq, 5.0, 100.0)
-    @test length(seq) == 1
     append!(seq, 5.02, 200.0)
     @test length(seq) == 2
     @test seq.x_values[2] ≈ 5.01
     @test seq.y_values[2] ≈ 150.0
 
-    # A bin that never reaches min_count is discarded when the motor moves on.
-    seq = XFA.AccuPairSequence(0.1; min_count=3)
-    append!(seq, 1.0, 1.0)
-    append!(seq, 1.05, 2.0)         # count=2, still below threshold
-    append!(seq, 10.0, 99.0)        # new bin — previous one had count<3, dropped
-    append!(seq, 10.0, 99.0)
-    append!(seq, 10.0, 99.0)        # this bin commits
-    @test length(seq) == 1
-    @test seq.x_values[1] ≈ 10.0
-
-    # min_count=1: bins are visible immediately; band collapses to the mean.
-    seq = XFA.AccuPairSequence(0.1; min_count=1)
-    append!(seq, 3.0, 7.0)
-    @test length(seq) == 1
-    @test seq.y_lower[1] == 7.0
-    @test seq.y_upper[1] == 7.0
-
     # reset! clears everything.
     XFA.reset!(seq)
     @test length(seq) == 0
-    @test seq.cur_count == 0
 
     # Array constructor matches incremental appends.
     xs = [1.0, 1.02, 0.98, 5.0, 5.01, 5.0]
     ys = [10.0, 20.0, 30.0, 100.0, 200.0, 300.0]
-    seq = XFA.AccuPairSequence(xs, ys, 0.1; min_count=2)
+    seq = XFA.AccuPairSequence(xs, ys, 0.1)
     @test length(seq) == 2
     @test seq.x_values ≈ [1.0, 5.0033333333] atol=1e-6
     @test seq.y_values ≈ [20.0, 200.0]
+end
+
+@testset "Fitting" begin
+    @testset "fit_gaussian" begin
+        # Recover known parameters from clean data.
+        y0, A, μ, σ = 1.0, 5.0, 2.0, 0.5
+        x = collect(range(-2.0, 6.0; length=200))
+        y = @. XFA.gaussian(x, y0, A, μ, σ)
+        popt, retcode = XFA.fit_gaussian(y, x)
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out; xdata defaults to 1:length(ydata).
+        y_noisy = copy(y)
+        y_noisy[[10, 50, 100]] .= [NaN, Inf, -Inf]
+        @test XFA.fit_gaussian(y_noisy, x)[1] ≈ [y0, A, μ, σ] atol=1e-6
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        popt, retcode = XFA.fit_gaussian(fill(NaN, 10))
+        @test isnothing(popt)
+        @test retcode == :NoFiniteSamples
+
+        # A_sign=-1 fits a downward peak.
+        y_down = @. XFA.gaussian(x, 0.0, -3.0, 1.0, 0.4)
+        popt, _ = XFA.fit_gaussian(y_down, x; A_sign=-1)
+        @test popt[2] < 0
+        @test popt[3] ≈ 1.0 atol=1e-4
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_gaussian(y, x; p0=[1.0, 2.0])
+    end
+
+    @testset "fit_erf" begin
+        # Recover known parameters from a clean step
+        y0, A, center, width = 0.5, 2.0, 1.0, 1.5
+        x = collect(range(-3.0, 5.0; length=200))
+        y = @. XFA.erf(x, y0, A, center, width)
+        popt, retcode = XFA.fit_erf(y, x)
+        @test popt ≈ [y0, A, center, width] atol=1e-4
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out
+        y_noisy = copy(y)
+        y_noisy[[10, 50, 100]] .= [NaN, Inf, -Inf]
+        @test XFA.fit_erf(y_noisy, x)[1] ≈ [y0, A, center, width] atol=1e-4
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        popt, retcode = XFA.fit_erf(fill(NaN, 10))
+        @test isnothing(popt)
+        @test retcode == :NoFiniteSamples
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_erf(y, x; p0=[1.0])
+    end
+
+    @testset "fit_line" begin
+        line(x, intercept, slope) = intercept + slope * x
+
+        intercept = 0.5
+        slope = 2.0
+        x = collect(range(-3.0, 5.0; length=50))
+        y = @. line(x, intercept, slope)
+        popt, retcode = XFA.fit_line(y, x)
+        @test popt ≈ [slope, intercept] atol=1e-10
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out.
+        y_noisy = copy(y)
+        y_noisy[[5, 25]] .= [NaN, Inf]
+        @test XFA.fit_line(y_noisy, x)[1] ≈ [slope, intercept] atol=1e-10
+
+        # Failure modes carry the right retcode.
+        @test XFA.fit_line(fill(NaN, 10)) == (nothing, :NoFiniteSamples)
+        @test XFA.fit_line([1.0]) == (nothing, :InsufficientData)
+    end
 end
 
 @testset "GUI" begin
