@@ -465,3 +465,35 @@ function (r::Reducer)(data)
 
     return r.dims_reducer(r.buffer, data; dim=dims)
 end
+
+## MovingAvg postprocessor
+
+# Postprocessor that maintains an exponentially weighted moving average of the
+# input array. The buffer is reallocated when the input's size or eltype
+# changes; `nsamples` controls the EWMA window via alpha = 2/(nsamples+1).
+mutable struct MovingAvg <: AbstractPostprocessor
+    nsamples::Parameter{Int}
+    buffer::AbstractArray
+    buffer_key::UInt
+end
+
+MovingAvg(; nsamples::Integer=10) = MovingAvg(Parameter(Int(nsamples)), Float64[], UInt(0))
+
+default_name(::MovingAvg) = "moving_avg"
+
+function update_moving_avg!(buffer::AbstractArray{T}, data, nsamples) where {T}
+    alpha = T(2 / (nsamples + 1))
+    @. buffer = alpha * data + (1 - alpha) * buffer
+    return buffer
+end
+
+function (m::MovingAvg)(data::AbstractArray)
+    key = hash((size(data), eltype(data)))
+    if key != m.buffer_key
+        m.buffer = float(eltype(data)).(data)
+        m.buffer_key = key
+        return m.buffer
+    end
+
+    return update_moving_avg!(m.buffer, data, m.nsamples[])
+end

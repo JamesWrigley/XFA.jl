@@ -1716,6 +1716,29 @@ end
         @test m.buffer !== buf
     end
 
+    @testset "MovingAvg" begin
+        m = Context.MovingAvg(; nsamples=3)
+        # First call seeds the buffer with the input promoted to float
+        @test m([1, 2, 3]) == [1.0, 2.0, 3.0]
+        @test eltype(m.buffer) === Float64
+        buf = m.buffer
+
+        # Subsequent calls with matching size/eltype reuse the buffer and apply
+        # the EWMA in-place: alpha = 2/(3+1) = 0.5
+        @test m([3, 4, 5]) == [2.0, 3.0, 4.0]
+        @test m.buffer === buf
+
+        # Changing size triggers reallocation
+        @test m([1.0, 2.0]) == [1.0, 2.0]
+        @test m.buffer !== buf
+
+        # Changing eltype also triggers reallocation
+        prev = m.buffer
+        @test m(Float32[1, 2]) == Float32[1, 2]
+        @test eltype(m.buffer) === Float32
+        @test m.buffer !== prev
+    end
+
     @testset "Correlation" begin
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 
