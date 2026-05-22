@@ -604,7 +604,7 @@ fit_param_names(name::AbstractString) = if name == "Line"
 elseif name == "Gaussian"
     ("y0", "A", "mu", "sigma")
 elseif name == "erf"
-    ("y0", "A", "center", "width")
+    ("y0", "A", "center", "fwhm")
 else
     ()
 end
