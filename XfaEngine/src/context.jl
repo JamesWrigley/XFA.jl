@@ -640,7 +640,9 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 if dep.kind == DepKind_Group
                     args[i] = upstream[dep.name]
                 elseif dep.kind == DepKind_Subvariable
-                    args[i] = matched_data[dep.parent].subvariables[dep.name].data
+                    parent_data = matched_data[dep.parent]
+                    subvar = get(parent_data.subvariables, dep.name, nothing)
+                    args[i] = isnothing(subvar) ? nothing : subvar.data
                 else
                     args[i] = matched_data[dep.name].data
                 end
