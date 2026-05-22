@@ -102,3 +102,15 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
 
     return gui_state
 end
+
+function draw_postprocessor_params(::Val{Symbol("XfaEngine.Context.Histogram1D")}, pp, min_node_width)
+    param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
+    for param_name in param_order
+        if param_name == "buffer_size" && !pp.params["windowed"].value
+            continue
+        end
+        if haskey(pp.params, param_name)
+            draw_parameter(param_name, pp.params[param_name]; min_node_width)
+        end
+    end
+end

@@ -429,6 +429,7 @@ function build_context_state(state, ctx_info)
                     tree_id_suffix = "###pp_$(subvar)",
                     plot_id = "Plot##pp_plot_$(subvar)",
                     params = pp_params,
+                    origin = ctx_info["postprocessor_origins"][subvar],
                 ))
             else
                 push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))

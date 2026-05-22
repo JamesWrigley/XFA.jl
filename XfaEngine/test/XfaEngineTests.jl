@@ -1881,6 +1881,34 @@ end
         @test vd.plot_type === :histogram
         @test vd.name == "hist"
         @test vd.xlabel == "energy"
+
+        # Windowed mode: buffer_size is in trains, so the sample buffer is
+        # sized to length(xs) * buffer_size on each append. Older trains drop
+        # out as new ones arrive.
+        h = Context.Histogram1D(; buffer_size=2, nbins=4, windowed=true)
+        append!(h, [1.0, 2.0, 3.0])
+        @test h.buffer.capacity == 6
+        @test collect(h.buffer) == [1.0, 2.0, 3.0]
+        @test sum(bincounts(h)) == 3
+
+        append!(h, [4.0, 5.0, 6.0])
+        @test isfull(h.buffer)
+        @test collect(h.buffer) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+        append!(h, [7.0, 8.0, 9.0])
+        @test collect(h.buffer) == [4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+        @test sum(bincounts(h)) == 6
+        @test first(binedges(h.histogram)) == 4.0
+        @test last(binedges(h.histogram)) == 9.0
+
+        # Bumping buffer_size grows capacity on the next append, preserving
+        # the most recent samples.
+        h.buffer_size[] = 3
+        append!(h, [10.0, 11.0, 12.0])
+        @test h.buffer.capacity == 9
+        @test collect(h.buffer) == [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        @test sum(bincounts(h)) == 9
+        @test last(binedges(h.histogram)) == 12.0
     end
 
     @testset "KaraboBridge" begin
@@ -2030,6 +2058,7 @@ end
                                                               "foo" => [],
                                                               "bar" => ["bar.max_data", "bar.window"]),
                                        "postprocessors" => Dict("bar" => ["bar.window"]),
+                                       "postprocessor_origins" => Dict("bar.window" => "Main.PostprocessorLibrary.TestWindow"),
                                        "displays" => Dict("bar" => ["roi"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",
