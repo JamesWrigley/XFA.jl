@@ -1223,7 +1223,7 @@ function draw_plot(plot::Plot, store, was_updated)
             elseif is_dimarray
                 parent(lookup(data)[1]), parent(data)
             else
-                eachindex(data), data
+                1:length(data), data
             end
 
             if was_updated
