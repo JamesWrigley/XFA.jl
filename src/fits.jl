@@ -76,8 +76,8 @@ function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothin
             y0 = maximum(y)
         end
         μ = x[μ_idx]
-        σ = abs(maximum(x) - minimum(x)) / 4
-        p0 = [y0, A, μ, σ]
+        width = abs(maximum(x) - minimum(x)) / 4
+        p0 = [y0, A, μ, width]
     end
 
     lb, ub = nothing, nothing
