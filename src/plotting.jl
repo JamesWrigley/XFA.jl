@@ -1623,7 +1623,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                 ig.SetNextItemWidth(120)
                 ig.DragFloat("Binning resolution##$(plot.id)",
                              plot.binning_resolution, 0.01f0,
-                             0.0f0, typemax(Cfloat), "%.4f",
+                             0.0f0, typemax(Cfloat), "%.8f",
                              ig.ImGuiSliderFlags_AlwaysClamp)
             end
         end
