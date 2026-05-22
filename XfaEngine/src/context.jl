@@ -90,7 +90,7 @@ include("trainmatching.jl")
 
 import ..KaraboBridge: KaraboBridgeClient, BufferPool
 using DataStructures: CircularBuffer
-using FHist: Hist2D, bincounts, binedges
+using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges
 using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
 include("context_builtins.jl")
 
@@ -491,6 +491,7 @@ function change_parameter(ctx::XfaContext, new_param::Parameter)
         end
 
         ctx_param.value = new_param.value
+        ctx_param.set_by_user = true
     end
 end
 
@@ -531,7 +532,9 @@ function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update
         VariableData(; tid, name, data=result.data, subvariables,
                      title=result.title, x_axis=result.x_axis, y_axis=result.y_axis,
                      xlabel=result.xlabel, ylabel=result.ylabel, unit=result.unit,
-                     fixed_aspect=result.fixed_aspect, update_rate)
+                     fixed_aspect=result.fixed_aspect, plot_type=result.plot_type, update_rate)
+    elseif result isa Histogram1D
+        VariableData(result; tid, name, subvariables, update_rate)
     else
         VariableData(; tid, name, data=result, subvariables, update_rate)
     end
@@ -670,12 +673,18 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 tick!(rate)
             end
 
-            # Run postprocessors on the variable output
+            # Run postprocessors on the variable output. Reuse the variable's
+            # train-scoped metadata so `tryset` (and anything else reading
+            # Meta.*) works the same as inside the variable body.
             if !isempty(postprocessors)
                 raw_out = out isa VariableData ? out.data : out
                 for (pp_name, pp) in postprocessors
                     try
-                        subvar_values[pp_name] = pp(raw_out)
+                        subvar_values[pp_name] = @with(Meta.tid => tid,
+                                                       Meta.name => pp_name,
+                                                       Meta.scratch => scratch,
+                                                       Meta.subvariables => subvar_values,
+                                                       pp(raw_out))
                     catch ex
                         @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
                     end

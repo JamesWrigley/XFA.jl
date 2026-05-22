@@ -188,34 +188,37 @@ function invalidate_histogram(corr::Correlation, _)
     corr.rebuild_histogram = true
 end
 
-function compute_edges(buffer::AbstractVector, pulses, nbins)
-    if isempty(buffer) || isempty(buffer[1]) || (!isempty(pulses) && isempty(intersect(eachindex(buffer), pulses)))
+function compute_edges(samples, nbins)
+    lo, hi = floatmax(), floatmin()
+    any_seen = false
+    for x in samples
+        if !isfinite(x)
+            continue
+        end
+        any_seen = true
+        lo = min(lo, x)
+        hi = max(hi, x)
+    end
+    if !any_seen
         return range(-1.0, 1.0; length=nbins + 1)
     end
-
-    lo = floatmax()
-    hi = floatmin()
-
-    pulses = isempty(pulses) ? eachindex(buffer) : pulses
-    for i in pulses
-        if i <= length(buffer)
-            pulse_lo, pulse_hi = extrema(buffer[i])
-            lo = min(lo, pulse_lo)
-            hi = max(hi, pulse_hi)
-        end
-    end
-
     if lo == hi
         lo -= 1
         hi += 1
     end
-
     return range(lo, hi; length=nbins + 1)
 end
 
+# Flatten the active pulses of a per-pulse buffer list into a single iterator
+# of samples, for feeding into compute_edges.
+function pulse_samples(buffers::Vector{CircularBuffer{Float64}}, pulses)
+    idxs = isempty(pulses) ? eachindex(buffers) : pulses
+    Iterators.flatten(buffers[i] for i in idxs if i <= length(buffers))
+end
+
 function build_histogram(corr::Correlation)
-    binedges = (compute_edges(corr.x_buffers, corr.pulses[], corr.nbins[]),
-                compute_edges(corr.y_buffers, corr.pulses[], corr.nbins[]))
+    binedges = (compute_edges(pulse_samples(corr.x_buffers, corr.pulses[]), corr.nbins[]),
+                compute_edges(pulse_samples(corr.y_buffers, corr.pulses[]), corr.nbins[]))
     corr.histogram = Hist2D(; binedges, overflow=true)
 
     pulses = isempty(corr.pulses[]) ? eachindex(corr.x_buffers) : corr.pulses[]
@@ -287,6 +290,129 @@ end
                         x_axis=collect(xe), y_axis=collect(ye),
                         xlabel=corr.x.value.name, ylabel=corr.y.value.name,
                         fixed_aspect=false)
+end
+
+## Histogram1D
+
+# Streaming 1D histogram with periodic edge rebinning. Usable both as a
+# postprocessor (attach with `@postprocess Histogram1D(...)`) and standalone
+# inside a variable body (append!() raw samples and read bincounts/bincenters).
+# When `binedges` is empty the bin range is auto-fitted from the warm-up
+# buffer using `nbins`; setting `binedges` pins the edges explicitly.
+mutable struct Histogram1D <: AbstractPostprocessor
+    nbins::Parameter{Int}
+    binedges::Parameter{Tuple{Float64, Float64}}
+    normalize::Parameter{Bool}
+
+    const buffer::CircularBuffer{Float64}
+    histogram::Hist1D{Float64}
+    rebuild::Bool
+    last_edge_update::Float64
+end
+
+function invalidate_edges(h::Histogram1D, _)
+    h.rebuild = true
+end
+
+# The `binedges` parameter is treated as auto-fitted whenever the user hasn't
+# pinned it via the GUI. `rebuild!` then writes the discovered range back via
+# `tryset` so the GUI shows live values, but `set_by_user` stays false so the
+# next rebuild still re-fits from data.
+auto_edges(binedges::Parameter{Tuple{Float64, Float64}}) = !binedges.set_by_user
+
+function Histogram1D(; buffer_size::Integer=10_000, nbins::Integer=100,
+                     binedges::Tuple{Real, Real}=(0.0, 0.0), normalize::Bool=false)
+    edges = (Float64(binedges[1]), Float64(binedges[2]))
+    explicit = edges[1] < edges[2]
+    initial = explicit ? range(edges[1], edges[2]; length=Int(nbins) + 1) :
+                         range(-1.0, 1.0; length=Int(nbins) + 1)
+    edge_param = Parameter("", edges, explicit, invalidate_edges, invalidate_edges)
+    Histogram1D(Parameter(invalidate_edges, Int(nbins)),
+                edge_param,
+                Parameter(normalize),
+                CircularBuffer{Float64}(buffer_size),
+                Hist1D(; binedges=initial, overflow=true),
+                true, 0.0)
+end
+
+default_name(::Histogram1D) = "histogram"
+
+FHist.bincounts(h::Histogram1D) = bincounts(h.histogram)
+FHist.bincenters(h::Histogram1D) = bincenters(h.histogram)
+
+const HIST_REBIN_INTERVAL = 5.0
+
+function rebuild!(h::Histogram1D)
+    edges = if auto_edges(h.binedges)
+        fitted = compute_edges(h.buffer, h.nbins[])
+        # Surface the auto-fitted range back to the GUI without claiming the
+        # binedges parameter — tryset is a no-op once the user pins a range.
+        tryset(h.binedges, (Float64(first(fitted)), Float64(last(fitted))))
+        fitted
+    else
+        lo, hi = h.binedges[]
+        range(lo, hi; length=h.nbins[] + 1)
+    end
+    h.histogram = Hist1D(; binedges=edges, overflow=true)
+    for x in h.buffer
+        if isfinite(x)
+            push!(h.histogram, x)
+        end
+    end
+    h.rebuild = false
+    h.last_edge_update = time()
+end
+
+function Base.append!(h::Histogram1D, xs)
+    # The buffer only exists to settle auto-fitted bin edges during warm-up.
+    # With explicit `binedges` we still feed it so a parameter change can
+    # replay history through `rebuild!`, but skip the time/sparsity triggers
+    # since the edges are pinned.
+    explicit_edges = !auto_edges(h.binedges)
+    needs_rebuild = if isfull(h.buffer)
+        h.rebuild
+    elseif explicit_edges
+        append!(h.buffer, xs)
+        h.rebuild
+    else
+        append!(h.buffer, xs)
+        stale = time() - h.last_edge_update >= HIST_REBIN_INTERVAL
+        sparse = !isempty(h.buffer) && length(h.buffer) < 20
+        h.rebuild || sparse || stale || isfull(h.buffer)
+    end
+
+    if needs_rebuild
+        rebuild!(h)
+    else
+        for v in xs
+            if isfinite(v)
+                push!(h.histogram, v)
+            end
+        end
+    end
+    return h
+end
+
+Base.push!(h::Histogram1D, x::Number) = append!(h, (x,))
+
+# Postprocessor entry point: bin the variable's output and return self so
+# `wrap_result` can package the current histogram state into a VariableData.
+(h::Histogram1D)(data::Number) = (push!(h, data); h)
+(h::Histogram1D)(data) = (append!(h, data); h)
+
+# Lets user variables return a Histogram1D directly; the engine wraps it
+# into a VariableData with bincounts as data, bincenters as x_axis, and the
+# :histogram plot type so the GUI draws bars.
+function VariableData(h::Histogram1D; kwargs...)
+    counts = collect(Float64, bincounts(h))
+    if h.normalize[]
+        total = sum(counts)
+        if total > 0
+            counts ./= total
+        end
+    end
+    return VariableData(; data=counts, x_axis=collect(bincenters(h)),
+                        plot_type=:histogram, kwargs...)
 end
 
 ## Reducer postprocessor

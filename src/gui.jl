@@ -144,6 +144,20 @@ function draw_parameter_widget(name, param::Parameter{Vector{Int}})
     return false, nothing
 end
 
+# (lo, hi) range editor. We only commit a new value once lo < hi so the engine
+# isn't bombarded with half-edited input. Tracking of "user-pinned vs auto" is
+# handled engine-side via the parameter's `set_by_user` flag.
+function draw_parameter_widget(name, param::Parameter{Tuple{Float64, Float64}})
+    lo, hi = param.value
+    buf = Cdouble[lo, hi]
+    edited = ig.InputScalarN("##$(name)", ig.ImGuiDataType_Double, buf, 2,
+                             C_NULL, C_NULL, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
+    if !edited || !(buf[1] < buf[2])
+        return false, nothing
+    end
+    return true, (buf[1], buf[2])
+end
+
 function draw_parameter_widget(name, param::Parameter{OptionalDims})
     ps = state[].client.parameter_states[param.name]::OptionalDimsState
 
@@ -235,9 +249,8 @@ function draw_parameter_widget(name, param::Parameter{Dependency})
 end
 
 function draw_parameter_widget(name, param::Parameter{Bool})
-    @c ig.Checkbox("", &param.value)
-
-    return false, nothing
+    changed = @c ig.Checkbox("##$(name)", &param.value)
+    return changed, param.value
 end
 
 function get_variable_typeinfo(name)

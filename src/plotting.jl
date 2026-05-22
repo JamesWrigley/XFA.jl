@@ -1183,37 +1183,30 @@ function draw_plot(plot::Plot, store, was_updated)
         elseif no_data
             ig.Text("Array has length 0, nothing to plot")
         elseif data isa AbstractVector
+            xs, ys = if is_scalar
+                store.scalar_tids_cache, store.scalar_data_cache
+            elseif !isnothing(store.x_axis)
+                store.x_axis, data
+            elseif is_dimarray
+                parent(lookup(data)[1]), parent(data)
+            else
+                eachindex(data), data
+            end
+
             if was_updated
-                if is_scalar
-                    compute_fit!(plot.fit, store.scalar_data_cache, store.scalar_tids_cache)
-                elseif is_dimarray
-                    compute_fit!(plot.fit, parent(data), parent(lookup(data)[1]))
-                else
-                    compute_fit!(plot.fit, data)
-                end
+                compute_fit!(plot.fit, ys, xs)
             end
 
             if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
-                if is_scalar
-                    tids = store.scalar_tids_cache
-                    vals = store.scalar_data_cache
-                    if length(vals) == 1
-                        ImPlot.PlotScatter(label, tids, vals)
-                    else
-                        ImPlot.PlotLine(label, tids, vals)
-                    end
-                elseif length(data) == 1
-                    if is_dimarray
-                        ImPlot.PlotScatter(label, parent(lookup(data)[1]), parent(data))
-                    else
-                        ImPlot.PlotScatter(label, data)
-                    end
+                if store.plot_type === :histogram
+                    bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
+                    ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
+                    ImPlot.PlotBars(label, xs, ys; bar_size)
+                    ImPlot.PopStyleColor()
+                elseif length(ys) == 1
+                    ImPlot.PlotScatter(label, xs, ys)
                 else
-                    if is_dimarray
-                        ImPlot.PlotLine(label, parent(lookup(data)[1]), parent(data))
-                    else
-                        ImPlot.PlotLine(label, data)
-                    end
+                    ImPlot.PlotLine(label, xs, ys)
                 end
                 draw_fit_overlay(plot.fit)
                 check_plot_interaction!(plot)

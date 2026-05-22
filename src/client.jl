@@ -741,6 +741,7 @@ function store_variable_data!(client, variable::VariableData)
     store.y_axis = variable.y_axis
     store.unit = variable.unit
     store.fixed_aspect = variable.fixed_aspect
+    store.plot_type = variable.plot_type
 
     # Use explicit labels if provided, otherwise derive from DimArray or data type.
     # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).
