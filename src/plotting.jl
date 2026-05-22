@@ -612,15 +612,16 @@ end
 # Re-run the selected fit against the plot's current X/Y samples. Called from
 # the draw_plot data-update path so the popt stays in sync with what's shown.
 function compute_fit!(fit::FitSettings, ydata::AbstractVector,
-                      xdata::Maybe{AbstractVector}=nothing)
+                      xdata::Maybe{AbstractVector}=nothing;
+                      sigma::Maybe{AbstractVector}=nothing)
     name = FIT_TYPES[fit.fit_type[] + 1]
     t0 = time_ns()
     if name == "Line"
-        fit.popt, fit.retcode = fit_line(ydata, xdata)
+        fit.popt, fit.retcode = fit_line(ydata, xdata; sigma)
     elseif name == "Gaussian"
-        fit.popt, fit.retcode = fit_gaussian(ydata, xdata)
+        fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma)
     elseif name == "erf"
-        fit.popt, fit.retcode = fit_erf(ydata, xdata)
+        fit.popt, fit.retcode = fit_erf(ydata, xdata; sigma)
     else
         fit.popt = nothing
         fit.retcode = nothing
@@ -1554,7 +1555,8 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                         if isnothing(plot.accu)
                             compute_fit!(plot.fit, plot.y_data, plot.x_data)
                         else
-                            compute_fit!(plot.fit, plot.accu.y_values, plot.accu.x_values)
+                            compute_fit!(plot.fit, plot.accu.y_values, plot.accu.x_values;
+                                         sigma=plot.accu.sigma)
                         end
                     end
 

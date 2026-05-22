@@ -6,12 +6,15 @@ mutable struct AccuPairSequence
 
     # Parallel arrays sorted by bin_keys ascending. bin_keys is the fixed
     # integer bin index; x_values/y_values hold each bin's running x and y
-    # mean; y_lower/y_upper hold y_mean ± half-std.
+    # mean; y_lower/y_upper hold y_mean ± half-std (for plotting); sigma is
+    # the standard error of the bin's y mean (for weighted fitting; 0.0 when
+    # only one sample has landed in the bin).
     bin_keys::Vector{Int}
     x_values::Vector{Float64}
     y_values::Vector{Float64}
     y_lower::Vector{Float64}
     y_upper::Vector{Float64}
+    sigma::Vector{Float64}
 
     # Per-bin Welford state (counts and sum of squared y-deviations).
     counts::Vector{Int}
@@ -25,7 +28,7 @@ function AccuPairSequence(resolution::Real)
 
     AccuPairSequence(Float64(resolution),
                      Int[],
-                     Float64[], Float64[], Float64[], Float64[],
+                     Float64[], Float64[], Float64[], Float64[], Float64[],
                      Int[], Float64[])
 end
 
@@ -58,14 +61,18 @@ function Base.append!(seq::AccuPairSequence, x::Real, y::Real)
         half_std = 0.5 * sqrt(seq.y_m2[i] / n)
         seq.y_lower[i] = seq.y_values[i] - half_std
         seq.y_upper[i] = seq.y_values[i] + half_std
+        # SEM of the bin mean: sample_std / sqrt(n) = sqrt(m2 / (n-1) / n).
+        seq.sigma[i] = sqrt(seq.y_m2[i] / ((n - 1) * n))
     else
         # New bin at the sorted insertion point; single-sample band collapses
-        # to the line (half_std == 0).
+        # to the line (half_std == 0) and sigma stays 0 until a second sample
+        # arrives.
         insert!(seq.bin_keys, i, key)
         insert!(seq.x_values, i, x)
         insert!(seq.y_values, i, y)
         insert!(seq.y_lower, i, y)
         insert!(seq.y_upper, i, y)
+        insert!(seq.sigma, i, 0.0)
         insert!(seq.counts, i, 1)
         insert!(seq.y_m2, i, 0.0)
     end
@@ -78,6 +85,7 @@ function reset!(seq::AccuPairSequence)
     empty!(seq.y_values)
     empty!(seq.y_lower)
     empty!(seq.y_upper)
+    empty!(seq.sigma)
     empty!(seq.counts)
     empty!(seq.y_m2)
     return seq

@@ -15,25 +15,31 @@ function erf(x, y0, A, center, fwhm)
     return (A / 2) * base_erf(2√log(2) / fwhm * (x - center)) + y0
 end
 
-# Default xdata, mask non-finite ydata samples, return paired (x, y) as Float64
+# Default xdata, mask non-finite ydata samples (and non-positive sigma entries
+# when sigma is provided), return paired (x, y, sigma_or_nothing) as Float64
 # vectors. Returns `nothing` if no finite samples remain.
-function mask_finite(ydata::AbstractVector, xdata::Maybe{AbstractVector})
+function mask_finite(ydata::AbstractVector, xdata::Maybe{AbstractVector},
+                     sigma::Maybe{AbstractVector}=nothing)
     if isnothing(xdata)
         xdata = eachindex(ydata)
     end
     mask = isfinite.(ydata)
+    if !isnothing(sigma)
+        mask .&= isfinite.(sigma) .& (sigma .> 0)
+    end
     x = float.(xdata[mask])
     y = float.(ydata[mask])
     if isempty(y)
         return nothing
     end
-    return x, y
+    σ = isnothing(sigma) ? nothing : float.(sigma[mask])
+    return x, y, σ
 end
 
 # Solve a nonlinear least-squares fit, returning `(popt_or_nothing, retcode)`
 # where retcode is the SciML return code as a Symbol.
-function run_fit(model, p0, x, y; lb=nothing, ub=nothing)
-    prob = NonlinearCurveFitProblem(model, collect(p0), x, y; lb, ub)
+function run_fit(model, p0, x, y; sigma=nothing, lb=nothing, ub=nothing)
+    prob = NonlinearCurveFitProblem(model, collect(p0), x, y, sigma; lb, ub)
     sol = solve(prob)
 
     u = successful_retcode(sol.retcode) ? sol.u : nothing
@@ -47,16 +53,17 @@ end
 #
 # `A_sign`: 0 (default) allows either peak direction, 1 forces upward, -1 forces downward.
 function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
+                      sigma::Maybe{AbstractVector}=nothing,
                       p0::Maybe{AbstractVector}=nothing, A_sign::Int=0)
     if !isnothing(p0) && length(p0) != 4
         throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
     end
 
-    masked = mask_finite(ydata, xdata)
+    masked = mask_finite(ydata, xdata, sigma)
     if isnothing(masked)
         return nothing, :NoFiniteSamples
     end
-    x, y = masked
+    x, y, σ = masked
 
     if isnothing(p0)
         if A_sign >= 0
@@ -81,7 +88,7 @@ function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothin
     end
 
     model = ScalarModel((p, xi) -> gaussian(xi, p[1], p[2], p[3], p[4]))
-    popt, retcode = run_fit(model, p0, x, y; lb, ub)
+    popt, retcode = run_fit(model, p0, x, y; sigma=σ, lb, ub)
     if isnothing(popt)
         return nothing, retcode
     end
@@ -95,16 +102,17 @@ end
 # retcode)` — popt is the fitted [y0, A, center, width] vector (or `nothing` on
 # failure) and retcode is a Symbol tagged with the solver outcome.
 function fit_erf(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
+                 sigma::Maybe{AbstractVector}=nothing,
                  p0::Maybe{AbstractVector}=nothing)
     if !isnothing(p0) && length(p0) != 4
         throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
     end
 
-    masked = mask_finite(ydata, xdata)
+    masked = mask_finite(ydata, xdata, sigma)
     if isnothing(masked)
         return nothing, :NoFiniteSamples
     end
-    x, y = masked
+    x, y, σ = masked
 
     if isnothing(p0)
         # Edges estimated from the outer 10% of the data on each side.
@@ -120,24 +128,25 @@ function fit_erf(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
     end
 
     model = ScalarModel((p, xi) -> erf(xi, p[1], p[2], p[3], p[4]))
-    return run_fit(model, p0, x, y)
+    return run_fit(model, p0, x, y; sigma=σ)
 end
 
 # Fit a line to (xdata, ydata). Returns `(popt, retcode)` — popt is
 # [slope, intercept] (or `nothing` on failure / fewer than two finite samples)
 # and retcode is a Symbol tagged with the solver outcome.
-function fit_line(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing)
-    masked = mask_finite(ydata, xdata)
+function fit_line(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
+                  sigma::Maybe{AbstractVector}=nothing)
+    masked = mask_finite(ydata, xdata, sigma)
     if isnothing(masked)
         return nothing, :NoFiniteSamples
     end
-    x, y = masked
+    x, y, σ = masked
 
     if length(y) < 2
         return nothing, :InsufficientData
     end
 
-    sol = solve(CurveFitProblem(x, y), LinearCurveFitAlgorithm())
+    sol = solve(CurveFitProblem(x, y; sigma=σ), LinearCurveFitAlgorithm())
     retcode = Symbol(sol.retcode)
     u = successful_retcode(sol.retcode) ? collect(sol.u) : nothing
     return u, retcode
