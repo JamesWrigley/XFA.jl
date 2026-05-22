@@ -500,7 +500,8 @@ function center_of_mass(data::AbstractVector)
             weighted += i * v
         end
     end
-    return weighted / total
+    ax = axes(data, 1)
+    return clamp(weighted / total, first(ax), last(ax))
 end
 
 function center_of_mass(data::AbstractMatrix)
@@ -515,7 +516,9 @@ function center_of_mass(data::AbstractMatrix)
             wy += i * v
         end
     end
-    return (wx / total, wy / total)
+    rows, cols = axes(data, 1), axes(data, 2)
+    return (clamp(wx / total, first(cols), last(cols)),
+            clamp(wy / total, first(rows), last(rows)))
 end
 
 function (m::MovingAvg)(data::AbstractArray)
