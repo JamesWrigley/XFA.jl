@@ -682,6 +682,12 @@ function store_variable_data!(client, variable::VariableData)
     data = variable.data
     name = variable.name
 
+    # `nothing` means the engine skipped this train (missing input, failed
+    # body, or a variable that opted out by returning nothing). Skip silently.
+    if isnothing(data)
+        return
+    end
+
     compression_ratio = NaN
     received_bytes = data isa AbstractArray ? sizeof(data) : 0
     if data isa CompressedArray
