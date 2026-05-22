@@ -9,10 +9,10 @@ function gaussian(x, y0, A, μ, σ)
     return y0 + A * exp(-(x - μ)^2 / (2 * σ^2))
 end
 
-# Parameterized error function. `width` is the full transition width; `A` is the
+# Parameterized error function. `fwhm` is the Gaussian FWHM; `A` is the
 # total step height between the two asymptotes.
-function erf(x, y0, A, center, width)
-    return (A / 2) * base_erf((x - center) / (width / 4)) + y0
+function erf(x, y0, A, center, fwhm)
+    return (A / 2) * base_erf(2√log(2) / fwhm * (x - center)) + y0
 end
 
 # Default xdata, mask non-finite ydata samples, return paired (x, y) as Float64
