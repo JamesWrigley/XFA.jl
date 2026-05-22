@@ -1246,6 +1246,7 @@ function draw_plot(plot::Plot, store, was_updated)
                     ImPlot.PlotLine(label, xs, ys)
                 end
                 draw_fit_overlay(plot.fit)
+                draw_variable_overlays(plot.name)
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
             end
