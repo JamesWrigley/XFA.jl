@@ -547,12 +547,14 @@ end
     @test_throws ArgumentError XFA.AccuPairSequence(-1.0)
     @test_throws ArgumentError XFA.AccuPairSequence([1.0, 2.0], [1.0], 0.1)
 
-    # First sample creates a bin immediately with a degenerate band.
+    # First sample creates a bin immediately with a degenerate band and unit
+    # sigma (single sample → weight 1 in the fit).
     seq = XFA.AccuPairSequence(0.1)
     append!(seq, 1.0, 10.0)
     @test length(seq) == 1
     @test seq.y_lower[1] == 10.0
     @test seq.y_upper[1] == 10.0
+    @test seq.sigma[1] == 1.0
 
     # Samples in the same fixed bin (floor(x/resolution)) merge; running means update.
     append!(seq, 1.05, 20.0)
@@ -562,6 +564,8 @@ end
     # y_lower/y_upper are y_mean ± half the population std (5.0 for [10, 20]).
     @test seq.y_lower[1] ≈ 12.5
     @test seq.y_upper[1] ≈ 17.5
+    # sigma = 1/sqrt(count) — bin has 2 samples.
+    @test seq.sigma[1] ≈ 1 / sqrt(2)
 
     # Motor moves to a new position: a separate bin is created.
     append!(seq, 5.0, 100.0)
