@@ -487,6 +487,37 @@ function update_moving_avg!(buffer::AbstractArray{T}, data, nsamples) where {T}
     return buffer
 end
 
+# Center of mass of an array, weighting each entry by its value. For 1D
+# returns a scalar coordinate; for 2D returns an (x, y) tuple where x is the
+# column index and y is the row index. Non-finite entries are skipped.
+function center_of_mass(data::AbstractVector)
+    total = zero(eltype(data))
+    weighted = zero(eltype(data))
+    for i in eachindex(data)
+        v = data[i]
+        if isfinite(v)
+            total += v
+            weighted += i * v
+        end
+    end
+    return weighted / total
+end
+
+function center_of_mass(data::AbstractMatrix)
+    total = zero(eltype(data))
+    wx = zero(eltype(data))
+    wy = zero(eltype(data))
+    for j in axes(data, 2), i in axes(data, 1)
+        v = data[i, j]
+        if isfinite(v)
+            total += v
+            wx += j * v
+            wy += i * v
+        end
+    end
+    return (wx / total, wy / total)
+end
+
 function (m::MovingAvg)(data::AbstractArray)
     key = hash((size(data), eltype(data)))
     if key != m.buffer_key
