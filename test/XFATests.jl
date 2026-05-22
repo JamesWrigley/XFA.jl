@@ -554,7 +554,7 @@ end
     @test seq.y_lower[1] == 10.0
     @test seq.y_upper[1] == 10.0
 
-    # Samples within resolution merge into the same bin; running means update.
+    # Samples in the same fixed bin (floor(x/resolution)) merge; running means update.
     append!(seq, 1.05, 20.0)
     @test length(seq) == 1
     @test seq.x_values[1] ≈ 1.025
@@ -570,17 +570,26 @@ end
     @test seq.x_values[2] ≈ 5.01
     @test seq.y_values[2] ≈ 150.0
 
+    # Bins are keyed on floor(x/resolution), so assignment is order-independent
+    # and samples straddling a bin boundary don't merge even if their distance
+    # is < resolution.
+    append!(seq, 0.98, 30.0)
+    @test length(seq) == 3
+    @test seq.bin_keys == [9, 10, 50]
+    @test seq.x_values[1] ≈ 0.98
+    @test seq.y_values[1] ≈ 30.0
+
     # reset! clears everything.
     XFA.reset!(seq)
     @test length(seq) == 0
 
     # Array constructor matches incremental appends.
-    xs = [1.0, 1.02, 0.98, 5.0, 5.01, 5.0]
-    ys = [10.0, 20.0, 30.0, 100.0, 200.0, 300.0]
+    xs = [1.0, 1.02, 5.0, 5.01, 5.0]
+    ys = [10.0, 20.0, 100.0, 200.0, 300.0]
     seq = XFA.AccuPairSequence(xs, ys, 0.1)
     @test length(seq) == 2
-    @test seq.x_values ≈ [1.0, 5.0033333333] atol=1e-6
-    @test seq.y_values ≈ [20.0, 200.0]
+    @test seq.x_values ≈ [1.01, 5.0033333333] atol=1e-6
+    @test seq.y_values ≈ [15.0, 200.0]
 end
 
 @testset "Fitting" begin

@@ -1,9 +1,13 @@
-# Accumulating pair sequence for binning scan data.
+# Accumulating pair sequence for binning scan data. Bins are fixed regions of
+# width `resolution` keyed by floor(x / resolution), so sample-to-bin assignment
+# is independent of arrival order.
 mutable struct AccuPairSequence
     resolution::Float64
 
-    # Arrays sorted by x_values ascending. x_values/y_values hold each bin's
-    # running x and y mean; y_lower/y_upper hold y_mean ± half-std.
+    # Parallel arrays sorted by bin_keys ascending. bin_keys is the fixed
+    # integer bin index; x_values/y_values hold each bin's running x and y
+    # mean; y_lower/y_upper hold y_mean ± half-std.
+    bin_keys::Vector{Int}
     x_values::Vector{Float64}
     y_values::Vector{Float64}
     y_lower::Vector{Float64}
@@ -20,6 +24,7 @@ function AccuPairSequence(resolution::Real)
     end
 
     AccuPairSequence(Float64(resolution),
+                     Int[],
                      Float64[], Float64[], Float64[], Float64[],
                      Int[], Float64[])
 end
@@ -37,58 +42,38 @@ function AccuPairSequence(xs::AbstractVector{<:Real}, ys::AbstractVector{<:Real}
     return seq
 end
 
-# Return the index of the bin whose x_value is within resolution of `x`, or
-# nothing if none. Bins are pairwise > resolution apart, so at most one
-# candidate qualifies — check the two nearest via binary search.
-function find_matching_bin(seq::AccuPairSequence, x::Real)
-    n = length(seq.x_values)
-    if n == 0
-        return nothing
-    end
-    i = searchsortedfirst(seq.x_values, x)
-    best_idx = nothing
-    best_dist = seq.resolution
-    for j in (i - 1, i)
-        if 1 <= j <= n
-            d = abs(x - seq.x_values[j])
-            if d <= best_dist
-                best_dist = d
-                best_idx = j
-            end
-        end
-    end
-    return best_idx
-end
+bin_key(seq::AccuPairSequence, x::Real) = floor(Int, x / seq.resolution)
 
 function Base.append!(seq::AccuPairSequence, x::Real, y::Real)
-    j = find_matching_bin(seq, x)
-    if isnothing(j)
+    key = bin_key(seq, x)
+    i = searchsortedfirst(seq.bin_keys, key)
+    if i <= length(seq.bin_keys) && seq.bin_keys[i] == key
+        # Welford merge into existing bin.
+        seq.counts[i] += 1
+        n = seq.counts[i]
+        seq.x_values[i] += (x - seq.x_values[i]) / n
+        prev_y_mean = seq.y_values[i]
+        seq.y_values[i] += (y - prev_y_mean) / n
+        seq.y_m2[i] += (y - prev_y_mean) * (y - seq.y_values[i])
+        half_std = 0.5 * sqrt(seq.y_m2[i] / n)
+        seq.y_lower[i] = seq.y_values[i] - half_std
+        seq.y_upper[i] = seq.y_values[i] + half_std
+    else
         # New bin at the sorted insertion point; single-sample band collapses
         # to the line (half_std == 0).
-        j = searchsortedfirst(seq.x_values, x)
-        insert!(seq.x_values, j, x)
-        insert!(seq.y_values, j, y)
-        insert!(seq.y_lower, j, y)
-        insert!(seq.y_upper, j, y)
-        insert!(seq.counts, j, 1)
-        insert!(seq.y_m2, j, 0.0)
-    else
-        # Welford merge. x_mean drift is bounded by resolution and neighbours
-        # are > resolution away, so the bin keeps its sorted position.
-        seq.counts[j] += 1
-        n = seq.counts[j]
-        seq.x_values[j] += (x - seq.x_values[j]) / n
-        prev_y_mean = seq.y_values[j]
-        seq.y_values[j] += (y - prev_y_mean) / n
-        seq.y_m2[j] += (y - prev_y_mean) * (y - seq.y_values[j])
-        half_std = 0.5 * sqrt(seq.y_m2[j] / n)
-        seq.y_lower[j] = seq.y_values[j] - half_std
-        seq.y_upper[j] = seq.y_values[j] + half_std
+        insert!(seq.bin_keys, i, key)
+        insert!(seq.x_values, i, x)
+        insert!(seq.y_values, i, y)
+        insert!(seq.y_lower, i, y)
+        insert!(seq.y_upper, i, y)
+        insert!(seq.counts, i, 1)
+        insert!(seq.y_m2, i, 0.0)
     end
     return seq
 end
 
 function reset!(seq::AccuPairSequence)
+    empty!(seq.bin_keys)
     empty!(seq.x_values)
     empty!(seq.y_values)
     empty!(seq.y_lower)
