@@ -531,7 +531,10 @@ function tryset(param::Parameter, value; force=false)
 
     if !param.set_by_user
         param.value = value
-        remote_do(set_parameter, 1, param.name, value, Meta.name[])
+        requestor = Base.ScopedValues.get(Meta.name)
+        if !isnothing(requestor)
+            remote_do(set_parameter, 1, param.name, value, something(requestor))
+        end
         return true
     else
         return false
