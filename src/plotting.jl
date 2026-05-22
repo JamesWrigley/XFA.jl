@@ -689,6 +689,8 @@ end
     const open::Ref{Bool} = Ref(true)
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
+    const log_x::Ref{Bool} = Ref(false)
+    const log_y::Ref{Bool} = Ref(false)
     const fixed_aspect::Ref{Bool} = Ref(true)
     const show_side_panel::Ref{Bool} = Ref(false)
     const fit::FitSettings = FitSettings()
@@ -801,6 +803,31 @@ function autoscale_buttons(plot)
         new_state = !both
         plot.autoscale_x[] = new_state
         plot.autoscale_y[] = new_state
+    end
+end
+
+"""Apply log10 scale to X/Y axes based on plot state. Call after BeginPlot,
+before any plotting calls."""
+function apply_log_scales(plot)
+    if plot.log_x[]
+        ImPlot.SetupAxisScale(ImPlot.ImAxis_X1, ImPlot.ImPlotScale_Log10)
+    end
+    if plot.log_y[]
+        ImPlot.SetupAxisScale(ImPlot.ImAxis_Y1, ImPlot.ImPlotScale_Log10)
+    end
+end
+
+"""Draw the log-scale toggle button group: [logX] [logY]"""
+function log_scale_buttons(plot)
+    ig.AlignTextToFramePadding()
+    ig.Text("Log:")
+    ig.SameLine()
+    if toggle_button("X##log-$(plot.id)", plot.log_x[])
+        plot.log_x[] = !plot.log_x[]
+    end
+    ig.SameLine()
+    if toggle_button("Y##log-$(plot.id)", plot.log_y[])
+        plot.log_y[] = !plot.log_y[]
     end
 end
 
@@ -1204,6 +1231,7 @@ function draw_plot(plot::Plot, store, was_updated)
             end
 
             if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
+                apply_log_scales(plot)
                 if store.plot_type === :histogram
                     bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
                     ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
@@ -1317,6 +1345,11 @@ function draw_plot(plot::Plot, store, was_updated)
         if !no_data
             autoscale_buttons(plot)
 
+            if !(data isa AbstractMatrix)
+                ig.SameLine()
+                log_scale_buttons(plot)
+            end
+
             if is_scalar
                 ig.SameLine()
                 if ig.Button("Clear##$(plot.id)")
@@ -1354,6 +1387,8 @@ end
     const y_data::Vector{Float64} = Float64[]
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
+    const log_x::Ref{Bool} = Ref(false)
+    const log_y::Ref{Bool} = Ref(false)
     const show_side_panel::Ref{Bool} = Ref(false)
     const fit::FitSettings = FitSettings()
     const subscribed::Vector{String} = ["", ""]
@@ -1561,6 +1596,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                     end
 
                     if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
+                        apply_log_scales(plot)
                         label = "$(x_name) vs $(y_name)"
                         if !isnothing(plot.accu)
                             # Same label_id ties the band and line to one
@@ -1594,6 +1630,7 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                     end
 
                     if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
+                        apply_log_scales(plot)
                         ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
                         ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
                         ImPlot.PopStyleVar()
@@ -1612,6 +1649,8 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
 
         if types_match
             autoscale_buttons(plot)
+            ig.SameLine()
+            log_scale_buttons(plot)
 
             if x.type == VariableType_Scalar
                 ig.SameLine()
