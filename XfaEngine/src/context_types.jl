@@ -530,6 +530,7 @@ function tryset(param::Parameter, value; force=false)
     end
 
     if !param.set_by_user
+        param.value = value
         remote_do(set_parameter, 1, param.name, value, Meta.name[])
         return true
     else
@@ -540,8 +541,29 @@ end
 Base.getindex(param::Parameter) = param.value
 Base.setindex!(param::Parameter, value) = param.value = value
 
+# Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
+# into the coordinator's parameter dict and broadcasts a ParameterChanged so
+# every client picks the engine-initiated change up in its GUI.
 function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
+
+    if haskey(worker_state.parameters, name)
+        worker_state.parameters[name].value = value
+    end
+
+    state = XfaEngine.current_engine_state
+    if isnothing(state)
+        return
+    end
+
+    msg = XfaEngine.Protocol.ParameterChanged(Parameter(name, value))
+    for (id, client) in state.clients
+        try
+            XfaEngine.Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
+        end
+    end
 end
 
 function _input(ctx_module, expr, side_effects)
