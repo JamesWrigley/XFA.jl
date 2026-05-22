@@ -1536,19 +1536,26 @@ function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
                         end
                     end
 
-                    if data_updated
-                        compute_fit!(plot.fit, plot.y_data, plot.x_data)
-                    end
-
                     # Sync accu with the current resolution: rebuild from the
                     # raw sample history whenever the plot's resolution disagrees
                     # with what's stored in accu (covers initial creation,
                     # widget edits, swaps, and variable changes).
                     res = plot.binning_resolution[]
+                    accu_changed = false
                     if res > 0 && (isnothing(plot.accu) || plot.accu.resolution != res)
                         plot.accu = AccuPairSequence(plot.x_data, plot.y_data, res)
+                        accu_changed = true
                     elseif res <= 0 && !isnothing(plot.accu)
                         plot.accu = nothing
+                        accu_changed = true
+                    end
+
+                    if data_updated || accu_changed
+                        if isnothing(plot.accu)
+                            compute_fit!(plot.fit, plot.y_data, plot.x_data)
+                        else
+                            compute_fit!(plot.fit, plot.accu.y_values, plot.accu.x_values)
+                        end
                     end
 
                     if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
