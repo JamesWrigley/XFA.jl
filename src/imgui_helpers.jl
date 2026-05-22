@@ -565,6 +565,13 @@ find_separator(s) = @something(findfirst(':', s), findfirst('.', s), Some(nothin
 # Strip a "TOPIC//" prefix from a device name, if present.
 strip_topic(s) = (m = match(r"^\w+//(.+)$", s); isnothing(m) ? s : m.captures[1])
 
+# Split a "TOPIC//device" string into (topic, device). Returns ("", s) if no
+# topic prefix is present.
+function split_topic(s)
+    m = match(r"^(\w+)//(.+)$", s)
+    isnothing(m) ? ("", s) : (m.captures[1], m.captures[2])
+end
+
 # Compute completions for a KaraboDependency text input. Returns
 # (items, formatter, query) where items is the list to complete from, formatter
 # maps an item to the string to insert, and query is the fuzzy match input.
