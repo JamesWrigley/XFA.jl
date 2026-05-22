@@ -547,15 +547,10 @@ function build_context_state(state, ctx_info)
 
             link_end_id = int32_hash("$(name).dependencies.$(arg_name => dep)")
 
-            if dep isa Dependency && dep.kind == DepKind_Variable
-                if is_group_var(dep.name)
-                    # Link from the group node's output pin for this variable
-                    link_start_id = int32_hash("$(dep.name).outputs.")
-                    dep_node = group_of(dep.name)
-                else
-                    link_start_id = ctx_state[dep.name]["outputs"][1].id
-                    dep_node = dep.name
-                end
+            if dep isa Dependency && dep.kind in (DepKind_Variable, DepKind_Subvariable)
+                owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
+                link_start_id = int32_hash("$(owner).outputs.$(pin_suffix)")
+                dep_node = is_group_var(owner) ? group_of(owner) : owner
                 link_id = int32_hash("$(link_start_id)->$(link_end_id)")
                 push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
