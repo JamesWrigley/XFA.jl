@@ -103,6 +103,97 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
     return gui_state
 end
 
+@kwdef mutable struct AttosecondState
+    fits::Vector{Vector{Float64}} = Vector{Float64}[]
+    xs::Vector{Float64} = Float64[]
+    spectrum_name::String = ""
+    last_tid::Int = -1
+end
+
+# Overlay hook called from draw_plot for each entry in client.variable_gui_states.
+# Specialize on the gui_state type to add ImPlot series on top of the plot
+# identified by `plot_name`. Called between BeginPlot/EndPlot.
+plot_overlay(::Any, plot_name) = nothing
+
+function plot_overlay(s::AttosecondState, plot_name)
+    if s.spectrum_name != plot_name
+        return
+    end
+    for (i, curve) in enumerate(s.fits)
+        ImPlot.PlotLine("spike $i fit", s.xs, curve)
+    end
+end
+
+function draw_variable_overlays(plot_name)
+    for (_, gui_state) in state[].client.variable_gui_states
+        plot_overlay(gui_state, plot_name)
+    end
+end
+
+# Resolve the variable name connected to a group's Parameter{Dependency} field.
+function group_dep_variable(var_data, field::AbstractString)
+    for (attr_id, (_, dep)) in var_data["dependencies"]
+        if get(var_data["dep_field_names"], attr_id, nothing) == field
+            return dep.name
+        end
+    end
+    return nothing
+end
+
+# spike_fitting returns a (params, n_spikes) matrix where each column is
+# (y0, A, mu, sigma) for one spike. Sample each gaussian over xs and store
+# the resulting curve in state.fits.
+function update_spike_fits!(gui_state::AttosecondState, params::AbstractMatrix, xs)
+    resize!(gui_state.xs, length(xs))
+    copyto!(gui_state.xs, xs)
+
+    n_spikes = size(params, 2)
+    resize!(gui_state.fits, n_spikes)
+    for k in 1:n_spikes
+        curve = isassigned(gui_state.fits, k) ? gui_state.fits[k] : Float64[]
+        resize!(curve, length(xs))
+        y0, A, μ, σ = params[1, k], params[2, k], params[3, k], params[4, k]
+        for (i, x) in enumerate(xs)
+            curve[i] = gaussian(x, y0, A, μ, σ)
+        end
+        gui_state.fits[k] = curve
+    end
+end
+
+function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, gui_state)
+    client = state[].client
+    if isnothing(gui_state)
+        gui_state = AttosecondState()
+        subscribe_variable(state[], "$(name).spike_fitting")
+    end
+
+    # Recompute fit curves whenever spike_fitting produces a new train.
+    gui_state.spectrum_name = something(group_dep_variable(var_data, "spectrum"), "")
+    fit_store = get(client.variable_data, "$(name).spike_fitting", nothing)
+    if !isnothing(fit_store) && fit_store.data isa AbstractMatrix &&
+       fit_store.trainId != gui_state.last_tid
+        spectrum_store = isempty(gui_state.spectrum_name) ?
+            nothing : get(client.variable_data, gui_state.spectrum_name, nothing)
+        xs = if !isnothing(spectrum_store) && spectrum_store.data isa AbstractVector
+            isnothing(spectrum_store.x_axis) ?
+                (1:length(spectrum_store.data)) : spectrum_store.x_axis
+        else
+            1:size(fit_store.data, 2)
+        end
+        update_spike_fits!(gui_state, fit_store.data, xs)
+        gui_state.last_tid = fit_store.trainId
+    end
+
+    if ig.Button("Plot fits##$(name)")
+        spectrum_name = group_dep_variable(var_data, "spectrum")
+        if !isnothing(spectrum_name)
+            push!(client.plots, Plot(spectrum_name, client.plot_counter))
+            client.plot_counter += 1
+        end
+    end
+    return gui_state
+end
+
 function draw_postprocessor_params(::Val{Symbol("XfaEngine.Context.Histogram1D")}, pp, min_node_width)
     param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
     for param_name in param_order
