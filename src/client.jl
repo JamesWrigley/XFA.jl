@@ -1060,6 +1060,7 @@ function handle_server(state)
         catch ex
             # If the client was already connected then we don't try again
             if !isnothing(client.websocket)
+                @error "Client websocket loop exited with exception" exception=(ex, catch_backtrace())
                 break
             end
 
