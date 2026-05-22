@@ -2,6 +2,7 @@
     zmq_outputs::Union{Vector{String}, Exception, Nothing} = nothing
     zmq_outputs_request::Maybe{Int} = nothing
     selected_output::Cint = 0
+    auto_select_output::Bool = false
 end
 
 function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
@@ -24,6 +25,7 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
 
         gui_state.zmq_outputs = nothing
         gui_state.selected_output = 0
+        gui_state.auto_select_output = true
     end
 
     draw_parameter("manual_configuration", params["manual_configuration"])
@@ -55,6 +57,18 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
             ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), sprint(showerror, gui_state.zmq_outputs))
         elseif gui_state.zmq_outputs isa Vector
             if !isempty(gui_state.zmq_outputs)
+                # After a trainmatcher change, push the first output through as the new address
+                if gui_state.auto_select_output
+                    gui_state.auto_select_output = false
+                    gui_state.selected_output = 0
+                    new_address = gui_state.zmq_outputs[1]
+                    address_param = params["address"]
+                    if address_param.value != new_address
+                        client.pending_source_edit = address_param.name
+                        change_parameter(Parameter(address_param.name, new_address))
+                    end
+                end
+
                 # Sync combo selection with the current address parameter
                 current_address = params["address"].value
                 if !isempty(current_address)
