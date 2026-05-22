@@ -12,7 +12,7 @@ using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
-using FHist: bincounts, binedges
+using FHist: bincounts, bincenters, binedges
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
     build_client_view!, is_scalar_data, ArrayMetadata, EngineState
@@ -1719,15 +1719,14 @@ end
     @testset "Correlation" begin
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 
-        # compute_edges: empty buffer → degenerate [0,0] padded to [-1,1];
-        # positive data → [0, max]; explicit `pulses` picks a subset.
-        @test Context.compute_edges([], [], 10) == -1:0.2:1
+        # compute_edges: empty samples → [-1,1]; otherwise min/max range
+        @test Context.compute_edges((), 10) == -1:0.2:1
 
         cb1 = CircularBuffer{Float64}([1.0, 2.0])
         cb2 = CircularBuffer{Float64}([50.0, 100.0])
-        @test Context.compute_edges([cb1], [], 10) == 1:0.1:2
-        @test Context.compute_edges([cb1, cb2], [2], 4) == 50:12.5:100
-        @test Context.compute_edges([cb1, cb2], [], 4) == 1:24.75:100
+        @test Context.compute_edges(cb1, 10) == 1:0.1:2
+        @test Context.compute_edges(Context.pulse_samples([cb1, cb2], [2]), 4) == 50:12.5:100
+        @test Context.compute_edges(Context.pulse_samples([cb1, cb2], []), 4) == 1:24.75:100
 
         # Parameter update handlers should trigger rebuilding
         for handler in (corr.buffer_size.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
@@ -1777,6 +1776,75 @@ end
         Context.correlate(corr, [1.0, 999.0], [2.0, 999.0])
         @test last(binedges(corr.histogram)[1]) ≤ 1.0
         @test sum(bincounts(corr.histogram)) == 1
+    end
+
+    @testset "Histogram1D" begin
+        h = Context.Histogram1D(; buffer_size=100, nbins=10)
+
+        # Fresh histogram: default edges, no counts
+        @test length(bincenters(h)) == 10
+        @test sum(bincounts(h)) == 0
+
+        # Scalar push triggers an initial rebuild against the buffer range
+        push!(h, 1.0)
+        @test length(h.buffer) == 1
+        @test sum(bincounts(h)) == 1
+        @test !h.rebuild
+
+        # append! a vector — each sample lands in the buffer and a bin
+        append!(h, [2.0, 3.0, 4.0, 5.0])
+        @test length(h.buffer) == 5
+        @test sum(bincounts(h)) == 5
+        # Edges should now span [1, 5] (just rebuilt by the buffer-sparse trigger)
+        @test first(binedges(h.histogram)) == 1.0
+        @test last(binedges(h.histogram)) == 5.0
+
+        # Past the sparse threshold the hot path just pushes into existing bins,
+        # leaving the edges alone until the periodic interval elapses.
+        h = Context.Histogram1D(; buffer_size=100, nbins=10)
+        append!(h, collect(1.0:30.0))
+        edges_before = collect(binedges(h.histogram))
+        append!(h, [100.0])
+        @test collect(binedges(h.histogram)) == edges_before  # no rebuild
+        @test sum(bincounts(h)) == 31
+
+        # Forcing a stale interval triggers a rebuild with the new range
+        h.last_edge_update = 0.0
+        append!(h, [200.0])
+        @test last(binedges(h.histogram)) == 200.0
+        @test sum(bincounts(h)) == 32
+
+        # Once the buffer fills, edges freeze and further samples accumulate
+        # cumulatively without touching the buffer or rebuilding.
+        h = Context.Histogram1D(; buffer_size=5, nbins=4)
+        append!(h, [1.0, 2.0, 3.0, 4.0, 5.0])
+        @test isfull(h.buffer)
+        @test sum(bincounts(h)) == 5
+        edges_at_fill = collect(binedges(h.histogram))
+        buffer_at_fill = collect(h.buffer)
+
+        # New samples bypass the buffer and bin against the frozen edges.
+        append!(h, [10.0, 20.0])
+        @test collect(h.buffer) == buffer_at_fill
+        @test collect(binedges(h.histogram)) == edges_at_fill
+        @test sum(bincounts(h)) == 7
+
+        # Stale-driven rebuild no longer fires once the buffer is full.
+        h.last_edge_update = 0.0
+        append!(h, [3.0])
+        @test collect(binedges(h.histogram)) == edges_at_fill
+        @test sum(bincounts(h)) == 8
+
+        # VariableData(::Histogram1D) wraps a histogram for direct return from
+        # a variable: bincounts as data, bincenters as x_axis, :histogram type.
+        h = Context.Histogram1D(; buffer_size=100, nbins=4)
+        append!(h, [1.0, 2.0, 3.0, 4.0])
+        vd = Context.VariableData(h; name="hist", xlabel="energy")
+        @test vd.data == collect(bincounts(h))
+        @test vd.x_axis == collect(bincenters(h))
+        @test vd.plot_type === :histogram
+        @test vd.name == "hist"
+        @test vd.xlabel == "energy"
     end
 
     @testset "KaraboBridge" begin

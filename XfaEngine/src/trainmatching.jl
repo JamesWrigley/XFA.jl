@@ -40,6 +40,7 @@ end
     ylabel::Union{String, Nothing} = nothing
     unit::Union{String, Nothing} = nothing
     fixed_aspect::Bool = true
+    plot_type::Symbol = :series
     update_rate::Float64 = 0.0
 end
 
@@ -52,14 +53,14 @@ function Base.:(==)(x::VariableData{T}, y::VariableData{T}) where {T}
     (x.tid == y.tid && x.name == y.name && x.data == y.data && x.subvariables == y.subvariables
      && x.title == y.title && x.x_axis == y.x_axis && x.y_axis == y.y_axis
      && x.xlabel == y.xlabel && x.ylabel == y.ylabel && x.unit == y.unit
-     && x.fixed_aspect == y.fixed_aspect)
+     && x.fixed_aspect == y.fixed_aspect && x.plot_type == y.plot_type)
 end
 
 function Base.hash(x::VariableData, h::UInt)
     subvariable_hash = isempty(x.subvariables) ? hash(0) : hash(x.subvariables)
     hash(x.tid, hash(x.name, hash(x.data, hash(subvariable_hash,
          hash(x.title, hash(x.x_axis, hash(x.y_axis, hash(x.xlabel, hash(x.ylabel,
-              hash(x.unit, hash(x.fixed_aspect, h)))))))))))
+              hash(x.unit, hash(x.fixed_aspect, hash(x.plot_type, h))))))))))))
 end
 
 mutable struct Trainmatcher

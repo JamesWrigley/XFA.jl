@@ -191,6 +191,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     ylabel::String = ""
     unit::Maybe{String} = nothing
     fixed_aspect::Bool = true
+    plot_type::Symbol = :series
 end
 
 struct LinkInfo

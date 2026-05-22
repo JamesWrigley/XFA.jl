@@ -158,7 +158,8 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
                      subvariables=variable.subvariables,
                      title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
                      xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                     fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+                     fixed_aspect=variable.fixed_aspect, plot_type=variable.plot_type,
+                     update_rate=variable.update_rate)
     end
 
     if !isnothing(precision)
@@ -196,7 +197,8 @@ function build_client_view!(state::EngineState, variable::VariableData,
                         title=parent_view.title, x_axis=parent_view.x_axis,
                         y_axis=parent_view.y_axis, xlabel=parent_view.xlabel,
                         ylabel=parent_view.ylabel, unit=parent_view.unit,
-                        fixed_aspect=parent_view.fixed_aspect, update_rate=parent_view.update_rate)
+                        fixed_aspect=parent_view.fixed_aspect, plot_type=parent_view.plot_type,
+                        update_rate=parent_view.update_rate)
 end
 
 function forward_output(state::EngineState, stream_output)
