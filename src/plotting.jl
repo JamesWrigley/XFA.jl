@@ -590,6 +590,8 @@ const FIT_TYPES = ["None", "Line", "Gaussian", "erf"]
     fit_type::Ref{Cint} = Ref(Cint(0))
     popt::Maybe{Vector{Float64}} = nothing
     retcode::Maybe{Symbol} = nothing
+    # Wall time of the most recent fit, in seconds.
+    elapsed::Float64 = 0.0
     # Sampled model curve, refreshed by compute_fit! on each successful fit so
     # the GUI can overlay it without re-evaluating per frame.
     const model_x::Vector{Float64} = Float64[]
@@ -612,6 +614,7 @@ end
 function compute_fit!(fit::FitSettings, ydata::AbstractVector,
                       xdata::Maybe{AbstractVector}=nothing)
     name = FIT_TYPES[fit.fit_type[] + 1]
+    t0 = time_ns()
     if name == "Line"
         fit.popt, fit.retcode = fit_line(ydata, xdata)
     elseif name == "Gaussian"
@@ -622,6 +625,7 @@ function compute_fit!(fit::FitSettings, ydata::AbstractVector,
         fit.popt = nothing
         fit.retcode = nothing
     end
+    fit.elapsed = (time_ns() - t0) / 1e9
 
     update_fit_curve!(fit, ydata, xdata)
 end
@@ -1095,6 +1099,7 @@ function draw_fitting_settings(id, fit::FitSettings)
                 ig.SetNextItemWidth(150)
                 ig.InputText("$(pname)##fit-$(id)", pointer(buf), length(buf), flags)
             end
+            ig.TextDisabled(@sprintf("Fit time: %.2f ms", fit.elapsed * 1e3))
         elseif !isnothing(fit.retcode)
             ig.TextWrapped("Fit failed: $(fit.retcode)")
         end
