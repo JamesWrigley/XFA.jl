@@ -2038,10 +2038,12 @@ end
         @test !should_compress(zeros(Bool, 600))
     end
 
+    # High precision pins the round-trip fidelity regardless of whatever
+    # lossy default the engine currently uses.
     @testset "Float round-trip (all finite)" begin
         for T in (Float32, Float64), shape in ((1000,), (40, 40))
             arr = randn(T, shape)
-            ca = compress_array(ws, arr)
+            ca = compress_array(ws, arr; precision=15)
             @test !ca.promoted && isnothing(ca.nonfinite_mask)
             @test ca.original_eltype === T && Tuple(ca.shape) == shape
             out = decompress_array(ws, ca)
@@ -2057,7 +2059,7 @@ end
         a[200] = -Inf32
         a[1500] = NaN32
 
-        ca = compress_array(ws, a)
+        ca = compress_array(ws, a; precision=15)
         @test !isnothing(ca.nonfinite_mask)
         out = decompress_array(ws, ca)
         @test isnan(out[10]) && out[100] == Inf32 && out[200] == -Inf32 && isnan(out[1500])
@@ -2096,7 +2098,7 @@ end
 
     @testset "decompress_array! into provided buffer" begin
         arr = randn(Float64, 800)
-        ca = compress_array(ws, arr)
+        ca = compress_array(ws, arr; precision=15)
         out = allocate_array(ca)
         @test eltype(out) === Float64 && size(out) == size(arr)
         decompress_array!(ws, out, ca)
