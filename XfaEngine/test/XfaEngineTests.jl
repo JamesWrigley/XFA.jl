@@ -1739,6 +1739,19 @@ end
         @test m.buffer !== prev
     end
 
+    @testset "center_of_mass" begin
+        # 1D: symmetric around index 2
+        @test Context.center_of_mass([0.0, 1.0, 0.0]) == 2.0
+        @test Context.center_of_mass([1.0, 0.0, 1.0]) == 2.0
+        # Non-finite entries are skipped
+        @test Context.center_of_mass([NaN, 1.0, 0.0, Inf]) == 2.0
+
+        # 2D: returns (x=col, y=row); single hot pixel at (row=2, col=3)
+        m = zeros(3, 4)
+        m[2, 3] = 1.0
+        @test Context.center_of_mass(m) == (3.0, 2.0)
+    end
+
     @testset "Correlation" begin
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 
