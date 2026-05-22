@@ -1200,7 +1200,19 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules
                     if !(param.value isa Dependency)
                         throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' must hold a Dependency value"))
                     end
-                    dag_deps[arg_name] = param.value
+                    # A dotted name in a DepKind_Variable means a subvariable
+                    # reference (the user-facing `Dependency("foo.bar")` form
+                    # can't disambiguate). Promote it so topological_sort and
+                    # the group-variable rewrite below see the right kind.
+                    resolved = param.value
+                    if resolved.kind == DepKind_Variable
+                        dot_idx = findfirst('.', resolved.name)
+                        if !isnothing(dot_idx)
+                            resolved = subvariable_dependency(resolved.name[1:dot_idx-1],
+                                                              resolved.name[dot_idx+1:end])
+                        end
+                    end
+                    dag_deps[arg_name] = resolved
                 end
             end
 

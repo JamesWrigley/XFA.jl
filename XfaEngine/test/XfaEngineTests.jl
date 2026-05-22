@@ -1099,6 +1099,26 @@ end
     @test ctx.dag["foo_group.foo"] == OD("group" => group_dependency("foo_group", only(filter(x -> nameof(x) == :Foo, keys(ctx.group_types)))),
                                          "data" => karabo"motor1.pos")
 
+    # Subvariable dependency passed via a group Parameter{Dependency}. The
+    # dotted name in `Dependency("bar.sub")` must be resolved as a
+    # subvariable so topological_sort can match it against the parent node.
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Dependency}
+    end
+
+    @Variable function bar()
+        42
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo(; source=Dependency("bar.sub"))
+    """)
+    @test ctx.dag["foo_group.foo"]["data"] == subvariable_dependency("bar", "sub")
+
     # Test that referencing a non-existent parameter throws
     @test_throws XfaContextException Context.load_from_string(raw"""
     @Group mutable struct Foo end
@@ -1987,29 +2007,29 @@ end
     # Subvariables follow the same rule under their qualified name. The
     # subvariables dict is keyed by the qualified name (as produced by
     # @add_subvariable), and subscriptions must look it up under that same key.
-    parent = VariableData(; tid=0, name="p", data=[1, 2],
+    bar = VariableData(; tid=0, name="p", data=[1, 2],
                           subvariables=Dict{String, Any}(
                               "p.scalar" => VariableData(0, "p.scalar", 1.5),
                               "p.arr" => VariableData(0, "p.arr", [4, 5])))
-    f = build_client_view!(state, parent, sub(), cache())
+    f = build_client_view!(state, bar, sub(), cache())
     @test f.data isa ArrayMetadata
     @test keyset(f.subvariables) == Set(["p.scalar", "p.arr"])
     @test f.subvariables["p.scalar"].data == 1.5
     @test f.subvariables["p.arr"].data isa ArrayMetadata
 
     # Subscribing to the qualified subvariable name delivers the real array.
-    f = build_client_view!(state, parent, sub("p.arr" => -1), cache())
+    f = build_client_view!(state, bar, sub("p.arr" => -1), cache())
     @test f.data isa ArrayMetadata
     @test f.subvariables["p.arr"].data == [4, 5]
 
-    # Subscribing to the parent does not implicitly subscribe its subvariables.
-    f = build_client_view!(state, parent, sub("p" => -1), cache())
+    # Subscribing to the bar does not implicitly subscribe its subvariables.
+    f = build_client_view!(state, bar, sub("p" => -1), cache())
     @test f.data == [1, 2]
     @test f.subvariables["p.arr"].data isa ArrayMetadata
 
-    # Re-prepending the parent name (the historical bug) would look up
+    # Re-prepending the bar name (the historical bug) would look up
     # "p.p.arr" and miss the subscription — make sure that doesn't happen.
-    f = build_client_view!(state, parent, sub("p.p.arr" => -1), cache())
+    f = build_client_view!(state, bar, sub("p.p.arr" => -1), cache())
     @test f.subvariables["p.arr"].data isa ArrayMetadata
 
     # Compressible payload: a long enough Float array triggers ZFP. With two
