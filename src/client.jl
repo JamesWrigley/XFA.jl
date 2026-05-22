@@ -1111,13 +1111,23 @@ end
 # ("", device, "") if the device isn't in the loaded topology.
 function source_device_info(client::ClientState, source::String)
     sep = find_separator(source)
-    device = strip_topic(isnothing(sep) ? source : source[1:sep-1])
-    for (topic, devices) in client.karabo_devices
-        if haskey(devices, device)
-            return topic, device, get(devices[device], "classId", "")
+    head = isnothing(sep) ? source : source[1:sep-1]
+    topic_hint, device = split_topic(head)
+    if !isempty(topic_hint)
+        devices = get(client.karabo_devices, topic_hint, nothing)
+        if !isnothing(devices) && haskey(devices, device)
+            return topic_hint, device, get(devices[device], "classId", "")
+        else
+            return topic_hint, device, ""
         end
+    else
+        for (topic, devices) in client.karabo_devices
+            if haskey(devices, device)
+                return topic, device, get(devices[device], "classId", "")
+            end
+        end
+        return "", device, ""
     end
-    return "", device, ""
 end
 
 source_device_class(client::ClientState, source::String) = source_device_info(client, source)[3]
@@ -1132,6 +1142,7 @@ function apply_remap_rule(client::ClientState, rule::RemapRule, source,
     if !occursin(Regex(rule.device_class), device_class)
         return nothing, nothing
     end
+
     pattern = Regex(rule.source)
     if !occursin(pattern, source)
         return nothing, nothing
