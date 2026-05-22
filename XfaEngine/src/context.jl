@@ -375,9 +375,15 @@ function to_dict(ctx::XfaContext)
         end
     end
 
+    postprocessor_origins = Dict{String, String}()
+    for (pp_name, pp) in ctx.postprocessors
+        postprocessor_origins[pp_name] = origin_path(typeof(pp))
+    end
+
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
+                "postprocessor_origins" => postprocessor_origins,
                 "displays" => ctx.displays,
                 "parameters" => parameters,
                 "inputs" => inputs,

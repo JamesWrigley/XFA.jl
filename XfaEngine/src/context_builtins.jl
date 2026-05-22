@@ -303,6 +303,10 @@ mutable struct Histogram1D <: AbstractPostprocessor
     nbins::Parameter{Int}
     binedges::Parameter{Tuple{Float64, Float64}}
     normalize::Parameter{Bool}
+    windowed::Parameter{Bool}
+    # Capacity expressed in trains; the underlying sample buffer is (re)sized
+    # to `length(xs) * buffer_size` on each `append!` call.
+    buffer_size::Parameter{Int}
 
     const buffer::CircularBuffer{Float64}
     histogram::Hist1D{Float64}
@@ -320,8 +324,9 @@ end
 # next rebuild still re-fits from data.
 auto_edges(binedges::Parameter{Tuple{Float64, Float64}}) = !binedges.set_by_user
 
-function Histogram1D(; buffer_size::Integer=10_000, nbins::Integer=100,
-                     binedges::Tuple{Real, Real}=(0.0, 0.0), normalize::Bool=false)
+function Histogram1D(; buffer_size::Integer=10, nbins::Integer=100,
+                     binedges::Tuple{Real, Real}=(0.0, 0.0),
+                     normalize::Bool=false, windowed::Bool=false)
     edges = (Float64(binedges[1]), Float64(binedges[2]))
     explicit = edges[1] < edges[2]
     initial = explicit ? range(edges[1], edges[2]; length=Int(nbins) + 1) :
@@ -330,6 +335,8 @@ function Histogram1D(; buffer_size::Integer=10_000, nbins::Integer=100,
     Histogram1D(Parameter(invalidate_edges, Int(nbins)),
                 edge_param,
                 Parameter(normalize),
+                Parameter(invalidate_edges, windowed),
+                Parameter(invalidate_edges, Int(buffer_size)),
                 CircularBuffer{Float64}(buffer_size),
                 Hist1D(; binedges=initial, overflow=true),
                 true, 0.0)
@@ -364,6 +371,18 @@ function rebuild!(h::Histogram1D)
 end
 
 function Base.append!(h::Histogram1D, xs)
+    # In windowed mode the histogram is just a view of the circular buffer,
+    # so size the buffer for the requested train count, feed it, and rebuild.
+    if h.windowed[]
+        desired_cap = length(xs) * h.buffer_size[]
+        if desired_cap > 0 && h.buffer.capacity != desired_cap
+            resize!(h.buffer, desired_cap)
+        end
+        append!(h.buffer, xs)
+        rebuild!(h)
+        return h
+    end
+
     # The buffer only exists to settle auto-fitted bin edges during warm-up.
     # With explicit `binedges` we still feed it so a parameter change can
     # replay history through `rebuild!`, but skip the time/sparsity triggers

@@ -31,7 +31,7 @@ using CRC32c: crc32c
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
+using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
 include("imgui_helpers.jl")
@@ -402,6 +402,14 @@ end
 # Return a gui state object to persist custom state across frames, or nothing.
 draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
+# Specialize on Val{Symbol("ModulePath.PostprocessorType")} to draw a custom
+# parameter UI for a postprocessor. Default: list every parameter.
+function draw_postprocessor_params(::Val, pp, min_node_width)
+    for (param_name, param) in pp.params
+        draw_parameter(param_name, param; min_node_width)
+    end
+end
+
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
 # always the same, but draw_variable_content() is called inside to allow
 # custom rendering for specific variables.
@@ -554,9 +562,7 @@ function draw_variable(name, var_data)
                     if isempty(pp.params)
                         ig.TextDisabled("(no parameters)")
                     else
-                        for (param_name, param) in pp.params
-                            draw_parameter(param_name, param; min_node_width)
-                        end
+                        draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
                     end
                     ig.TreePop()
                 end
