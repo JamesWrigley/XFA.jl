@@ -491,8 +491,8 @@ end
 # returns a scalar coordinate; for 2D returns an (x, y) tuple where x is the
 # column index and y is the row index. Non-finite entries are skipped.
 function center_of_mass(data::AbstractVector)
-    total = zero(eltype(data))
-    weighted = zero(eltype(data))
+    total = 0.0
+    weighted = 0.0
     for i in eachindex(data)
         v = data[i]
         if isfinite(v)
@@ -500,8 +500,9 @@ function center_of_mass(data::AbstractVector)
             weighted += i * v
         end
     end
-    ax = axes(data, 1)
-    return clamp(weighted / total, first(ax), last(ax))
+
+    com = weighted / total
+    return com in axes(data, 1) ? com : NaN
 end
 
 function center_of_mass(data::AbstractMatrix)
@@ -516,9 +517,18 @@ function center_of_mass(data::AbstractMatrix)
             wy += i * v
         end
     end
+
+    com_x = wx / total
+    com_y = wy / total
     rows, cols = axes(data, 1), axes(data, 2)
-    return (clamp(wx / total, first(cols), last(cols)),
-            clamp(wy / total, first(rows), last(rows)))
+    if com_x ∉ axes(data, 2)
+        com_x = NaN
+    end
+    if com_y ∉ axes(data, 1)
+        com_y = NaN
+    end
+
+    return (com_x, com_y)
 end
 
 function (m::MovingAvg)(data::AbstractArray)
