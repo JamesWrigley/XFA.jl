@@ -741,7 +741,10 @@ clear_plot(::Plot) = nothing
 function check_plot_interaction!(plot)
     io = ig.GetIO()
     mouse_wheel = unsafe_load(io.MouseWheel)
-    dragging = ig.IsMouseDragging(ig.ImGuiMouseButton_Left)
+    # Disable autoscale during the drag (not on release) so ImPlot's box zoom,
+    # which commits on release, isn't overridden by apply_autoscale that frame.
+    dragging = ig.IsMouseDragging(ig.ImGuiMouseButton_Left) ||
+               ig.IsMouseDragging(ig.ImGuiMouseButton_Right)
     interacting = dragging || mouse_wheel != 0
 
     x_hovered = ImPlot.IsAxisHovered(ImPlot.ImAxis_X1)
