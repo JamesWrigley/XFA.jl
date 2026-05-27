@@ -129,7 +129,11 @@ end
 function get_all_devices(webproxies; classId=nothing)
     devices = Dict{String, Dict{String, Any}}()
     for (topic, wp) in webproxies
-        devices[topic] = get_devices(wp; classId)
+        try
+            devices[topic] = get_devices(wp; classId)
+        catch ex
+            @error "Error when getting devices for $(topic)" exception=(ex, catch_backtrace())
+        end
     end
 
     return devices
