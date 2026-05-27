@@ -30,7 +30,6 @@ ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 [sources]
 XfaEngine = {path = "XfaEngine"}
 LibSSH = {rev = "polling", url = "https://github.com/JuliaWeb/LibSSH.jl"}
-ImPlot = {rev = "main", url = "https://github.com/JuliaImGui/ImPlot.jl"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
@@ -42,7 +41,7 @@ Dates = "1.11.0"
 DimensionalData = "0.30"
 GLFW = "3"
 HTTP = "1"
-ImPlot = "0.7.1"
+ImPlot = "0.7.5"
 LibSSH = "0.7"
 ModernGL = "1"
 NaNStatistics = "0.6.55"
