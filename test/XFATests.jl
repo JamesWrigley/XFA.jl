@@ -385,6 +385,25 @@ end
         end
     end
 
+    @testset "Edit Int parameter" begin
+        @test XFA.format_param_value(42) == "42"
+
+        source = """
+        count = Parameter(0)
+        """
+        @test XFA.replace_parameter_value(source, "count", XFA.format_param_value(42)) == """
+        count = Parameter(42)
+        """
+
+        source = """
+        my_group = MyGroup(; count=3)
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "count",
+                                            XFA.format_param_value(42)) == """
+        my_group = MyGroup(; count=42)
+        """
+    end
+
     @testset "Edit string group parameter" begin
         # Replace an existing string kwarg on a generic group constructor
         source = """
