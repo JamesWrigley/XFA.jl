@@ -327,6 +327,7 @@ end
 format_param_value(s::String) = "\"$(escape_string(s))\""
 format_param_value(roi::RectROI) =
     "RectROI($(roi.corner_x), $(roi.corner_y), $(roi.width), $(roi.height))"
+format_param_value(x::Union{Integer, AbstractFloat, Bool}) = repr(x)
 format_param_value(_) = nothing
 
 # Replace the first positional argument of a `name = Parameter(...)` assignment.

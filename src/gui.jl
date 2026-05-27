@@ -107,18 +107,16 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Int})
     int32_ref = Ref(Int32(param.value))
-    ret = ig.InputInt("##$(name)", int32_ref)
-    param.value = Int(int32_ref[])
+    ret = ig.InputInt("##$(name)", int32_ref, 1, 100, ig.ImGuiInputTextFlags_EnterReturnsTrue)
+    if ret
+        param.value = Int(int32_ref[])
+    end
 
     return ret, param.value
 end
 
 function draw_parameter_widget(name, param::Parameter{String})
-    edited, new_text = SafeInputText("##$(name)"; current_text=param.value)
-    if edited && is_group_param(state[].client, param.name)
-        state[].client.pending_source_edit = param.name
-    end
-    return edited, new_text
+    return SafeInputText("##$(name)"; current_text=param.value)
 end
 
 # True if `param_name` is a fully-qualified "<group>.<field>" name belonging to
@@ -245,6 +243,15 @@ function draw_parameter_widget(name, param::Parameter{Dependency})
     if edited
         return true, new_dep
     end
+    return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{RectROI})
+    roi = param.value
+    text = "($(roi.corner_x), $(roi.corner_y), $(roi.width), $(roi.height))"
+    buf = Vector{UInt8}(undef, length(text) + 1)
+    Util.strcpy!(buf, text)
+    ig.InputText("##$(name)", buf, length(buf), ig.ImGuiInputTextFlags_ReadOnly)
     return false, nothing
 end
 
@@ -381,6 +388,7 @@ function draw_parameter(name, param; min_node_width=150)
     ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
     modified, new_value = draw_parameter_widget(name, param)
     if modified
+        state[].client.pending_source_edit = param.name
         change_parameter(Parameter(param.name, new_value))
     end
     return modified, new_value
