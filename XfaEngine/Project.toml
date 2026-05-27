@@ -31,7 +31,7 @@ ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpC
 
 [compat]
 Accessors = "0.1.44"
-DataStructures = "0.19.4"
+DataStructures = "0.18, 0.19"
 DimensionalData = "0.30"
 DistributedNext = "1.0.0"
 FHist = "0.11"
