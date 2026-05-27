@@ -582,7 +582,7 @@ end
 
 # --- Plot struct with optional GPU heatmap ---
 
-const FIT_TYPES = ["None", "Line", "Gaussian", "erf"]
+const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
 
 # Per-plot fit configuration. Shared between Plot and CorrelationPlot so the
 # side-panel fitting UI can be driven from a single struct.
@@ -605,6 +605,8 @@ elseif name == "Gaussian"
     ("y0", "A", "mu", "sigma")
 elseif name == "erf"
     ("y0", "A", "center", "fwhm")
+elseif name == "sin"
+    ("y0", "A", "period", "phi")
 else
     ()
 end
@@ -622,6 +624,8 @@ function compute_fit!(fit::FitSettings, ydata::AbstractVector,
         fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma)
     elseif name == "erf"
         fit.popt, fit.retcode = fit_erf(ydata, xdata; sigma)
+    elseif name == "sin"
+        fit.popt, fit.retcode = fit_sin(ydata, xdata; sigma)
     else
         fit.popt = nothing
         fit.retcode = nothing
@@ -671,6 +675,8 @@ function update_fit_curve!(fit::FitSettings, ydata::AbstractVector,
         x -> gaussian(x, p[1], p[2], p[3], p[4])
     elseif name == "erf"
         x -> erf(x, p[1], p[2], p[3], p[4])
+    elseif name == "sin"
+        x -> sinusoid(x, p[1], p[2], p[3], p[4])
     end
     sample_model!(fit.model_x, fit.model_y, model, xmin, xmax, 200)
 end
