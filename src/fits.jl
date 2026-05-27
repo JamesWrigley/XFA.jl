@@ -3,6 +3,8 @@ using CurveFit: NonlinearCurveFitProblem, CurveFitProblem, LinearCurveFitAlgorit
 using CurveFit.SciMLBase: successful_retcode
 using SpecialFunctions: erf as base_erf
 using NaNStatistics: nanmean
+using FFTW: rfft, rfftfreq
+using Statistics: median
 
 # Unnormalized Gaussian profile.
 function gaussian(x, y0, A, μ, σ)
@@ -129,6 +131,131 @@ function fit_erf(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
 
     model = ScalarModel((p, xi) -> erf(xi, p[1], p[2], p[3], p[4]))
     return run_fit(model, p0, x, y; sigma=σ)
+end
+
+# Estimate the dominant period of (x, y) via FFT of the mean-subtracted signal
+# with quadratic interpolation around the peak bin for sub-bin resolution.
+# Handles non-uniform sampling by linearly interpolating onto a uniform grid
+# with spacing `median(diff(x))` before the FFT. Returns period in units of x;
+# falls back to the full span when the data is too short for a meaningful FFT.
+function estimate_period(x::AbstractVector, y::AbstractVector, y0::Real)
+    span = abs(maximum(x) - minimum(x))
+    fallback = span > 0 ? span : 1.0
+    n = length(y)
+    if n < 4 || span == 0
+        return fallback
+    end
+
+    # Sort by x (samples may arrive out of order) and resample onto a uniform
+    # grid at the median spacing so the FFT sees evenly-spaced data.
+    perm = sortperm(x)
+    xs = x[perm]
+    ys = y[perm]
+    dx = median(diff(xs))
+    if !(dx > 0)
+        return fallback
+    end
+    n = max(4, round(Int, span / dx) + 1)
+    xu = range(xs[1], xs[end]; length=n)
+    yu = similar(ys, n)
+    j = 1
+    for (i, xi) in enumerate(xu)
+        while j < length(xs) - 1 && xs[j + 1] < xi
+            j += 1
+        end
+        t = (xi - xs[j]) / (xs[j + 1] - xs[j])
+        yu[i] = ys[j] + t * (ys[j + 1] - ys[j])
+    end
+
+    spectrum = abs.(rfft(yu .- y0))
+    # Bin 0 is DC (already removed, but skip to be safe).
+    idx = argmax(@view spectrum[2:end]) + 1
+    freqs = rfftfreq(n, (n - 1) / span)
+    # Quadratic interpolation around the peak for sub-bin frequency resolution.
+    δ = 0.0
+    if 1 < idx < length(spectrum)
+        a, b, c = spectrum[idx - 1], spectrum[idx], spectrum[idx + 1]
+        denom = a - 2b + c
+        if denom != 0
+            δ = clamp(0.5 * (a - c) / denom, -0.5, 0.5)
+        end
+    end
+    df = length(freqs) > 1 ? freqs[2] - freqs[1] : 0.0
+    f = freqs[idx] + δ * df
+    return f > 0 ? 1 / f : fallback
+end
+
+# Sinusoid: y0 offset, amplitude A, period (in units of x), phase φ (in units
+# of x — a horizontal shift, not an angle).
+function sinusoid(x, y0, A, period, φ)
+    return y0 + A * sin(2π * (x - φ) / period)
+end
+
+# Fit a sinusoid to (xdata, ydata). Returns `(popt, retcode)` where popt is
+# [y0, A, period, φ] (or `nothing` on failure).
+function fit_sin(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
+                 sigma::Maybe{AbstractVector}=nothing,
+                 p0::Maybe{AbstractVector}=nothing)
+    if !isnothing(p0) && length(p0) != 4
+        throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
+    end
+
+    masked = mask_finite(ydata, xdata, sigma)
+    if isnothing(masked)
+        return nothing, :NoFiniteSamples
+    end
+    x, y, σ = masked
+
+    # Center x around 0 for the fit: period and φ are otherwise strongly
+    # correlated (a tiny period change → large phase shift at large x), which
+    # makes the nonlinear solver drift along that valley. Undo the shift on
+    # popt afterwards.
+    x_center = (maximum(x) + minimum(x)) / 2
+    x_fit = x .- x_center
+
+    if !isnothing(p0)
+        # Convert caller-supplied p0 (original x frame) to the shifted frame.
+        p0 = copy(p0)
+        p0[4] -= x_center
+    end
+
+    if isnothing(p0)
+        y0_guess = nanmean(y)
+        T = estimate_period(x_fit, y, y0_guess)
+        # With period fixed, the model is linear in (y0, a, b) where
+        # A·sin(2π(x-φ)/T) = a·sin(2πx/T) + b·cos(2πx/T). Solve that LS to
+        # seed the nonlinear fit near the optimum.
+        s = sin.(2π .* x_fit ./ T)
+        c = cos.(2π .* x_fit ./ T)
+        M = hcat(ones(length(x_fit)), s, c)
+        coeffs = M \ y
+        y0, a, b = coeffs
+        A = hypot(a, b)
+        # a = A·cos(2πφ/T), b = -A·sin(2πφ/T) ⇒ φ = -T/(2π)·atan(b, a)
+        φ = -T / (2π) * atan(b, a)
+        p0 = [y0, A, T, φ]
+    end
+
+    model = ScalarModel((p, xi) -> sinusoid(xi, p[1], p[2], p[3], p[4]))
+    popt, retcode = run_fit(model, p0, x_fit, y; sigma=σ)
+    if isnothing(popt)
+        return nothing, retcode
+    end
+
+    # Undo the x shift: φ in the original frame is offset by x_center.
+    popt[4] += x_center
+
+    # Canonicalize: A ≥ 0, period > 0, φ ∈ [0, period).
+    if popt[3] < 0
+        popt[3] = -popt[3]
+        popt[2] = -popt[2]
+    end
+    if popt[2] < 0
+        popt[2] = -popt[2]
+        popt[4] += popt[3] / 2
+    end
+    popt[4] = mod(popt[4], popt[3])
+    return popt, retcode
 end
 
 # Fit a line to (xdata, ydata). Returns `(popt, retcode)` — popt is

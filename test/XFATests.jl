@@ -668,6 +668,22 @@ end
         @test_throws ArgumentError XFA.fit_erf(y, x; p0=[1.0])
     end
 
+    @testset "fit_sin" begin
+        # Multi-cycle data with a non-trivial phase shift.
+        y0, A, period, φ = 0.5, 2.0, 3.0, 0.4
+        x = collect(range(0.0, 30.0; length=600))
+        y = @. XFA.sinusoid(x, y0, A, period, φ)
+        popt, retcode = XFA.fit_sin(y, x)
+        @test popt ≈ [y0, A, period, φ] atol=1e-4
+        @test retcode == :Success
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_sin(y, x; p0=[1.0, 2.0])
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        @test XFA.fit_sin(fill(NaN, 10)) == (nothing, :NoFiniteSamples)
+    end
+
     @testset "fit_line" begin
         line(x, intercept, slope) = intercept + slope * x
 
