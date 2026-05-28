@@ -1185,34 +1185,46 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules
                                 argument_names)
             dag_deps[argument_names[arg_idx]] = group_dependency(group_name, group_type)
 
-            # Resolve GroupParameter dependencies by looking up the parameter
-            # value from the instantiated group.
+            # Resolve GroupParameter dependencies, which may reference either
+            # a Parameter field of the group, another @Variable in the group,
+            # or a subvariable of one.
             for (arg_name, dep) in dag_deps
                 if dep isa Dependency && dep.kind == DepKind_GroupParameter
-                    param_field = Symbol(dep.parameter)
-                    if !hasfield(group_type, param_field) || !(fieldtype(group_type, param_field) <: Parameter)
-                        throw(XfaContextException("'$(dep.parameter)' is not a Parameter field of $(nameof(group_type))"))
-                    end
-                    param = getproperty(object, param_field)
-                    if isnothing(param.value)
-                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' has no value"))
-                    end
-                    if !(param.value isa Dependency)
-                        throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' must hold a Dependency value"))
-                    end
-                    # A dotted name in a DepKind_Variable means a subvariable
-                    # reference (the user-facing `Dependency("foo.bar")` form
-                    # can't disambiguate). Promote it so topological_sort and
-                    # the group-variable rewrite below see the right kind.
-                    resolved = param.value
-                    if resolved.kind == DepKind_Variable
-                        dot_idx = findfirst('.', resolved.name)
-                        if !isnothing(dot_idx)
-                            resolved = subvariable_dependency(resolved.name[1:dot_idx-1],
-                                                              resolved.name[dot_idx+1:end])
+                    dot_idx = findfirst('.', dep.parameter)
+                    head = isnothing(dot_idx) ? dep.parameter : dep.parameter[1:dot_idx-1]
+                    tail = isnothing(dot_idx) ? "" : dep.parameter[dot_idx+1:end]
+                    head_sym = Symbol(head)
+
+                    if hasfield(group_type, head_sym) && fieldtype(group_type, head_sym) <: Parameter
+                        if !isempty(tail)
+                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' cannot be subscripted with '.$tail'"))
                         end
+                        param = getproperty(object, head_sym)
+                        if isnothing(param.value)
+                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' has no value"))
+                        end
+                        if !(param.value isa Dependency)
+                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' must hold a Dependency value"))
+                        end
+                        # A dotted name in a DepKind_Variable means a subvariable
+                        # reference (the user-facing `Dependency("foo.bar")` form
+                        # can't disambiguate). Promote it so topological_sort and
+                        # the group-variable rewrite below see the right kind.
+                        resolved = param.value
+                        if resolved.kind == DepKind_Variable
+                            d = findfirst('.', resolved.name)
+                            if !isnothing(d)
+                                resolved = subvariable_dependency(resolved.name[1:d-1],
+                                                                  resolved.name[d+1:end])
+                            end
+                        end
+                        dag_deps[arg_name] = resolved
+                    elseif any(nameof(f) == head_sym for f in group_types[group_type].variables)
+                        var_name = "$group_name.$head"
+                        dag_deps[arg_name] = isempty(tail) ? Dependency(var_name) : subvariable_dependency(var_name, tail)
+                    else
+                        throw(XfaContextException("'$head' is not a Parameter field or @Variable of $(nameof(group_type))"))
                     end
-                    dag_deps[arg_name] = resolved
                 end
             end
 
@@ -1281,16 +1293,17 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules
     ctx_postprocessors = Dict{String, AbstractPostprocessor}()
     ctx_variable_postprocessors = Dict{String, Vector{String}}()
     for name in keys(dag)
-        ctx_subvariables[name] = variable_subvariables(functions[name])
+        # For grouped variables the DAG name (e.g. "my_corr.correlate")
+        # differs from the bare function name used in the trait methods
+        # (e.g. subvariable "correlate.avg"), so we remap.
+        func_base = string(nameof(functions[name]))
+        ctx_subvariables[name] = [replace(s, func_base => name; count=1)
+                                  for s in variable_subvariables(functions[name])]
 
         pps = variable_postprocessors(functions[name])
         if !isempty(pps)
             ctx_variable_postprocessors[name] = String[]
 
-            # For grouped variables the DAG name (e.g. "my_corr.correlate")
-            # differs from the bare function name used in the trait method
-            # (e.g. "correlate.avg"), so we remap.
-            func_base = string(nameof(functions[name]))
             for (pp_name, processor) in pps
                 pp_name = replace(pp_name, func_base => name; count=1)
                 ctx_postprocessors[pp_name] = processor

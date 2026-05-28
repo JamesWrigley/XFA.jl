@@ -62,10 +62,12 @@ group_dependency(name::String, type::DataType) = Dependency(kind=DepKind_Group, 
 # one of its group's Parameter fields (e.g. `@Variable foo(::MyGroup, data ->
 # MyGroup.data_param)`). At load time this is resolved to the actual dependency
 # value held by the parameter.
-group_parameter_dependency(group_type::String, parameter::String) = Dependency(kind=DepKind_GroupParameter,
-                                                                               name="$group_type.$parameter",
-                                                                               group_type_name=group_type,
-                                                                               parameter=parameter)
+function group_parameter_dependency(group_type::AbstractString, parameter::AbstractString)
+    Dependency(kind=DepKind_GroupParameter,
+               name="$group_type.$parameter",
+               group_type_name=group_type,
+               parameter=parameter)
+end
 
 abstract type AbstractPostprocessor end
 function default_name end
@@ -200,9 +202,13 @@ function _parse_function_args(args; is_input=false)
                         value = MacroTools.unblock(value)
 
                         if @capture(value, head_.tail_)
-                            if !isnothing(group_type_name) && "$head" == group_type_name
-                                # Group parameter reference: e.g. MyGroup.data_param
-                                value = :(Context.group_parameter_dependency($("$head"), $("$tail")))
+                            value_str = "$value"
+                            if !isnothing(group_type_name) && startswith(value_str, "$(group_type_name).")
+                                # Reference to a member of the surrounding group's type:
+                                # a Parameter field, another @Variable, or a subvariable
+                                # of one. Resolved at group instantiation time.
+                                path = chopprefix(value_str, "$(group_type_name).")
+                                value = :(Context.group_parameter_dependency($("$group_type_name"), $path))
                             else
                                 # Subvariable reference: e.g. var.subvar
                                 value = :(Context.subvariable_dependency($("$head"), $("$tail")))

@@ -456,29 +456,30 @@ function build_context_state(state, ctx_info)
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
-        # Add dependencies from group member variables as inputs on the group node
+        # Add Parameter{Dependency} fields of the group struct as inputs. Member
+        # variable dependencies that don't bind to a group field are excluded:
+        # they're either group-internal references or static (and editable via
+        # parameters).
         dep_param_names = Set{String}()
+        seen_field_names = Set{String}()
         for (var_name, deps) in ctx_info["dag"]
             if !group_filter(var_name)
                 continue
             end
 
             for (arg_name, dep) in deps
-                if dep isa Dependency && dep.kind == DepKind_Group
+                field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
+                if isnothing(field_name)
                     continue
                 end
-                if dep isa Parameter
+                if field_name in seen_field_names
                     continue
                 end
+                push!(seen_field_names, field_name)
                 attr_id = int32_hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
-                field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
-                if !isnothing(field_name)
-                    ctx_state[name]["dep_field_names"][attr_id] = field_name
-                    push!(dep_param_names, field_name)
-                else
-                    push!(dep_param_names, arg_name)
-                end
+                ctx_state[name]["dep_field_names"][attr_id] = field_name
+                push!(dep_param_names, field_name)
             end
         end
 
@@ -534,7 +535,19 @@ function build_context_state(state, ctx_info)
 
     node_dag = Dict(name => String[] for name in keys(ctx_state))
 
+    # Reverse lookup: (group_name, field_name) -> the single attr_id used as the
+    # group's pin for that field. Multiple member-variable deps bound to the
+    # same group field collapse to one link.
+    group_field_pins = Dict{Tuple{String, String}, Int32}()
+    for gname in ctx_info["groups"]
+        for (aid, fname) in ctx_state[gname]["dep_field_names"]
+            group_field_pins[(gname, fname)] = aid
+        end
+    end
+    group_param_args_all = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
+
     new_links = LinkInfo[]
+    seen_link_ids = Set{Int32}()
     for (name, deps) in ctx_info["dag"]
         # Determine which node this variable belongs to
         node_name = is_group_var(name) ? group_of(name) : name
@@ -545,14 +558,25 @@ function build_context_state(state, ctx_info)
                 continue
             end
 
-            link_end_id = int32_hash("$(name).dependencies.$(arg_name => dep)")
+            link_end_id = if is_group_var(name)
+                field_name = get(get(group_param_args_all, name, Dict{String, String}()), arg_name, nothing)
+                isnothing(field_name) ? nothing : get(group_field_pins, (node_name, field_name), nothing)
+            else
+                int32_hash("$(name).dependencies.$(arg_name => dep)")
+            end
+            if isnothing(link_end_id)
+                continue
+            end
 
             if dep isa Dependency && dep.kind in (DepKind_Variable, DepKind_Subvariable)
                 owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
                 link_start_id = int32_hash("$(owner).outputs.$(pin_suffix)")
                 dep_node = is_group_var(owner) ? group_of(owner) : owner
                 link_id = int32_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                if !(link_id in seen_link_ids)
+                    push!(seen_link_ids, link_id)
+                    push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                end
 
                 if dep_node != node_name
                     push!(node_dag[node_name], dep_node)
@@ -561,7 +585,10 @@ function build_context_state(state, ctx_info)
                 input_name = ctx_info["dep_to_input"][dep.name]
                 link_start_id = int32_hash(input_name)
                 link_id = int32_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                if !(link_id in seen_link_ids)
+                    push!(seen_link_ids, link_id)
+                    push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                end
 
                 input_node_name = split(input_name, ".")[1]
                 if input_node_name != node_name
