@@ -1084,6 +1084,35 @@ end
     @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> karabo"motor1.pos") data end), false)
     @test_throws ArgumentError Context._variable(@__MODULE__, :(function bar(::Foo, data -> some_var) data end), false)
 
+    # A group variable can reference other @Variable's (and their
+    # subvariables) of its own group through the GroupType name, alongside
+    # Parameter fields.
+    ctx = Context.load_from_string(raw"""
+    @Group struct Foo end
+
+    @Variable function bar(::Foo)
+        @add_subvariable("sub", 1)
+        0
+    end
+
+    @Variable function baz(::Foo, whole -> Foo.bar, part -> Foo.bar.sub)
+        (whole, part)
+    end
+
+    f = Foo()
+    """)
+    @test ctx.dag["f.baz"]["whole"] == Context.Dependency("f.bar")
+    @test ctx.dag["f.baz"]["part"] == subvariable_dependency("f.bar", "sub")
+
+    # Referencing a non-existent member through the GroupType throws
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Group struct Foo end
+
+    @Variable function bar(::Foo, data -> Foo.missing) data end
+
+    f = Foo()
+    """)
+
     # Test group parameter dependency resolution
     ctx = Context.load_from_string(raw"""
     @Group mutable struct Foo
@@ -2110,6 +2139,22 @@ end
         """)
     @test Context.to_dict(ctx)["group_parameter_args"] ==
         Dict("foo_group.foo" => Dict("data" => "source"))
+
+    # Subvariables of a grouped variable must be reported under the
+    # group-qualified DAG name, not the bare function name. The client uses
+    # these strings to build output-pin IDs; if they're not remapped the
+    # downstream link's start_id won't match any pin.
+    ctx = Context.load_from_string(raw"""
+        @Group struct G end
+
+        @Variable function gv(::G)
+            @add_subvariable("sub", 1)
+            0
+        end
+
+        g = G()
+        """)
+    @test Context.to_dict(ctx)["subvariables"]["g.gv"] == ["g.gv.sub"]
 end
 
 @testset "ZfpWorkspace" begin
