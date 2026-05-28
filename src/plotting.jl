@@ -584,6 +584,16 @@ end
 
 const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
 
+# Per-parameter UI state: `fixed` selects whether the slot is held in the next
+# fit; `value` is the committed value used by the fit; `edit_buf` is the
+# InputDouble binding, copied into `value` only on Enter so live keystrokes
+# don't drive the fit.
+@kwdef mutable struct FitParameter
+    fixed::Bool = false
+    value::Float64 = 0.0
+    const edit_buf::Ref{Cdouble} = Ref(0.0)
+end
+
 # Per-plot fit configuration. Shared between Plot and CorrelationPlot so the
 # side-panel fitting UI can be driven from a single struct.
 @kwdef mutable struct FitSettings
@@ -596,6 +606,9 @@ const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
     # the GUI can overlay it without re-evaluating per frame.
     const model_x::Vector{Float64} = Float64[]
     const model_y::Vector{Float64} = Float64[]
+    # Per-parameter fix flags + values for the current fit type. Rebuilt when
+    # fit_type changes; iteration order matches the positional popt layout.
+    const params::OrderedDict{String, FitParameter} = OrderedDict{String, FitParameter}()
 end
 
 # Parameter names per fit type, matching the order returned by the fit_* funcs.
@@ -611,21 +624,41 @@ else
     ()
 end
 
+# Rebuild fit.params for the given fit type, dropping any previous per-param
+# state. Called whenever the fit type changes.
+function reset_fit_params!(fit::FitSettings)
+    empty!(fit.params)
+    for pname in fit_param_names(FIT_TYPES[fit.fit_type[] + 1])
+        fit.params[pname] = FitParameter()
+    end
+end
+
+# Collapse fit.params into the Vector{Maybe{Float64}} layout that the fit_*
+# functions consume. Returns `nothing` when no slot is pinned so the solver
+# takes its fast path.
+function fixed_vector(fit::FitSettings)
+    if !any(p.fixed for p in values(fit.params))
+        return nothing
+    end
+    return [p.fixed ? p.value : nothing for p in values(fit.params)]
+end
+
 # Re-run the selected fit against the plot's current X/Y samples. Called from
 # the draw_plot data-update path so the popt stays in sync with what's shown.
 function compute_fit!(fit::FitSettings, ydata::AbstractVector,
                       xdata::Maybe{AbstractVector}=nothing;
                       sigma::Maybe{AbstractVector}=nothing)
     name = FIT_TYPES[fit.fit_type[] + 1]
+    fixed = fixed_vector(fit)
     t0 = time_ns()
     if name == "Line"
-        fit.popt, fit.retcode = fit_line(ydata, xdata; sigma)
+        fit.popt, fit.retcode = fit_line(ydata, xdata; sigma, fixed)
     elseif name == "Gaussian"
-        fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma)
+        fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma, fixed)
     elseif name == "erf"
-        fit.popt, fit.retcode = fit_erf(ydata, xdata; sigma)
+        fit.popt, fit.retcode = fit_erf(ydata, xdata; sigma, fixed)
     elseif name == "sin"
-        fit.popt, fit.retcode = fit_sin(ydata, xdata; sigma)
+        fit.popt, fit.retcode = fit_sin(ydata, xdata; sigma, fixed)
     else
         fit.popt = nothing
         fit.retcode = nothing
@@ -1119,23 +1152,51 @@ function draw_fitting_settings(id, fit::FitSettings)
             fit.retcode = nothing
             empty!(fit.model_x)
             empty!(fit.model_y)
+            reset_fit_params!(fit)
         end
 
         name = FIT_TYPES[fit.fit_type[] + 1]
-        names = fit_param_names(name)
         if name == "None"
-            # nothing to show
-        elseif !isnothing(fit.popt) && length(fit.popt) == length(names)
-            flags = ig.ImGuiInputTextFlags_ReadOnly
-            for (i, pname) in enumerate(names)
-                # Re-fill the buffer each frame so the value stays in sync with
-                # the latest fit (cheap — only a few short strings per panel).
-                text = @sprintf("%g", fit.popt[i])
-                buf = zeros(UInt8, 64)
-                Util.strcpy!(buf, text)
-                ig.SetNextItemWidth(150)
-                ig.InputText("$(pname)##fit-$(id)", pointer(buf), length(buf), flags)
+            return
+        end
+
+        for (i, (pname, param)) in enumerate(fit.params)
+            ig.PushID("fit-param-$(id)-$(pname)")
+            @c ig.Checkbox("##fix", &param.fixed)
+            ig.SetItemTooltip("Fix this parameter to a specific value")
+            ig.SameLine()
+
+            # Mirror the fitted value into both the committed value and widget
+            # buffer for free slots so the user can flip "fixed" on and edit
+            # from the current fit.
+            if !param.fixed && !isnothing(fit.popt)
+                param.value = fit.popt[i]
+                param.edit_buf[] = fit.popt[i]
             end
+
+            flags = param.fixed ? ig.ImGuiInputTextFlags_None :
+                                  ig.ImGuiInputTextFlags_ReadOnly
+            ig.SetNextItemWidth(120)
+            # InputDouble's bound buffer updates per keystroke (only the commit
+            # to `param.value` is gated on Enter / focus-loss), so comparing
+            # edit_buf to value detects uncommitted changes mid-edit.
+            uncommitted = param.fixed && param.edit_buf[] != param.value
+            if uncommitted
+                ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(143, 98, 0, 255))
+            end
+            ig.InputDouble("$(pname)", param.edit_buf, 0.0, 0.0, "%g", flags)
+            if uncommitted
+                ig.PopStyleColor()
+            end
+            if param.fixed && ig.IsItemDeactivatedAfterEdit()
+                param.value = param.edit_buf[]
+            end
+            ig.SameLine()
+            ig.TextDisabled(param.fixed ? "(fixed)" : "(fitted)")
+            ig.PopID()
+        end
+
+        if !isnothing(fit.popt)
             ig.TextDisabled(@sprintf("Fit time: %.2f ms", fit.elapsed * 1e3))
         elseif !isnothing(fit.retcode)
             ig.TextWrapped("Fit failed: $(fit.retcode)")
@@ -1212,147 +1273,155 @@ function draw_plot(plot::Plot, store, was_updated)
     if ig.Begin("$(store.title)##$(plot.id)", plot.open)
         plot.dock_id = ig.GetWindowDockID()
         is_dimarray = data isa DimArray
+        is_matrix = data isa AbstractMatrix
         is_scalar = data isa CircularBuffer
         is_metadata = data isa ArrayMetadata
+        is_plottable = true
         label = store.title
 
-        apply_autoscale(plot)
-
-        no_data = is_metadata || length(data) == 0
         plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
         if is_metadata
             ig.Text("Waiting for data: $(plot.name)")
-        elseif no_data
+            is_plottable = false
+        elseif !(eltype(data) <: Real)
+            ig.Text("Unsupported array type: $(typeof(data))")
+            is_plottable = false
+        elseif isempty(data)
             ig.Text("Array has length 0, nothing to plot")
-        elseif data isa AbstractVector
-            xs, ys = if is_scalar
-                store.scalar_tids_cache, store.scalar_data_cache
-            elseif !isnothing(store.x_axis)
-                store.x_axis, data
-            elseif is_dimarray
-                parent(lookup(data)[1]), parent(data)
-            else
-                1:length(data), data
-            end
+            is_plottable = false
+        else
+            apply_autoscale(plot)
 
-            if was_updated
-                compute_fit!(plot.fit, ys, xs)
-            end
-
-            if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
-                apply_log_scales(plot)
-                if store.plot_type === :histogram
-                    bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
-                    ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
-                    ImPlot.PlotBars(label, xs, ys; bar_size)
-                    ImPlot.PopStyleColor()
-                elseif length(ys) == 1
-                    ImPlot.PlotScatter(label, xs, ys)
+            if data isa AbstractVector
+                xs, ys = if is_scalar
+                    store.scalar_tids_cache, store.scalar_data_cache
+                elseif !isnothing(store.x_axis)
+                    store.x_axis, data
+                elseif is_dimarray
+                    parent(lookup(data)[1]), parent(data)
                 else
-                    ImPlot.PlotLine(label, xs, ys)
+                    1:length(data), data
                 end
-                draw_fit_overlay(plot.fit)
-                draw_variable_overlays(plot.name)
-                check_plot_interaction!(plot)
-                ImPlot.EndPlot()
-            end
-        elseif data isa AbstractMatrix
-            rows, cols = size(data)
 
-            # Ensure GPU resources exist
-            ctx = get_heatmap_context()
-            needs_initial_upload = isnothing(plot.gpu_heatmap)
-            if needs_initial_upload
-                plot.gpu_heatmap = GPUHeatmap()
-                plot.fixed_aspect[] = store.fixed_aspect
-            end
-            gpu = plot.gpu_heatmap
-
-            # Update colormap if needed (use Viridis as default, index 4)
-            update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
-
-            log = plot.log_scale[]
-            log_changed = !needs_initial_upload && gpu.log_scale != log
-            if was_updated || needs_initial_upload || log_changed
-                if was_updated || needs_initial_upload
-                    upload_data!(gpu, data)
+                if was_updated
+                    compute_fit!(plot.fit, ys, xs)
                 end
-                if needs_initial_upload || log_changed || plot.autoscale_colorbar[]
-                    dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
-                    plot.colorbar_clip_min[] = dmin
-                    plot.colorbar_clip_max[] = dmax
-                    # Don't stomp a manual zoom — only reset the visible range
-                    # if the user has not adjusted it themselves (or just
-                    # toggled log mode, which makes the old range meaningless).
-                    if needs_initial_upload || log_changed || !plot.colorbar_display_zoomed
-                        margin = 0.1 * (dmax - dmin)
-                        plot.colorbar_display_min[] = dmin - margin
-                        plot.colorbar_display_max[] = dmax + margin
+
+                if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
+                    apply_log_scales(plot)
+                    if store.plot_type === :histogram
+                        bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
+                        ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
+                        ImPlot.PlotBars(label, xs, ys; bar_size)
+                        ImPlot.PopStyleColor()
+                    elseif length(ys) == 1
+                        ImPlot.PlotScatter(label, xs, ys)
+                    else
+                        ImPlot.PlotLine(label, xs, ys)
                     end
+                    draw_fit_overlay(plot.fit)
+                    draw_variable_overlays(plot.name)
+                    check_plot_interaction!(plot)
+                    ImPlot.EndPlot()
                 end
-                render_colormapped!(gpu, ctx,
-                                    plot.colorbar_clip_min[],
-                                    plot.colorbar_clip_max[],
-                                    log)
-                gpu.log_scale = log
-            end
+            elseif data isa AbstractMatrix
+                rows, cols = size(data)
 
-            # Reserve space for the colorbar on the right
-            colorbar_width = 100
-            plot_width = max(plot_size.x - colorbar_width, 100)
+                # Ensure GPU resources exist
+                ctx = get_heatmap_context()
+                needs_initial_upload = isnothing(plot.gpu_heatmap)
+                if needs_initial_upload
+                    plot.gpu_heatmap = GPUHeatmap()
+                    plot.fixed_aspect[] = store.fixed_aspect
+                end
+                gpu = plot.gpu_heatmap
 
-            plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
-            if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
-                ImPlot.SetupAxis(ImPlot.ImAxis_X1, store.xlabel)
-                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel, ImPlot.ImPlotAxisFlags_Invert)
-                tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
-                # Matplotlib convention: first dim = row (vertical, top→bottom),
-                # second dim = col (horizontal, left→right). data[1,1] at plot
-                # top-left; data[rows,cols] at plot bottom-right. Y axis is
-                # inverted so y_min sits at the top — pass swapped y bounds so
-                # the texture's data[1,:] row stays at the top.
-                has_x_axis = !isnothing(store.x_axis)
-                has_y_axis = !isnothing(store.y_axis)
-                x_min = has_x_axis ? first(store.x_axis) : 0
-                x_max = has_x_axis ? last(store.x_axis) : cols
-                y_min = has_y_axis ? first(store.y_axis) : 0
-                y_max = has_y_axis ? last(store.y_axis) : rows
-                ImPlot.PlotImage("", tex_ref,
-                                 ImPlot.ImPlotPoint(x_min, y_max),
-                                 ImPlot.ImPlotPoint(x_max, y_min))
+                # Update colormap if needed (use Viridis as default, index 4)
+                update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
 
-                draw_roi_overlays(plot, x_min, x_max, y_min, y_max)
-
-                # Show pixel coordinates and intensity when hovering
-                if ImPlot.IsPlotHovered()
-                    mouse = ImPlot.GetPlotMousePos()
-                    j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
-                    i = floor(Int, (mouse.y - y_min) / (y_max - y_min) * rows) + 1
-                    if 1 <= i <= rows && 1 <= j <= cols
-                        val = data[i, j]
-                        ImPlot.AnnotationClamped(mouse.x, mouse.y,
-                                                 ImVec2(10, -10),
-                                                 "[$i, $j] $val")
+                log = plot.log_scale[]
+                log_changed = !needs_initial_upload && gpu.log_scale != log
+                if was_updated || needs_initial_upload || log_changed
+                    if was_updated || needs_initial_upload
+                        upload_data!(gpu, data)
                     end
+                    if needs_initial_upload || log_changed || plot.autoscale_colorbar[]
+                        dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
+                        plot.colorbar_clip_min[] = dmin
+                        plot.colorbar_clip_max[] = dmax
+                        # Don't stomp a manual zoom — only reset the visible range
+                        # if the user has not adjusted it themselves (or just
+                        # toggled log mode, which makes the old range meaningless).
+                        if needs_initial_upload || log_changed || !plot.colorbar_display_zoomed
+                            margin = 0.1 * (dmax - dmin)
+                            plot.colorbar_display_min[] = dmin - margin
+                            plot.colorbar_display_max[] = dmax + margin
+                        end
+                    end
+                    render_colormapped!(gpu, ctx,
+                                        plot.colorbar_clip_min[],
+                                        plot.colorbar_clip_max[],
+                                        log)
+                    gpu.log_scale = log
                 end
 
-                check_plot_interaction!(plot)
-                ImPlot.EndPlot()
-            end
+                # Reserve space for the colorbar on the right
+                colorbar_width = 100
+                plot_width = max(plot_size.x - colorbar_width, 100)
 
-            ig.SameLine()
-            if interactive_colorbar(plot, ImVec2(colorbar_width, plot_size.y))
-                render_colormapped!(gpu, ctx,
-                                    plot.colorbar_clip_min[],
-                                    plot.colorbar_clip_max[],
-                                    plot.log_scale[])
+                plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
+                if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
+                    ImPlot.SetupAxis(ImPlot.ImAxis_X1, store.xlabel)
+                    ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel, ImPlot.ImPlotAxisFlags_Invert)
+                    tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
+                    # Matplotlib convention: first dim = row (vertical, top→bottom),
+                    # second dim = col (horizontal, left→right). data[1,1] at plot
+                    # top-left; data[rows,cols] at plot bottom-right. Y axis is
+                    # inverted so y_min sits at the top — pass swapped y bounds so
+                    # the texture's data[1,:] row stays at the top.
+                    has_x_axis = !isnothing(store.x_axis)
+                    has_y_axis = !isnothing(store.y_axis)
+                    x_min = has_x_axis ? first(store.x_axis) : 0
+                    x_max = has_x_axis ? last(store.x_axis) : cols
+                    y_min = has_y_axis ? first(store.y_axis) : 0
+                    y_max = has_y_axis ? last(store.y_axis) : rows
+                    ImPlot.PlotImage("", tex_ref,
+                                     ImPlot.ImPlotPoint(x_min, y_max),
+                                     ImPlot.ImPlotPoint(x_max, y_min))
+
+                    draw_roi_overlays(plot, x_min, x_max, y_min, y_max)
+
+                    # Show pixel coordinates and intensity when hovering
+                    if ImPlot.IsPlotHovered()
+                        mouse = ImPlot.GetPlotMousePos()
+                        j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
+                        i = floor(Int, (mouse.y - y_min) / (y_max - y_min) * rows) + 1
+                        if 1 <= i <= rows && 1 <= j <= cols
+                            val = data[i, j]
+                            ImPlot.AnnotationClamped(mouse.x, mouse.y,
+                                                     ImVec2(10, -10),
+                                                     "[$i, $j] $val")
+                        end
+                    end
+
+                    check_plot_interaction!(plot)
+                    ImPlot.EndPlot()
+                end
+
+                ig.SameLine()
+                if interactive_colorbar(plot, ImVec2(colorbar_width, plot_size.y))
+                    render_colormapped!(gpu, ctx,
+                                        plot.colorbar_clip_min[],
+                                        plot.colorbar_clip_max[],
+                                        plot.log_scale[])
+                end
             end
         end
-        is_matrix = data isa AbstractMatrix
-        end_plot_area!(plot, side_panel_width, plot_area_h, !no_data,
+
+        end_plot_area!(plot, side_panel_width, plot_area_h, is_plottable,
                        () -> draw_side_panel(plot, store, is_scalar, is_matrix))
 
-        if !no_data
+        if is_plottable
             autoscale_buttons(plot)
 
             if !(data isa AbstractMatrix)

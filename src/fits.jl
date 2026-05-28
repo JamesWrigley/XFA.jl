@@ -40,13 +40,57 @@ end
 
 # Solve a nonlinear least-squares fit, returning `(popt_or_nothing, retcode)`
 # where retcode is the SciML return code as a Symbol.
-function run_fit(model, p0, x, y; sigma=nothing, lb=nothing, ub=nothing)
-    prob = NonlinearCurveFitProblem(model, collect(p0), x, y, sigma; lb, ub)
-    sol = solve(prob)
+#
+# `model_fn(xi, p)` evaluates the full model at scalar xi with the full-length
+# parameter vector p. `fixed` is `nothing` (all params free) or a length-N
+# vector where non-`nothing` entries pin that slot — fixed slots are removed
+# from the solver's parameter vector entirely (the Jacobian column is dropped,
+# not zeroed), and the result is re-expanded to a full popt.
+function run_fit(model_fn, full_p0, x, y;
+                 sigma=nothing, lb=nothing, ub=nothing,
+                 fixed::Maybe{AbstractVector}=nothing)
+    full = collect(Float64, full_p0)
+    if !isnothing(fixed) && length(fixed) != length(full)
+        throw(ArgumentError("fixed length $(length(fixed)) ≠ p0 length $(length(full))"))
+    end
 
-    u = successful_retcode(sol.retcode) ? sol.u : nothing
-    return u, Symbol(sol.retcode)
+    if isnothing(fixed)
+        free_idx = collect(eachindex(full))
+        model = ScalarModel((p, xi) -> model_fn(xi, p))
+    else
+        for i in eachindex(fixed)
+            if !isnothing(fixed[i])
+                full[i] = fixed[i]
+            end
+        end
+        free_idx = [i for i in eachindex(fixed) if isnothing(fixed[i])]
+        if isempty(free_idx)
+            return full, :Success
+        end
+        model = ScalarModel() do p_free, xi
+            # Match p_free's eltype so ForwardDiff Duals flow through.
+            p = collect(eltype(p_free), full)
+            p[free_idx] .= p_free
+            return model_fn(xi, p)
+        end
+    end
+
+    p0_used = full[free_idx]
+    lb_used = isnothing(lb) ? nothing : lb[free_idx]
+    ub_used = isnothing(ub) ? nothing : ub[free_idx]
+
+    prob = NonlinearCurveFitProblem(model, p0_used, x, y, sigma; lb=lb_used, ub=ub_used)
+    sol = solve(prob)
+    retcode = Symbol(sol.retcode)
+    if !successful_retcode(sol.retcode)
+        return nothing, retcode
+    end
+    full[free_idx] .= sol.u
+    return full, retcode
 end
+
+# True if slot `i` of a `fixed` argument is held at a specific value.
+is_fixed(fixed, i) = !isnothing(fixed) && !isnothing(fixed[i])
 
 # Fit a Gaussian to (xdata, ydata). Returns `(popt, retcode)` where popt is the
 # fitted [y0, A, μ, σ] vector (or `nothing` on failure) and retcode is a Symbol
@@ -56,7 +100,8 @@ end
 # `A_sign`: 0 (default) allows either peak direction, 1 forces upward, -1 forces downward.
 function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
                       sigma::Maybe{AbstractVector}=nothing,
-                      p0::Maybe{AbstractVector}=nothing, A_sign::Int=0)
+                      p0::Maybe{AbstractVector}=nothing, A_sign::Int=0,
+                      fixed::Maybe{AbstractVector}=nothing)
     if !isnothing(p0) && length(p0) != 4
         throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
     end
@@ -89,14 +134,17 @@ function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothin
         ub = [Inf, Amax, Inf, Inf]
     end
 
-    model = ScalarModel((p, xi) -> gaussian(xi, p[1], p[2], p[3], p[4]))
-    popt, retcode = run_fit(model, p0, x, y; sigma=σ, lb, ub)
+    model_fn(xi, p) = gaussian(xi, p[1], p[2], p[3], p[4])
+    popt, retcode = run_fit(model_fn, p0, x, y; sigma=σ, lb, ub, fixed)
     if isnothing(popt)
         return nothing, retcode
     end
 
     # σ can converge to a negative value (only σ² appears in the model).
-    popt[4] = abs(popt[4])
+    # Skip the flip if the user pinned σ explicitly.
+    if !is_fixed(fixed, 4)
+        popt[4] = abs(popt[4])
+    end
     return popt, retcode
 end
 
@@ -105,7 +153,8 @@ end
 # failure) and retcode is a Symbol tagged with the solver outcome.
 function fit_erf(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
                  sigma::Maybe{AbstractVector}=nothing,
-                 p0::Maybe{AbstractVector}=nothing)
+                 p0::Maybe{AbstractVector}=nothing,
+                 fixed::Maybe{AbstractVector}=nothing)
     if !isnothing(p0) && length(p0) != 4
         throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
     end
@@ -129,8 +178,8 @@ function fit_erf(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
         p0 = [y0, A, center, width]
     end
 
-    model = ScalarModel((p, xi) -> erf(xi, p[1], p[2], p[3], p[4]))
-    return run_fit(model, p0, x, y; sigma=σ)
+    model_fn(xi, p) = erf(xi, p[1], p[2], p[3], p[4])
+    return run_fit(model_fn, p0, x, y; sigma=σ, fixed)
 end
 
 # Estimate the dominant period of (x, y) via FFT of the mean-subtracted signal
@@ -195,7 +244,8 @@ end
 # [y0, A, period, φ] (or `nothing` on failure).
 function fit_sin(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
                  sigma::Maybe{AbstractVector}=nothing,
-                 p0::Maybe{AbstractVector}=nothing)
+                 p0::Maybe{AbstractVector}=nothing,
+                 fixed::Maybe{AbstractVector}=nothing)
     if !isnothing(p0) && length(p0) != 4
         throw(ArgumentError("p0 must have length 4, got length $(length(p0))"))
     end
@@ -219,6 +269,14 @@ function fit_sin(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
         p0[4] -= x_center
     end
 
+    # The fit runs in the shifted frame, so a fixed φ (slot 4) needs the same
+    # shift applied before it goes to the solver.
+    fixed_shifted = fixed
+    if !isnothing(fixed) && !isnothing(fixed[4])
+        fixed_shifted = copy(fixed)
+        fixed_shifted[4] = fixed[4] - x_center
+    end
+
     if isnothing(p0)
         y0_guess = nanmean(y)
         T = estimate_period(x_fit, y, y0_guess)
@@ -236,8 +294,8 @@ function fit_sin(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
         p0 = [y0, A, T, φ]
     end
 
-    model = ScalarModel((p, xi) -> sinusoid(xi, p[1], p[2], p[3], p[4]))
-    popt, retcode = run_fit(model, p0, x_fit, y; sigma=σ)
+    model_fn(xi, p) = sinusoid(xi, p[1], p[2], p[3], p[4])
+    popt, retcode = run_fit(model_fn, p0, x_fit, y; sigma=σ, fixed=fixed_shifted)
     if isnothing(popt)
         return nothing, retcode
     end
@@ -245,16 +303,19 @@ function fit_sin(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
     # Undo the x shift: φ in the original frame is offset by x_center.
     popt[4] += x_center
 
-    # Canonicalize: A ≥ 0, period > 0, φ ∈ [0, period).
-    if popt[3] < 0
+    # Canonicalize: A ≥ 0, period > 0, φ ∈ [0, period). Skip flips that would
+    # override a slot the user pinned.
+    if popt[3] < 0 && !is_fixed(fixed, 3) && !is_fixed(fixed, 2)
         popt[3] = -popt[3]
         popt[2] = -popt[2]
     end
-    if popt[2] < 0
+    if popt[2] < 0 && !is_fixed(fixed, 2) && !is_fixed(fixed, 4)
         popt[2] = -popt[2]
         popt[4] += popt[3] / 2
     end
-    popt[4] = mod(popt[4], popt[3])
+    if !is_fixed(fixed, 4)
+        popt[4] = mod(popt[4], popt[3])
+    end
     return popt, retcode
 end
 
@@ -262,7 +323,8 @@ end
 # [slope, intercept] (or `nothing` on failure / fewer than two finite samples)
 # and retcode is a Symbol tagged with the solver outcome.
 function fit_line(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
-                  sigma::Maybe{AbstractVector}=nothing)
+                  sigma::Maybe{AbstractVector}=nothing,
+                  fixed::Maybe{AbstractVector}=nothing)
     masked = mask_finite(ydata, xdata, sigma)
     if isnothing(masked)
         return nothing, :NoFiniteSamples
@@ -271,6 +333,21 @@ function fit_line(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothing;
 
     if length(y) < 2
         return nothing, :InsufficientData
+    end
+
+    # Closed-form solutions for the pinned cases — the linear solver can't
+    # express held parameters, but the 1-DOF subproblems are trivial.
+    if !isnothing(fixed) && any(!isnothing, fixed)
+        slope_fixed = fixed[1]
+        intercept_fixed = fixed[2]
+        if !isnothing(slope_fixed) && !isnothing(intercept_fixed)
+            return [Float64(slope_fixed), Float64(intercept_fixed)], :Success
+        elseif !isnothing(slope_fixed)
+            return [Float64(slope_fixed), sum(y .- slope_fixed .* x) / length(y)], :Success
+        else
+            s = sum((y .- intercept_fixed) .* x) / sum(abs2, x)
+            return [s, Float64(intercept_fixed)], :Success
+        end
     end
 
     sol = solve(CurveFitProblem(x, y; sigma=σ), LinearCurveFitAlgorithm())

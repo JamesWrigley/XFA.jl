@@ -643,6 +643,17 @@ end
 
         # Invalid p0 length is rejected.
         @test_throws ArgumentError XFA.fit_gaussian(y, x; p0=[1.0, 2.0])
+
+        # Fixed parameters: pinned slots stay put, free slots converge. Pins
+        # exercise the ForwardDiff path through the closure.
+        popt, retcode = XFA.fit_gaussian(y, x; fixed=[y0, nothing, nothing, nothing])
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        @test retcode == :Success
+        popt, _ = XFA.fit_gaussian(y, x; fixed=[nothing, nothing, μ, σ])
+        @test popt[3] == μ && popt[4] == σ
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        # All slots pinned → return the pinned vector directly.
+        @test XFA.fit_gaussian(y, x; fixed=[y0, A, μ, σ]) == ([y0, A, μ, σ], :Success)
     end
 
     @testset "fit_erf" begin
