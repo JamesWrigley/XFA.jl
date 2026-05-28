@@ -11,7 +11,7 @@ include("imnodes.jl")
 
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
-using DataStructures: CircularBuffer
+using DataStructures: CircularBuffer, OrderedDict
 using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
     ArrayMetadata, RectROI
 include("plotting.jl")
@@ -470,7 +470,8 @@ function draw_variable(name, var_data)
 
             ImNodes.BeginInputAttribute(dep_id, pin_shape)
             if var_data["type"] == :group
-                ig.Text(arg_name * ":")
+                label = get(var_data["dep_field_names"], dep_id, arg_name)
+                ig.Text(label * ":")
                 ig.SameLine()
             end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
