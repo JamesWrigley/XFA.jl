@@ -1372,7 +1372,7 @@ function draw_plot(plot::Plot, store, was_updated)
                 plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
                 if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
                     ImPlot.SetupAxis(ImPlot.ImAxis_X1, store.xlabel)
-                    ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel, ImPlot.ImPlotAxisFlags_Invert)
+                    ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel)
                     tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
                     # Matplotlib convention: first dim = row (vertical, top→bottom),
                     # second dim = col (horizontal, left→right). data[1,1] at plot
