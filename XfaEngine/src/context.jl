@@ -622,20 +622,34 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(deps))
 
+    # We read inputs asynchronously into a single Channel so as not to lose
+    # trains from a quickly updating source while waiting for train data from a
+    # slowly updating source.
+    input_data = Channel{VariableData}(max(4, length(upstream) * 4))
+    input_task = Threads.@spawn :interactive try
+        @sync for arg in values(upstream)
+            if arg isa RemoteChannel
+                Threads.@spawn :interactive try
+                    while isopen(arg) || isready(arg)
+                        put!(input_data, take!(arg))
+                    end
+                catch ex
+                    if !(ex isa InvalidStateException)
+                        @error "Upstream pump for '$(name)' failed" exception=(ex, catch_backtrace())
+                    end
+                end
+            end
+        end
+    finally
+        close(input_data)
+    end
+
     # Smoothed processing rate (Hz), reported to the client on each output.
     rate = RunningRate()
     try
         while true
             while isempty(matched_trains)
-                for arg in values(upstream)
-                    if arg isa RemoteChannel
-                        variable = take!(arg)
-
-                        if !isempty(match_train!(matched_trains, matcher, variable))
-                            break
-                        end
-                    end
-                end
+                match_train!(matched_trains, matcher, take!(input_data))
             end
 
             tid, matched_data = only(matched_trains)
@@ -728,6 +742,8 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
         for channel in values(downstream)
             close(channel)
         end
+
+        wait(input_task)
     end
 end
 
