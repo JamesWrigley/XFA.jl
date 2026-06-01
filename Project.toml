@@ -31,7 +31,7 @@ LibSSH = {rev = "safety", url = "https://github.com/JuliaWeb/LibSSH.jl"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
-CImGui = "7"
+CImGui = "7, 8.0"
 CRC32c = "1"
 DataStructures = "0.19"
 Dates = "1.11.0"
