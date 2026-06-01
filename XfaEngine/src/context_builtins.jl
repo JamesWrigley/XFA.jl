@@ -285,7 +285,7 @@ end
     # layout: first dim = row (top→bottom with y_max at top), second dim = col
     # (left→right with x_max at right).
     xe, ye = binedges(corr.histogram)
-    data = reverse(permutedims(bincounts(corr.histogram)), dims=1)
+    data = permutedims(bincounts(corr.histogram))
     return VariableData(; data,
                         x_axis=collect(xe), y_axis=collect(ye),
                         xlabel=corr.x.value.name, ylabel=corr.y.value.name,
