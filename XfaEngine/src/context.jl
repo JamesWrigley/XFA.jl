@@ -13,7 +13,7 @@ import MacroTools
 import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
 using Accessors: @set
-import DimensionalData as DD
+using DimensionalData: DimensionalData, DimensionalData as DD
 import ..XfaEngine
 
 using DataStructures: DataStructures, CircularBuffer, isfull
@@ -535,10 +535,10 @@ end
 
 function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update_rate=0.0)
     if result isa VariableData
-        VariableData(; tid, name, data=result.data, subvariables,
-                     title=result.title, x_axis=result.x_axis, y_axis=result.y_axis,
-                     xlabel=result.xlabel, ylabel=result.ylabel, unit=result.unit,
-                     fixed_aspect=result.fixed_aspect, plot_type=result.plot_type, update_rate)
+        v = @set result.tid = tid
+        v = @set v.name = name
+        v = @set v.subvariables = subvariables
+        @set v.update_rate = update_rate
     elseif result isa Histogram1D
         VariableData(result; tid, name, subvariables, update_rate)
     else

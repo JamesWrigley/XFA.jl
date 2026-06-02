@@ -289,7 +289,7 @@ end
     return VariableData(; data,
                         x_axis=collect(xe), y_axis=collect(ye),
                         xlabel=corr.x.value.name, ylabel=corr.y.value.name,
-                        fixed_aspect=false)
+                        fixed_aspect=false, compress=false)
 end
 
 ## Histogram1D

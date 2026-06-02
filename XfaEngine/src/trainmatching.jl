@@ -42,6 +42,7 @@ end
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
     update_rate::Float64 = 0.0
+    compress::Bool = true
 end
 
 VariableData(tid, name, data) = VariableData(; tid=Int(tid), name, data)
@@ -50,17 +51,30 @@ VariableData(tid, name, data, subvariables) = VariableData(; tid=Int(tid), name,
 # `update_rate` is a runtime metric, not part of value identity, so it's
 # excluded from equality and hashing.
 function Base.:(==)(x::VariableData{T}, y::VariableData{T}) where {T}
-    (x.tid == y.tid && x.name == y.name && x.data == y.data && x.subvariables == y.subvariables
-     && x.title == y.title && x.x_axis == y.x_axis && x.y_axis == y.y_axis
-     && x.xlabel == y.xlabel && x.ylabel == y.ylabel && x.unit == y.unit
-     && x.fixed_aspect == y.fixed_aspect && x.plot_type == y.plot_type)
+    for f in fieldnames(VariableData)
+        if f === :update_rate
+            continue
+        end
+        if getfield(x, f) != getfield(y, f)
+            return false
+        end
+    end
+    return true
 end
 
 function Base.hash(x::VariableData, h::UInt)
-    subvariable_hash = isempty(x.subvariables) ? hash(0) : hash(x.subvariables)
-    hash(x.tid, hash(x.name, hash(x.data, hash(subvariable_hash,
-         hash(x.title, hash(x.x_axis, hash(x.y_axis, hash(x.xlabel, hash(x.ylabel,
-              hash(x.unit, hash(x.fixed_aspect, hash(x.plot_type, h))))))))))))
+    for f in fieldnames(VariableData)
+        if f === :update_rate
+            continue
+        end
+        v = getfield(x, f)
+        if f === :subvariables && isempty(v)
+            h = hash(0, h)
+        else
+            h = hash(v, h)
+        end
+    end
+    return h
 end
 
 mutable struct Trainmatcher

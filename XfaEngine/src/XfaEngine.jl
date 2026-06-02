@@ -32,6 +32,7 @@ using DimensionalData: DimArray
 using .Protocol
 using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
 import .Context: XfaContext, VariableData, ArrayMetadata
+using Accessors: @set
 
 
 """Find the closest available port to `port_hint`."""
@@ -125,7 +126,9 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
     elseif isnothing(requested)
         METADATA_PRECISION
     elseif should_compress(data)
-        Int(requested)
+        # compress=false variables are still compressed, but reversibly rather
+        # than at the client's precision.
+        variable.compress ? Int(requested) : 0
     else
         nothing
     end
@@ -146,20 +149,10 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
         data
     end
 
-    view = if precision == METADATA_PRECISION
-        # Strip down to identity + shape; keep update_rate / subvariables but
-        # drop labels, axes etc. since the client only renders metadata.
-        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
-                     subvariables=variable.subvariables, update_rate=variable.update_rate)
-    elseif new_data === data
+    view = if new_data === data
         variable
     else
-        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
-                     subvariables=variable.subvariables,
-                     title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
-                     xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                     fixed_aspect=variable.fixed_aspect, plot_type=variable.plot_type,
-                     update_rate=variable.update_rate)
+        @set variable.data = new_data
     end
 
     if !isnothing(precision)
@@ -192,13 +185,7 @@ function build_client_view!(state::EngineState, variable::VariableData,
         return variable
     end
 
-    return VariableData(; tid=parent_view.tid, name=parent_view.name, data=parent_view.data,
-                        subvariables=new_subvars,
-                        title=parent_view.title, x_axis=parent_view.x_axis,
-                        y_axis=parent_view.y_axis, xlabel=parent_view.xlabel,
-                        ylabel=parent_view.ylabel, unit=parent_view.unit,
-                        fixed_aspect=parent_view.fixed_aspect, plot_type=parent_view.plot_type,
-                        update_rate=parent_view.update_rate)
+    return @set parent_view.subvariables = new_subvars
 end
 
 function forward_output(state::EngineState, stream_output)

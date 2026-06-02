@@ -888,17 +888,20 @@ end
 # imgui widgets, `name` is the qualified variable name to retune.
 function draw_compression_settings(id, name, precision::Ref{Cint}, store)
     compressed = isfinite(store.compression_ratio)
-    if !compressed
+    enabled = compressed && store.compress
+    if !enabled
         ig.BeginDisabled()
     end
     ig.SetNextItemWidth(120)
     if ig.InputInt("zfp precision##$(id)", precision)
         set_subscription_precision(state[], name, Int(precision[]))
     end
-    if !compressed
+    if !enabled
         ig.EndDisabled()
     end
-    if compressed
+    if !store.compress
+        ig.TextDisabled("Compression disabled for this variable")
+    elseif compressed
         ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
     elseif store.received_bytes > 0
         ig.TextDisabled("Variable is not compressed")
