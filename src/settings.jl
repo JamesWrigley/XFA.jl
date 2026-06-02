@@ -56,12 +56,18 @@ function save_settings(client::ClientState, updated_field=nothing)
     end
 
     plots = map(client.plots) do plot
-        if plot isa Plot
-            Dict("type" => "Plot", "name" => plot.name, "id" => plot.id, "dock_id" => plot.dock_id)
-        else
+        # Only single-layer Variable/Correlation plots have a stable round-trip
+        # format today; richer multi-layer plots stay in-memory only.
+        if length(plot.layers) == 1 && plot.layers[1] isa VariableLayer
+            Dict("type" => "Plot", "name" => plot.layers[1].name,
+                 "id" => plot.id, "dock_id" => plot.dock_id)
+        elseif length(plot.layers) == 1 && plot.layers[1] isa CorrelationLayer
             Dict("type" => "CorrelationPlot", "id" => plot.id, "dock_id" => plot.dock_id)
+        else
+            nothing
         end
     end
+    filter!(!isnothing, plots)
 
     ini_data = unsafe_string(ig.SaveIniSettingsToMemory(C_NULL))
 

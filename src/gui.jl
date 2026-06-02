@@ -13,7 +13,7 @@ using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
 using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
-    ArrayMetadata, RectROI
+    ArrayMetadata, RectROI, PlotSpec, LayerSpec
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -511,7 +511,7 @@ function draw_variable(name, var_data)
         if !isempty(label)
             if haskey(client.variable_data, output_name)
                 if plot_button("$(label)###$(output_name)-plot_button", output_name)
-                    push!(client.plots, Plot(output_name, client.plot_counter))
+                    push!(client.plots, variable_plot(output_name, client.plot_counter))
                     client.plot_counter += 1
                 end
             else
@@ -528,6 +528,21 @@ function draw_variable(name, var_data)
             if !isnothing(rate)
                 ig.SameLine()
                 ig.TextDisabled(@sprintf "%.2f Hz" rate)
+            end
+        end
+
+        # Advertised plot specs are openable in addition to the default plot.
+        if haskey(client.variable_data, output_name)
+            specs = client.variable_data[output_name].plot_specs
+            if !isempty(specs)
+                ig.Indent()
+                for spec in specs
+                    if ig.SmallButton("\uf201 $(spec.name)###$(output_name)-spec-$(spec.name)")
+                        push!(client.plots, spec_plot(output_name, spec.name, client.plot_counter))
+                        client.plot_counter += 1
+                    end
+                end
+                ig.Unindent()
             end
         end
 
@@ -561,7 +576,7 @@ function draw_variable(name, var_data)
                     if !isempty(typestr)
                         ig.SameLine()
                         if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
-                            push!(client.plots, Plot(pp.name, client.plot_counter))
+                            push!(client.plots, variable_plot(pp.name, client.plot_counter))
                             client.plot_counter += 1
                         end
                     end
@@ -805,7 +820,7 @@ function draw_dag()
     ig.SameLine()
     @Disabled isempty(client.variable_data) begin
         if ig.Button("Correlate")
-            push!(client.plots, CorrelationPlot(client.plot_counter))
+            push!(client.plots, correlation_plot(client.plot_counter))
             client.plot_counter += 1
         end
     end
@@ -1010,9 +1025,9 @@ function restore_plots(state::GuiState)
     # for p in get(ctx, "plots", [])
     #     dock_id = UInt32(get(p, "dock_id", 0))
     #     if p["type"] == "Plot"
-    #         push!(gui_state.client.plots, Plot(p["name"], p["id"], dock_id))
+    #         push!(gui_state.client.plots, variable_plot(p["name"], p["id"], dock_id))
     #     else
-    #         push!(gui_state.client.plots, CorrelationPlot(p["id"], dock_id))
+    #         push!(gui_state.client.plots, correlation_plot(p["id"], dock_id))
     #     end
     # end
 
@@ -1102,12 +1117,7 @@ function draw_plots()
 
     # Draw plot windows
     for plot in client.plots
-        if plot isa CorrelationPlot
-            draw_plot(plot, client.variable_data, updated_variables)
-        else
-            store = get(client.variable_data, plot.name, nothing)
-            draw_plot(plot, store, !isnothing(store) && haskey(updated_variables, plot.name))
-        end
+        draw_plot(plot, updated_variables)
     end
 
     # Remove closed plots

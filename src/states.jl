@@ -193,6 +193,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
     compress::Bool = true
+    plot_specs::Vector{PlotSpec} = PlotSpec[]
 end
 
 struct LinkInfo
@@ -349,7 +350,7 @@ end
     variable_data::Dict{String, VariableStore} = Dict()
     variable_gui_states::Dict{String, Any} = Dict()
     plot_counter::Int = 0
-    plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
+    plots::Vector{Plot} = Plot[]
 
     # Variable subscriptions, keyed by fully-qualified name. Entries are
     # removed when the open-plot count drops to zero. The keys (and each

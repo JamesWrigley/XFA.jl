@@ -187,7 +187,7 @@ function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, g
     if ig.Button("Plot fits##$(name)")
         spectrum_name = group_dep_variable(var_data, "spectrum")
         if !isnothing(spectrum_name)
-            push!(client.plots, Plot(spectrum_name, client.plot_counter))
+            push!(client.plots, variable_plot(spectrum_name, client.plot_counter))
             client.plot_counter += 1
         end
     end
