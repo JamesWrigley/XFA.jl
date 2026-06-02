@@ -2,11 +2,27 @@ module XfaEngineTests
 
 __revise_mode__ = :eval
 
+# Copy CondaPkg.toml to the test project so that it gets found by CondaPkg
+# during the tests. If this was instead in the project directory it would also
+# be used by CondaPkg outside of the tests, which we don't want.
+cp(joinpath(@__DIR__, "CondaPkg.toml"), joinpath(dirname(Base.active_project()), "CondaPkg.toml"); force=true)
+
+ENV["JULIA_CONDAPKG_ENV"] = "@xfaengine-tests"
+ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
+
+# If you're running the tests locally you could uncomment the two environment
+# variables below. This will be a bit faster since it stops CondaPkg from
+# re-resolving the environment each time (but you do need to run it at least
+# once locally to initialize the environment).
+# ENV["JULIA_PYTHONCALL_EXE"] = joinpath(Base.DEPOT_PATH[1], "conda_environments", "xfaengine-tests", "bin", "python")
+# ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
+
 using Logging: Logging
 using Sockets: Sockets, @ip_str, send, recv
 using Statistics: mean
 using Test: with_logger, TestLogger
 using ReTest: @testset, @test, @test_throws, @test_logs
+
 
 using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
@@ -14,10 +30,13 @@ using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, bincenters, binedges
 
+using PythonCall
+
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
     build_client_view!, is_scalar_data, ArrayMetadata, EngineState
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array,
     decompress_array, decompress_array!, allocate_array, should_compress
+using XfaEngine: XfaEngine as engine
 using XfaEngine.Context: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
@@ -2236,6 +2255,58 @@ end
 
         @test_throws ArgumentError decompress_array!(ws, zeros(Float32, 800), ca)
         @test_throws DimensionMismatch decompress_array!(ws, zeros(801), ca)
+    end
+end
+
+@testset "Detector assembly" begin
+    @test_throws DimensionMismatch engine.assemble!(zeros(3, 3), engine.AssemblerLUT(UInt64[1, 2, 3, 4], (2, 2)), rand(4))
+
+    # ReTest may run this body on a migrated task, so hold the GIL around all
+    # the PythonCall work to avoid calling into CPython without it.
+    PythonCall.GIL.@lock begin
+        eg = pyimport("extra_geom")
+        python = pyconvert(String, pyimport("sys").executable)
+
+        # XfaEngine works with dim-reversed arrays (e.g. (nfs, nss, nmod) rather
+        # than numpy's (nmod, nss, nfs)), so flip dimensions when crossing to or
+        # from extra-geom's numpy arrays.
+        revdims(a) = permutedims(a, ndims(a):-1:1)
+
+        # For each detector, check assembly matches extra-geom's own
+        # position_modules_fast pixel for pixel (gaps included). ePix100 and
+        # single-module JUNGFRAU have fixed layouts the script builds without a
+        # geom file; the others are written to a .geom file and loaded back.
+        detectors = ["AGIPD_1MGeometry", "DSSC_1MGeometry", "LPD_1MGeometry",
+                     "JUNGFRAUGeometry", "Epix100Geometry"]
+        mktempdir() do dir
+            for name in detectors
+                cls = getproperty(eg, Symbol(name))
+                loaded, asm = if name == "Epix100Geometry"
+                    (cls.pair_geometry(), engine.AssemblerLUT(name; python))
+                elseif name == "JUNGFRAUGeometry"
+                    (cls.from_module_positions(), engine.AssemblerLUT(name; python))
+                else
+                    geomfile = joinpath(dir, "$(name).geom")
+                    cls.example().write_crystfel_geom(geomfile)
+                    (cls.from_crystfel_geom(geomfile), engine.AssemblerLUT(name; geom_file=geomfile, python))
+                end
+                nmod, nss, nfs = pyconvert(Tuple{Int, Int, Int}, loaded.expected_data_shape)
+
+                # Test single frame
+                frame = rand(nfs, nss, nmod)
+                ref = loaded.position_modules_fast(Py(revdims(frame)).to_numpy())[0]
+                expected = revdims(pyconvert(Array{Float64}, ref))
+                got = engine.assemble(asm, frame)
+                @test size(got) == asm.frame_size
+                @test isequal(got, expected)
+
+                # Test multiple frames
+                stack = rand(nfs, nss, nmod, 3)
+                ref = loaded.position_modules_fast(Py(revdims(stack)).to_numpy())[0]
+                expected_stack = revdims(pyconvert(Array{Float64}, ref))
+                @test isequal(engine.assemble(asm, stack), expected_stack)
+            end
+        end
     end
 end
 

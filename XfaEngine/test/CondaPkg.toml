@@ -1,0 +1,6 @@
+[deps]
+numpy = ""
+python = "<3.14"
+
+[pip.deps]
+extra_geom = ""

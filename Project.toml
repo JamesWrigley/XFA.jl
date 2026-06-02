@@ -30,8 +30,8 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
-XfaEngine = {path = "XfaEngine"}
 LibSSH = {rev = "polling", url = "https://github.com/JuliaWeb/LibSSH.jl"}
+XfaEngine = {path = "XfaEngine"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
