@@ -28,6 +28,45 @@ function tick!(rr::RunningRate)
     return rr.value
 end
 
+# One mark within a PlotSpec. `data` names the variable to render (the client
+# subscribes to it). `mark` picks the ImPlot primitive. The axis channels say
+# where each axis's values come from: a String pulls from a sibling variable, a
+# Symbol selects a named dimension of `data` (e.g. a DimArray dim), and nothing
+# lets the client infer it from the data. A grouping channel bound to a dim
+# (e.g. color=:foo) fans the layer out into one series per coordinate along that
+# dim; set `gradient` to shade those series along a single-hue gradient instead
+# of distinct colors (useful when there are many). Modelled on Vega-Lite's
+# mark/encoding split so the same data can be plotted different ways by
+# reshaping channels.
+@kwdef struct LayerSpec
+    data::String
+    mark::Symbol = :line          # :line, :scatter, :bars, :image
+    x::Union{String, Symbol, Nothing} = nothing
+    y::Union{String, Symbol, Nothing} = nothing
+    color::Union{String, Symbol, Nothing} = nothing
+    gradient::Bool = false
+    label::Union{String, Nothing} = nothing
+end
+
+# A named, openable plot a variable advertises in addition to its default
+# output. The client opens it by `name`, which also keys reconciliation across
+# trains: name/title/labels/layers may change per train and the client reshapes
+# an already-open plot to match. Layers are stacked into one plot.
+@kwdef struct PlotSpec
+    name::String
+    layers::Vector{LayerSpec}
+    title::Union{String, Nothing} = nothing
+    xlabel::Union{String, Nothing} = nothing
+    ylabel::Union{String, Nothing} = nothing
+end
+
+PlotSpec(name::AbstractString, layers::AbstractVector{LayerSpec}; kwargs...) =
+    PlotSpec(; name=String(name), layers=collect(layers), kwargs...)
+
+# Sugar: a vector of variable names becomes one default line layer per name.
+PlotSpec(name::AbstractString, vars::AbstractVector{<:AbstractString}; kwargs...) =
+    PlotSpec(name, [LayerSpec(; data=String(v)) for v in vars]; kwargs...)
+
 @kwdef struct VariableData{T}
     tid::Int = 0
     name::Union{String, Nothing} = nothing
@@ -41,6 +80,7 @@ end
     unit::Union{String, Nothing} = nothing
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
+    plot_specs::Vector{PlotSpec} = PlotSpec[]
     update_rate::Float64 = 0.0
     compress::Bool = true
 end

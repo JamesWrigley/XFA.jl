@@ -594,8 +594,8 @@ const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
     const edit_buf::Ref{Cdouble} = Ref(0.0)
 end
 
-# Per-plot fit configuration. Shared between Plot and CorrelationPlot so the
-# side-panel fitting UI can be driven from a single struct.
+# Per-layer fit configuration. Used by both VariableLayer and CorrelationLayer
+# so the side-panel fitting UI can be driven from a single struct.
 @kwdef mutable struct FitSettings
     fit_type::Ref{Cint} = Ref(Cint(0))
     popt::Maybe{Vector{Float64}} = nothing
@@ -722,60 +722,347 @@ function draw_fit_overlay(fit::FitSettings)
     end
 end
 
-@kwdef mutable struct Plot
-    const name::String
-    const id::String
-    const open::Ref{Bool} = Ref(true)
-    const autoscale_x::Ref{Bool} = Ref(true)
-    const autoscale_y::Ref{Bool} = Ref(true)
-    const log_x::Ref{Bool} = Ref(false)
-    const log_y::Ref{Bool} = Ref(false)
+# --- Plot type payloads ---
+#
+# A `PlotType` is what a Layer hands back from `prepare!` each frame — a
+# description of what to draw. The Plot widget dispatches on the concrete type
+# to pick the right ImPlot primitive.
+
+abstract type PlotType end
+
+# 1D series. `style` selects the ImPlot primitive:
+#   :line    → PlotLine
+#   :scatter → PlotScatter
+struct Line <: PlotType
+    xs
+    ys
+    label::String
+    style::Symbol
+    # Explicit per-series color, used by SpecLayer fan-out (e.g. a gradient over
+    # grouped series). nothing lets ImPlot cycle its palette as usual.
+    color::Maybe{ig.ImVec4}
+end
+Line(xs, ys, label, style) = Line(xs, ys, label, style, nothing)
+
+# Bar series. Separate from Line because it uses PlotBars/PlotBarsH and carries
+# a bar_size. Covers histograms and any vector drawn as bars.
+struct Bars <: PlotType
+    xs
+    ys
+    label::String
+    bar_size::Float64
+    horizontal::Bool
+end
+
+# Shaded band + central line, sharing one legend entry. Used for binned
+# correlations where `lower`/`upper` bound the spread around `line_ys`.
+struct Band <: PlotType
+    xs
+    lower
+    upper
+    line_ys
+    label::String
+end
+
+# Colormapped 2D data, rendered via the GPU heatmap path. `x_axis`/`y_axis`
+# may be nothing (defaults to pixel coords).
+struct Image <: PlotType
+    data
+    x_axis::Maybe{AbstractVector}
+    y_axis::Maybe{AbstractVector}
+end
+
+# Layer has nothing to draw this frame. `message` (when non-empty) is surfaced
+# in place of the plot — used for "types must match" and similar diagnostics.
+struct Empty <: PlotType
+    message::String
+end
+
+# --- Layer interface ---
+#
+# A Layer is a self-contained piece of a Plot. Plot owns Vector{Layer} and
+# orchestrates BeginPlot/EndPlot; each layer contributes one PlotType and
+# optional overlays/side-panel/bottom-row widgets.
+
+abstract type Layer end
+
+# Called once per frame before BeginPlot. May mutate caches, run fits, push
+# subscriptions, etc. Returns what to draw this frame.
+function prepare! end
+
+# Called inside BeginPlot/EndPlot, after the primitive has been drawn.
+# Used for overlays that need plot-space coords: fit curves, ROI rects, hover
+# annotations.
+draw_overlay(::Layer, plot, ::PlotType) = nothing
+
+# Widgets rendered at the top of the plot window, above the plot area. Used by
+# layers that own variable-selection UI (e.g. correlation X/Y combos).
+top_controls(::Layer, plot) = nothing
+
+# Collapsing header(s) for this layer in the side panel.
+side_panel(::Layer, plot) = nothing
+
+# Extra widgets in the bottom row, right of the shared autoscale/log buttons.
+bottom_controls(::Layer, plot) = nothing
+
+# (xlabel, ylabel) this layer wants. Either may be "" to abstain — first
+# non-empty wins at the plot level.
+axis_labels(::Layer) = ("", "")
+
+# Title contribution for the window — same first-wins rule.
+window_title(::Layer) = ""
+
+# Reset any accumulated state (e.g. paired history) when the user hits Clear.
+# Default: no-op.
+clear_layer_data!(::Layer) = nothing
+
+# Unique-within-plot string used as the `##` suffix on this layer's ImGui
+# widgets. Assigned when the layer is added to a Plot.
+function layer_id end
+
+# Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
+# the colormap shader; `display_min`/`display_max` are the visible range
+# shown on the colorbar axis (>= clip range, controlled by mouse wheel).
+@kwdef mutable struct ColorbarState
+    const autoscale::Ref{Bool} = Ref(true)
+    const clip_min::Ref{Cdouble} = Ref(0.0)
+    const clip_max::Ref{Cdouble} = Ref(1.0)
+    const display_min::Ref{Cdouble} = Ref(0.0)
+    const display_max::Ref{Cdouble} = Ref(1.0)
+    drag::Symbol = :none
+    display_zoomed::Bool = false
+end
+
+# Matrix-rendering state: GPU heatmap resources, colormap log toggle, colorbar
+# state, ROI overlay bookkeeping. Lives on Plot whenever the plotted data is a
+# matrix.
+@kwdef mutable struct ImageState
     const fixed_aspect::Ref{Bool} = Ref(true)
-    const show_side_panel::Ref{Bool} = Ref(false)
-    const fit::FitSettings = FitSettings()
-    const precision::Ref{Cint} = Ref(Cint(-1))
-
-    # Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
-    # the colormap shader; `display_min`/`display_max` are the visible range
-    # shown on the colorbar axis (>= clip range, controlled by mouse wheel).
-    const autoscale_colorbar::Ref{Bool} = Ref(true)
     const log_scale::Ref{Bool} = Ref(false)
-    const colorbar_clip_min::Ref{Cdouble} = Ref(0.0)
-    const colorbar_clip_max::Ref{Cdouble} = Ref(1.0)
-    const colorbar_display_min::Ref{Cdouble} = Ref(0.0)
-    const colorbar_display_max::Ref{Cdouble} = Ref(1.0)
-    colorbar_drag::Symbol = :none
-    colorbar_display_zoomed::Bool = false
-
+    const colorbar::ColorbarState = ColorbarState()
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
-    dock_id::UInt32 = 0
-
     # ROI parameter values updated locally during a drag, keyed by parameter
     # name. Flushed to the engine when the user releases the mouse so we don't
     # flood it with per-frame updates.
     const pending_roi_updates::Dict{String, RectROI} = Dict{String, RectROI}()
 end
 
-Plot(name, counter::Int) = Plot(name, "$(name)##plot-$(counter)")
+# Pairs samples from two VariableData stores on matching train IDs. Owns the
+# paired history buffers and an optional binning accumulator. Pure data
+# plumbing — no ImGui state.
+@kwdef mutable struct VariableTrainmatcher
+    const x_data::Vector{Float64} = Float64[]
+    const y_data::Vector{Float64} = Float64[]
+    accu::Maybe{AccuPairSequence} = nothing
+    # Last vector-mode tid consumed, so we only copy once per matched train.
+    last_vector_tid::Int = -1
+end
 
-function Plot(name, id::String, dock_id = 0)
+# Walk updated_variables for x_name/y_name and append pairs for any tid present
+# in both x.scalar_tids and y.scalar_tids. Routes through accu if active.
+# Returns true if any pair was appended.
+function ingest_scalar!(m::VariableTrainmatcher, x_store, y_store,
+                        updated_variables, x_name, y_name)
+    if !haskey(updated_variables, x_name) && !haskey(updated_variables, y_name)
+        return false
+    end
+    new_tids = get(updated_variables, x_name, Set{Int}())
+    if haskey(updated_variables, y_name)
+        union!(new_tids, updated_variables[y_name])
+    end
+
+    appended = false
+    for tid in new_tids
+        xi = findfirst(==(tid), x_store.scalar_tids)
+        yi = findfirst(==(tid), y_store.scalar_tids)
+        if !isnothing(xi) && !isnothing(yi)
+            xv = x_store.data[xi]
+            yv = y_store.data[yi]
+            push!(m.x_data, xv)
+            push!(m.y_data, yv)
+            if !isnothing(m.accu)
+                append!(m.accu, xv, yv)
+            end
+            appended = true
+        end
+    end
+    return appended
+end
+
+# Copy both vector buffers when both stores share a fresh trainId. Returns
+# true if a copy happened.
+function ingest_vector!(m::VariableTrainmatcher, x_store, y_store)
+    if !(x_store.data isa AbstractVector) || !(y_store.data isa AbstractVector)
+        return false
+    end
+    if x_store.trainId != y_store.trainId || x_store.trainId == m.last_vector_tid
+        return false
+    end
+    resize!(m.x_data, length(x_store.data))
+    resize!(m.y_data, length(y_store.data))
+    copyto!(m.x_data, x_store.data)
+    copyto!(m.y_data, y_store.data)
+    m.last_vector_tid = x_store.trainId
+    return true
+end
+
+# Reconcile accu with the requested resolution; rebuild from raw history when
+# the resolution changes (covers initial creation, widget edits, swaps, var
+# changes). Returns true if the binned series changed.
+function set_resolution!(m::VariableTrainmatcher, res::Cfloat)
+    if res > 0 && (isnothing(m.accu) || m.accu.resolution != res)
+        m.accu = AccuPairSequence(m.x_data, m.y_data, res)
+        return true
+    elseif res <= 0 && !isnothing(m.accu)
+        m.accu = nothing
+        return true
+    end
+    return false
+end
+
+function Base.empty!(m::VariableTrainmatcher)
+    empty!(m.x_data)
+    empty!(m.y_data)
+    m.accu = nothing
+    m.last_vector_tid = -1
+end
+
+# In-place x↔y swap; the accu is rebuilt on the next set_resolution! call.
+function swap!(m::VariableTrainmatcher)
+    for i in eachindex(m.x_data, m.y_data)
+        m.x_data[i], m.y_data[i] = m.y_data[i], m.x_data[i]
+    end
+    m.accu = nothing
+end
+
+# A layer that subscribes to one variable and renders its data as a line, bar
+# series, scalar buffer, or matrix. `image` is allocated lazily the first time
+# the variable's data turns out to be a matrix.
+@kwdef mutable struct VariableLayer <: Layer
+    const name::String
+    const layer_id_str::String
+    const precision::Ref{Cint} = Ref(Cint(-1))
+    const fit::FitSettings = FitSettings()
+    image::Maybe{ImageState} = nothing
+end
+
+layer_id(layer::VariableLayer) = layer.layer_id_str
+
+# A layer that pairs samples from two variables on matching train IDs and
+# renders the result as a scatter (or shaded band when binning is enabled).
+@kwdef mutable struct CorrelationLayer <: Layer
+    const layer_id_str::String
+    const x_var::Ref{Cint} = Ref(Cint(0))
+    const y_var::Ref{Cint} = Ref(Cint(0))
+    const subscribed::Vector{String} = ["", ""]
+    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
+    const matcher::VariableTrainmatcher = VariableTrainmatcher()
+    const fit::FitSettings = FitSettings()
+    # Refreshed each frame from client.variable_data; used by the X/Y combos.
+    const variable_names::Vector{String} = String[]
+end
+
+layer_id(layer::CorrelationLayer) = layer.layer_id_str
+
+# Renders an engine-advertised PlotSpec. Each frame it looks up the latest spec
+# (by name) from the source variable's store, reconciles its subscriptions to
+# the variables the spec references, and emits one or more PlotTypes. A
+# LayerSpec whose grouping channel (color) is bound to a dimension fans out into
+# one series per coordinate along that dim. Self-contained: it owns its
+# subscriptions and tracks the spec across trains. If the variable stops
+# advertising the spec, the last-seen layout is kept (the plot freezes rather
+# than vanishing). Frame drawing reuses the generic plot_frame! methods.
+@kwdef mutable struct SpecLayer <: Layer
+    const layer_id_str::String
+    const source_var::String           # variable advertising the spec
+    const spec_name::String            # which PlotSpec, by name
+    const subscribed::Set{String} = Set{String}()
+    image::Maybe{ImageState} = nothing
+    last_spec::Maybe{PlotSpec} = nothing
+end
+
+layer_id(layer::SpecLayer) = layer.layer_id_str
+
+@kwdef mutable struct Plot
+    const id::String
+    const open::Ref{Bool} = Ref(true)
+    const autoscale_x::Ref{Bool} = Ref(true)
+    const autoscale_y::Ref{Bool} = Ref(true)
+    const log_x::Ref{Bool} = Ref(false)
+    const log_y::Ref{Bool} = Ref(false)
+    const show_side_panel::Ref{Bool} = Ref(false)
+    const layers::Vector{Layer} = Layer[]
+    dock_id::UInt32 = 0
+end
+
+# Build a VariableLayer wired to `name`, suitable for pushing onto `plot.layers`.
+# Seeds precision from any existing subscription and bumps the subscription count.
+function VariableLayer(plot::Plot, name::AbstractString)
     subscriptions = state[].client.subscriptions
     precision = haskey(subscriptions, name) ? subscriptions[name].precision : -1
-    plot = Plot(; name, id, dock_id=UInt32(dock_id), precision=Ref(Cint(precision)))
+    layer = VariableLayer(;
+        name = String(name),
+        layer_id_str = "$(plot.id)/$(name)/$(length(plot.layers) + 1)",
+        precision = Ref(Cint(precision)),
+    )
     subscribe_variable(state[], name; precision)
-    plot
+    return layer
+end
+
+# Convenience: a Plot containing a single VariableLayer for `name`.
+variable_plot(name::AbstractString, counter::Int) =
+    variable_plot(name, "$(name)##plot-$(counter)")
+
+function variable_plot(name::AbstractString, id::String, dock_id = 0)
+    plot = Plot(; id, dock_id = UInt32(dock_id))
+    push!(plot.layers, VariableLayer(plot, name))
+    return plot
+end
+
+# A Plot containing a single CorrelationLayer.
+function correlation_plot(counter::Integer)
+    id = "CorrelationPlot##plot-$(counter)"
+    plot = Plot(; id)
+    push!(plot.layers, CorrelationLayer(; layer_id_str = "$(id)/correlation/1"))
+    return plot
+end
+
+function correlation_plot(id::String, dock_id::Integer = 0)
+    plot = Plot(; id, dock_id = UInt32(dock_id))
+    push!(plot.layers, CorrelationLayer(; layer_id_str = "$(id)/correlation/1"))
+    return plot
+end
+
+# A Plot rendering a single advertised PlotSpec (by name) from `source_var`.
+function spec_plot(source_var::AbstractString, spec_name::AbstractString, counter::Integer)
+    id = "$(source_var)/$(spec_name)##plot-$(counter)"
+    plot = Plot(; id)
+    push!(plot.layers, SpecLayer(; layer_id_str = "$(id)/spec",
+                                 source_var = String(source_var), spec_name = String(spec_name)))
+    return plot
 end
 
 function Base.close(plot::Plot)
-    if !isnothing(plot.gpu_heatmap)
-        destroy!(plot.gpu_heatmap)
-        plot.gpu_heatmap = nothing
+    for layer in plot.layers
+        close(layer)
     end
-
-    unsubscribe_variable(state[], plot.name)
 end
 
-clear_plot(::Plot) = nothing
+function Base.close(layer::VariableLayer)
+    if !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap)
+        destroy!(layer.image.gpu_heatmap)
+        layer.image.gpu_heatmap = nothing
+    end
+    unsubscribe_variable(state[], layer.name)
+end
+
+function Base.close(layer::CorrelationLayer)
+    unsubscribe_variable(state[], layer.subscribed[1])
+    unsubscribe_variable(state[], layer.subscribed[2])
+end
+
+clear_plot(plot::Plot) = foreach(clear_layer_data!, plot.layers)
+clear_layer_data!(layer::CorrelationLayer) = empty!(layer.matcher)
 
 function check_plot_interaction!(plot)
     io = ig.GetIO()
@@ -917,14 +1204,17 @@ end
 #
 # Hovering: drag a handle to set clip_min/clip_max (disables colorbar
 # autoscale); mouse wheel zooms the display range around the cursor.
-function interactive_colorbar(plot::Plot, size::ImVec2)
-    display_min = plot.colorbar_display_min[]
-    display_max = plot.colorbar_display_max[]
-    clip_min = plot.colorbar_clip_min[]
-    clip_max = plot.colorbar_clip_max[]
+function interactive_colorbar(layer::VariableLayer, size::ImVec2)
+    img = layer.image
+    cb = img.colorbar
+    display_min = cb.display_min[]
+    display_max = cb.display_max[]
+    clip_min = cb.clip_min[]
+    clip_max = cb.clip_max[]
     # In log mode all four refs hold log10(value); the colorbar renders that
     # space directly and tick labels read as exponents.
-    tick_format = plot.log_scale[] ? "1e%g" : "%g"
+    tick_format = img.log_scale[] ? "1e%g" : "%g"
+    id = layer.layer_id_str
 
     # ColormapScale itself does not consume mouse input — without an overlay
     # button, clicks fall through to the parent window and start a window
@@ -932,7 +1222,7 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
     # capture clicks/drags for the handles.
     ig.SetNextItemAllowOverlap()
     start_pos = ig.GetCursorScreenPos()
-    ImPlot.ColormapScale("##colorbar_$(plot.id)",
+    ImPlot.ColormapScale("##colorbar_$(id)",
                          display_min, display_max,
                          size, tick_format,
                          ImPlot.ImPlotColormapScaleFlags_None,
@@ -941,7 +1231,7 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
     rect_max = ig.GetItemRectMax()
 
     ig.SetCursorScreenPos(start_pos)
-    ig.InvisibleButton("##colorbar_input_$(plot.id)",
+    ig.InvisibleButton("##colorbar_input_$(id)",
                        ImVec2(rect_max.x - rect_min.x, rect_max.y - rect_min.y))
     hovered = ig.IsItemHovered()
     active = ig.IsItemActive()
@@ -967,8 +1257,8 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
         mouse_y = ig.GetMousePos().y
         d_min = abs(mouse_y - y_min_px)
         d_max = abs(mouse_y - y_max_px)
-        if active && plot.colorbar_drag !== :none
-            near_handle = plot.colorbar_drag
+        if active && cb.drag !== :none
+            near_handle = cb.drag
         elseif d_min <= d_max && d_min < threshold
             near_handle = :min
         elseif d_max < threshold
@@ -991,22 +1281,22 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
         mouse_y = ig.GetMousePos().y
         d_min = abs(mouse_y - y_min_px)
         d_max = abs(mouse_y - y_max_px)
-        plot.colorbar_drag = d_min <= d_max ? :min : :max
+        cb.drag = d_min <= d_max ? :min : :max
     end
 
-    if active && plot.colorbar_drag !== :none
+    if active && cb.drag !== :none
         mouse_y = ig.GetMousePos().y
         new_v = y_to_value(mouse_y)
         eps = 1e-9 * max(abs(safe_span), 1.0)
-        if plot.colorbar_drag === :min
-            plot.colorbar_clip_min[] = min(new_v, plot.colorbar_clip_max[] - eps)
+        if cb.drag === :min
+            cb.clip_min[] = min(new_v, cb.clip_max[] - eps)
         else
-            plot.colorbar_clip_max[] = max(new_v, plot.colorbar_clip_min[] + eps)
+            cb.clip_max[] = max(new_v, cb.clip_min[] + eps)
         end
-        plot.autoscale_colorbar[] = false
+        cb.autoscale[] = false
         changed = true
     elseif !active
-        plot.colorbar_drag = :none
+        cb.drag = :none
     end
 
     if hovered && !active
@@ -1015,9 +1305,9 @@ function interactive_colorbar(plot::Plot, size::ImVec2)
             mouse_y = ig.GetMousePos().y
             anchor = y_to_value(mouse_y)
             factor = wheel > 0 ? 0.85 : 1 / 0.85
-            plot.colorbar_display_min[] = anchor + (display_min - anchor) * factor
-            plot.colorbar_display_max[] = anchor + (display_max - anchor) * factor
-            plot.colorbar_display_zoomed = true
+            cb.display_min[] = anchor + (display_min - anchor) * factor
+            cb.display_max[] = anchor + (display_max - anchor) * factor
+            cb.display_zoomed = true
         end
     end
 
@@ -1052,12 +1342,13 @@ function default_roi(x_min, x_max, y_min, y_max, idx=1)
     RectROI(cx - w / 2 + dx, cy - h / 2 + dy, w, h)
 end
 
-# Draw any RectROI parameters associated with `plot.name` via @display as
+# Draw any RectROI parameters associated with `layer.name` via @display as
 # draggable rectangles on top of the image, with the parameter name labelled
 # above the top-left corner. Sends a ChangeParameter when the user drags.
-function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
+function draw_roi_overlays(layer::VariableLayer, x_min, x_max, y_min, y_max)
     client = state[].client
-    displays = get(client.context.displays, plot.name, String[])
+    displays = get(client.context.displays, layer.name, String[])
+    pending = layer.image.pending_roi_updates
     for (idx, param_name) in enumerate(displays)
         param = get(client.context.parameters, param_name, nothing)
         if isnothing(param) || !(param.value isa RectROI)
@@ -1073,7 +1364,7 @@ function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
         y2 = Ref(Cdouble(roi.corner_y + roi.height))
         col = ROI_COLORS[mod1(idx, length(ROI_COLORS))]
         rect_col = ImVec4(col.x, col.y, col.z, 0.75)
-        id = int32_hash(plot.id, param_name)
+        id = int32_hash(layer.layer_id_str, param_name)
         held = Ref(false)
 
         if ImPlot.DragRect(id, x1, y1, x2, y2, rect_col, 0, C_NULL, C_NULL, held)
@@ -1082,14 +1373,14 @@ function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
             new_roi = RectROI(xlo, ylo, xhi - xlo, yhi - ylo)
             if new_roi != param.value
                 param.value = new_roi
-                plot.pending_roi_updates[param_name] = new_roi
+                pending[param_name] = new_roi
             end
         end
 
-        if !held[] && haskey(plot.pending_roi_updates, param_name)
+        if !held[] && haskey(pending, param_name)
             client.pending_source_edit = param_name
-            change_parameter(Parameter(param_name, plot.pending_roi_updates[param_name]))
-            delete!(plot.pending_roi_updates, param_name)
+            change_parameter(Parameter(param_name, pending[param_name]))
+            delete!(pending, param_name)
         end
 
         # Label above the top-left corner. Image plots invert the Y axis so
@@ -1110,38 +1401,13 @@ function draw_roi_overlays(plot::Plot, x_min, x_max, y_min, y_max)
     end
 end
 
-# Draw a thin semi-transparent tab on the right edge of the plot region
-# (`plot_min`/`plot_max` are screen-space corners). Renders via draw list + manual
-# hit-testing so it doesn't perturb the parent's layout cursor. Toggles
-# `plot.show_side_panel`.
-function side_panel_tab(plot, plot_min::ImVec2, plot_max::ImVec2)
-    tab_w = 14.0f0
-    tab_h = 56.0f0
-    x0 = plot_max.x - tab_w
-    y0 = plot_min.y + (plot_max.y - plot_min.y - tab_h) / 2
-    rect_min = ImVec2(x0, y0)
-    rect_max = ImVec2(x0 + tab_w, y0 + tab_h)
-
-    hovered = ig.IsMouseHoveringRect(rect_min, rect_max)
-    active = hovered && ig.IsMouseDown(ig.ImGuiMouseButton_Left)
-    clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
-
-    base = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Button))
-    alpha = active ? 1.0f0 : (hovered ? 0.75f0 : 0.35f0)
-    col = ig.GetColorU32(ImVec4(base.x, base.y, base.z, alpha))
-
-    draw_list = ig.GetWindowDrawList()
-    rounding = unsafe_load(ig.GetStyle().FrameRounding)
-    ig.AddRectFilled(draw_list, rect_min, rect_max, col, rounding)
-
+# A thin full-height button on the right edge of the plot area that toggles the
+# side panel. Laid out as a normal item (after the plot/colorbar) so it neither
+# overlaps nor leaks clicks to the colorbar.
+function side_panel_tab(plot, tab_w, height)
+    ig.SameLine()
     glyph = plot.show_side_panel[] ? ">" : "<"
-    text_size = ig.CalcTextSize(glyph)
-    text_pos = ImVec2(rect_min.x + (tab_w - text_size.x) / 2,
-                      rect_min.y + (tab_h - text_size.y) / 2)
-    text_col = ig.GetColorU32(ig.ImGuiCol_Text)
-    ig.AddText(draw_list, text_pos, text_col, glyph)
-
-    if clicked
+    if ig.Button("$(glyph)##sidepanel-tab-$(plot.id)", ImVec2(tab_w, height))
         plot.show_side_panel[] = !plot.show_side_panel[]
     end
 end
@@ -1207,18 +1473,227 @@ function draw_fitting_settings(id, fit::FitSettings)
     end
 end
 
-function draw_side_panel(plot::Plot, store, is_scalar::Bool, is_matrix::Bool)
-    if !is_scalar && ig.CollapsingHeader("Compression##$(plot.id)")
-        draw_compression_settings(plot.id, plot.name, plot.precision, store)
+# --- VariableLayer methods ---
+
+function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
+    client = state[].client
+    store = get(client.variable_data, layer.name, nothing)
+    if isnothing(store) || store.data isa ArrayMetadata
+        return Empty("Waiting for data: $(layer.name)")
     end
-    # Fitting only makes sense for 1D data.
+    data = store.data
+    if !(eltype(data) <: Real)
+        return Empty("$(layer.name): unsupported array type $(typeof(data))")
+    elseif isempty(data)
+        return Empty("$(layer.name): array has length 0, nothing to plot")
+    end
+
+    was_updated = haskey(updated_variables, layer.name)
+
+    if data isa AbstractVector
+        xs, ys = if data isa CircularBuffer
+            store.scalar_tids_cache, store.scalar_data_cache
+        elseif !isnothing(store.x_axis)
+            store.x_axis, data
+        elseif data isa DimArray
+            parent(lookup(data)[1]), parent(data)
+        else
+            1:length(data), data
+        end
+        if was_updated
+            compute_fit!(layer.fit, ys, xs)
+        end
+        if store.plot_type === :histogram
+            bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
+            return Bars(xs, ys, store.title, bar_size, false)
+        else
+            style = length(ys) == 1 ? :scatter : :line
+            return Line(xs, ys, store.title, style)
+        end
+    elseif data isa AbstractMatrix
+        if isnothing(layer.image)
+            layer.image = ImageState()
+            layer.image.fixed_aspect[] = store.fixed_aspect
+        end
+        return prepare_heatmap!(layer.image, data, store.x_axis, store.y_axis, was_updated)
+    end
+    return Empty("$(layer.name): unsupported data shape $(typeof(data))")
+end
+
+# Upload `data` to the GPU heatmap held by `img` and colormap it, returning the
+# Image frame to draw. Reuses cached GPU resources across frames; only re-uploads
+# and rescales when the data changed, log mode toggled, or on first use. Shared
+# by VariableLayer and SpecLayer.
+function prepare_heatmap!(img::ImageState, data, x_axis, y_axis, was_updated)
+    cb = img.colorbar
+    ctx = get_heatmap_context()
+    needs_initial_upload = isnothing(img.gpu_heatmap)
+    if needs_initial_upload
+        img.gpu_heatmap = GPUHeatmap()
+    end
+    gpu = img.gpu_heatmap
+    update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
+
+    log = img.log_scale[]
+    log_changed = !needs_initial_upload && gpu.log_scale != log
+    if was_updated || needs_initial_upload || log_changed
+        if was_updated || needs_initial_upload
+            upload_data!(gpu, data)
+        end
+        if needs_initial_upload || log_changed || cb.autoscale[]
+            dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
+            cb.clip_min[] = dmin
+            cb.clip_max[] = dmax
+            # Don't stomp a manual zoom — only reset the visible range
+            # if the user has not adjusted it themselves (or just
+            # toggled log mode, which makes the old range meaningless).
+            if needs_initial_upload || log_changed || !cb.display_zoomed
+                margin = 0.1 * (dmax - dmin)
+                cb.display_min[] = dmin - margin
+                cb.display_max[] = dmax + margin
+            end
+        end
+        render_colormapped!(gpu, ctx, cb.clip_min[], cb.clip_max[], log)
+        gpu.log_scale = log
+    end
+    return Image(data, x_axis, y_axis)
+end
+
+# Derive plot-space axis bounds for an Image frame.
+function image_bounds(frame::Image)
+    rows, cols = size(frame.data)
+    x_min = isnothing(frame.x_axis) ? 0 : first(frame.x_axis)
+    x_max = isnothing(frame.x_axis) ? cols : last(frame.x_axis)
+    y_min = isnothing(frame.y_axis) ? 0 : first(frame.y_axis)
+    y_max = isnothing(frame.y_axis) ? rows : last(frame.y_axis)
+    return (rows, cols, x_min, x_max, y_min, y_max)
+end
+
+# Generic line/bar drawing, shared by every layer (CorrelationLayer overrides
+# Line with its own alpha-blended scatter). `frame.color`, when set, fixes the
+# series colour — used by SpecLayer fan-out; otherwise ImPlot cycles its palette.
+function plot_frame!(::Layer, frame::Line)
+    if !isnothing(frame.color)
+        ImPlot.SetNextLineStyle(frame.color)
+    end
+    if frame.style === :scatter
+        ImPlot.PlotScatter(frame.label, frame.xs, frame.ys)
+    else
+        ImPlot.PlotLine(frame.label, frame.xs, frame.ys)
+    end
+end
+
+function plot_frame!(::Layer, frame::Bars)
+    ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
+    if frame.horizontal
+        ImPlot.PlotBarsH(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size)
+    else
+        ImPlot.PlotBars(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size)
+    end
+    ImPlot.PopStyleColor()
+end
+
+function draw_image_frame(gpu, frame::Image)
+    _, _, x_min, x_max, y_min, y_max = image_bounds(frame)
+    tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
+    # Matplotlib convention: first dim = row (vertical, top→bottom),
+    # second dim = col (horizontal, left→right). data[1,1] at plot top-left;
+    # data[rows,cols] at plot bottom-right. Y axis is inverted so y_min sits
+    # at the top — pass swapped y bounds.
+    ImPlot.PlotImage("", tex_ref,
+                     ImPlot.ImPlotPoint(x_min, y_max),
+                     ImPlot.ImPlotPoint(x_max, y_min))
+end
+
+plot_frame!(layer::Union{VariableLayer, SpecLayer}, frame::Image) = draw_image_frame(layer.image.gpu_heatmap, frame)
+
+function draw_overlay(layer::VariableLayer, ::Plot, ::Line)
+    draw_fit_overlay(layer.fit)
+    draw_variable_overlays(layer.name)
+end
+
+function draw_overlay(layer::VariableLayer, ::Plot, ::Bars)
+    draw_fit_overlay(layer.fit)
+    draw_variable_overlays(layer.name)
+end
+
+function draw_overlay(layer::VariableLayer, ::Plot, frame::Image)
+    rows, cols, x_min, x_max, y_min, y_max = image_bounds(frame)
+    draw_roi_overlays(layer, x_min, x_max, y_min, y_max)
+
+    if ImPlot.IsPlotHovered()
+        mouse = ImPlot.GetPlotMousePos()
+        j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
+        i = floor(Int, (mouse.y - y_min) / (y_max - y_min) * rows) + 1
+        if 1 <= i <= rows && 1 <= j <= cols
+            val = frame.data[i, j]
+            ImPlot.AnnotationClamped(mouse.x, mouse.y, ImVec2(10, -10), "[$i, $j] $val")
+        end
+    end
+end
+
+function side_panel(layer::VariableLayer, ::Plot)
+    client = state[].client
+    store = get(client.variable_data, layer.name, nothing)
+    isnothing(store) && return
+    is_scalar = store.data isa CircularBuffer
+    is_matrix = store.data isa AbstractMatrix
+    id = layer.layer_id_str
+    if !is_scalar && ig.CollapsingHeader("Compression##$(id)")
+        draw_compression_settings(id, layer.name, layer.precision, store)
+    end
     if is_matrix
         ig.BeginDisabled()
-        ig.CollapsingHeader("Fitting##$(plot.id)")
+        ig.CollapsingHeader("Fitting##$(id)")
         ig.EndDisabled()
     else
-        draw_fitting_settings(plot.id, plot.fit)
+        draw_fitting_settings(id, layer.fit)
     end
+end
+
+function bottom_controls(layer::VariableLayer, ::Plot)
+    client = state[].client
+    store = get(client.variable_data, layer.name, nothing)
+    isnothing(store) && return
+    data = store.data
+    id = layer.layer_id_str
+    if data isa CircularBuffer
+        ig.SameLine()
+        if ig.Button("Clear##$(id)")
+            clear_variable_data(store)
+        end
+    end
+    if data isa AbstractMatrix && !isnothing(layer.image)
+        image_controls(layer.image, id)
+    end
+end
+
+# Bottom-row image controls (fixed aspect / auto colorbar / log colormap),
+# shared by any layer that owns an ImageState. Each is prefixed with SameLine
+# so it sits alongside the shared autoscale/log buttons.
+function image_controls(img::ImageState, id::String)
+    ig.SameLine()
+    ig.Checkbox("Fixed aspect##$(id)", img.fixed_aspect)
+    ig.SameLine()
+    if ig.Checkbox("Auto colorbar##$(id)", img.colorbar.autoscale)
+        if img.colorbar.autoscale[]
+            img.colorbar.display_zoomed = false
+        end
+    end
+    ig.SameLine()
+    ig.Checkbox("Log colormap##$(id)", img.log_scale)
+end
+
+function axis_labels(layer::VariableLayer)
+    client = state[].client
+    store = get(client.variable_data, layer.name, nothing)
+    isnothing(store) ? ("", "") : (store.xlabel, store.ylabel)
+end
+
+function window_title(layer::VariableLayer)
+    client = state[].client
+    store = get(client.variable_data, layer.name, nothing)
+    isnothing(store) ? "" : store.title
 end
 
 # Begin the plot-area child, shrunk to leave room for the side panel when open.
@@ -1236,15 +1711,9 @@ function begin_plot_area!(plot, side_panel_width, bottom_row_h=30)
     return ImVec2(inner_avail.x, inner_avail.y), plot_area_h
 end
 
-# Closes the plot-area child opened by begin_plot_area!. Draws the tab over the
-# plot (when show_tab) so it captures clicks before being clipped, then if the
-# panel is open draws it alongside via the caller-supplied `draw_panel`.
-function end_plot_area!(plot, side_panel_width, plot_area_h, show_tab::Bool, draw_panel)
-    if show_tab
-        win_pos = ig.GetWindowPos()
-        win_size = ig.GetWindowSize()
-        side_panel_tab(plot, win_pos, ImVec2(win_pos.x + win_size.x, win_pos.y + win_size.y))
-    end
+# Closes the plot-area child opened by begin_plot_area!, then if the panel is
+# open draws it alongside via the caller-supplied `draw_panel`.
+function end_plot_area!(plot, side_panel_width, plot_area_h, draw_panel)
     ig.EndChild()
 
     if plot.show_side_panel[]
@@ -1257,249 +1726,128 @@ function end_plot_area!(plot, side_panel_width, plot_area_h, show_tab::Bool, dra
     end
 end
 
-function draw_plot(plot::Plot, store::Nothing, was_updated)
-    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
-
-    if ig.Begin(plot.id, plot.open)
-        plot.dock_id = ig.GetWindowDockID()
-        ig.Text("Waiting for data: $(plot.name)")
+# Locate the (at most one) image layer in this plot. Returns nothing if no
+# layer has allocated an ImageState.
+function image_layer(plot::Plot)
+    for L in plot.layers
+        if (L isa VariableLayer || L isa SpecLayer) && !isnothing(L.image)
+            return L
+        end
     end
-
-    ig.End()
+    return nothing
 end
 
-function draw_plot(plot::Plot, store, was_updated)
+# A layer's prepare! may return a single PlotType or several (SpecLayer fans a
+# grouped LayerSpec out into one series per slice). Normalise to a vector so the
+# draw loop can treat every layer uniformly.
+as_frames(f::PlotType) = PlotType[f]
+as_frames(fs::AbstractVector{<:PlotType}) = fs
+
+function draw_plot(plot::Plot, updated_variables)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
     side_panel_width = 300f0
+    colorbar_width = 100f0
 
-    data = store.data
-    if ig.Begin("$(store.title)##$(plot.id)", plot.open)
+    # Build window title from the first layer that has an opinion.
+    title = ""
+    for L in plot.layers
+        t = window_title(L)
+        if !isempty(t)
+            title = t
+            break
+        end
+    end
+    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
+
+    if ig.Begin(win_id, plot.open)
         plot.dock_id = ig.GetWindowDockID()
-        is_dimarray = data isa DimArray
-        is_matrix = data isa AbstractMatrix
-        is_scalar = data isa CircularBuffer
-        is_metadata = data isa ArrayMetadata
-        is_plottable = true
-        label = store.title
+
+        for L in plot.layers
+            top_controls(L, plot)
+        end
 
         plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
-        if is_metadata
-            ig.Text("Waiting for data: $(plot.name)")
-            is_plottable = false
-        elseif !(eltype(data) <: Real)
-            ig.Text("Unsupported array type: $(typeof(data))")
-            is_plottable = false
-        elseif isempty(data)
-            ig.Text("Array has length 0, nothing to plot")
-            is_plottable = false
+
+        # One frame list per layer, parallel to plot.layers.
+        layer_frames = [as_frames(prepare!(L, plot, updated_variables)) for L in plot.layers]
+        all_empty = all(f isa Empty for fs in layer_frames for f in fs)
+
+        if all_empty
+            for fs in layer_frames
+                for f in fs
+                    if f isa Empty && !isempty(f.message)
+                        ig.TextWrapped(f.message)
+                        shown_any = true
+                    end
+                end
+            end
         else
             apply_autoscale(plot)
 
-            if data isa AbstractVector
-                xs, ys = if is_scalar
-                    store.scalar_tids_cache, store.scalar_data_cache
-                elseif !isnothing(store.x_axis)
-                    store.x_axis, data
-                elseif is_dimarray
-                    parent(lookup(data)[1]), parent(data)
-                else
-                    1:length(data), data
+            # Reserve room on the right for the side-panel tab button.
+            tab_w = 14.0f0
+            spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+            img_layer = image_layer(plot)
+            reserved = tab_w + spacing + (isnothing(img_layer) ? 0f0 : colorbar_width + spacing)
+            plot_width = max(plot_size.x - reserved, 100f0)
+            plot_flags = (!isnothing(img_layer) && img_layer.image.fixed_aspect[]) ?
+                         ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
+
+            # First non-empty axis label wins.
+            xlabel = ylabel = ""
+            for L in plot.layers
+                xl, yl = axis_labels(L)
+                if isempty(xlabel)
+                    xlabel = xl
                 end
-
-                if was_updated
-                    compute_fit!(plot.fit, ys, xs)
-                end
-
-                if ImPlot.BeginPlot(store.title, store.xlabel, store.ylabel, plot_size)
-                    apply_log_scales(plot)
-                    if store.plot_type === :histogram
-                        bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
-                        ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
-                        ImPlot.PlotBars(label, xs, ys; bar_size)
-                        ImPlot.PopStyleColor()
-                    elseif length(ys) == 1
-                        ImPlot.PlotScatter(label, xs, ys)
-                    else
-                        ImPlot.PlotLine(label, xs, ys)
-                    end
-                    draw_fit_overlay(plot.fit)
-                    draw_variable_overlays(plot.name)
-                    check_plot_interaction!(plot)
-                    ImPlot.EndPlot()
-                end
-            elseif data isa AbstractMatrix
-                rows, cols = size(data)
-
-                # Ensure GPU resources exist
-                ctx = get_heatmap_context()
-                needs_initial_upload = isnothing(plot.gpu_heatmap)
-                if needs_initial_upload
-                    plot.gpu_heatmap = GPUHeatmap()
-                    plot.fixed_aspect[] = store.fixed_aspect
-                end
-                gpu = plot.gpu_heatmap
-
-                # Update colormap if needed (use Viridis as default, index 4)
-                update_colormap!(ctx, ImPlot.ImPlotColormap_Viridis)
-
-                log = plot.log_scale[]
-                log_changed = !needs_initial_upload && gpu.log_scale != log
-                if was_updated || needs_initial_upload || log_changed
-                    if was_updated || needs_initial_upload
-                        upload_data!(gpu, data)
-                    end
-                    if needs_initial_upload || log_changed || plot.autoscale_colorbar[]
-                        dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
-                        plot.colorbar_clip_min[] = dmin
-                        plot.colorbar_clip_max[] = dmax
-                        # Don't stomp a manual zoom — only reset the visible range
-                        # if the user has not adjusted it themselves (or just
-                        # toggled log mode, which makes the old range meaningless).
-                        if needs_initial_upload || log_changed || !plot.colorbar_display_zoomed
-                            margin = 0.1 * (dmax - dmin)
-                            plot.colorbar_display_min[] = dmin - margin
-                            plot.colorbar_display_max[] = dmax + margin
-                        end
-                    end
-                    render_colormapped!(gpu, ctx,
-                                        plot.colorbar_clip_min[],
-                                        plot.colorbar_clip_max[],
-                                        log)
-                    gpu.log_scale = log
-                end
-
-                # Reserve space for the colorbar on the right
-                colorbar_width = 100
-                plot_width = max(plot_size.x - colorbar_width, 100)
-
-                plot_flags = plot.fixed_aspect[] ? ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
-                if ImPlot.BeginPlot(store.title, ImVec2(plot_width, plot_size.y), plot_flags)
-                    ImPlot.SetupAxis(ImPlot.ImAxis_X1, store.xlabel)
-                    ImPlot.SetupAxis(ImPlot.ImAxis_Y1, store.ylabel)
-                    tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
-                    # Matplotlib convention: first dim = row (vertical, top→bottom),
-                    # second dim = col (horizontal, left→right). data[1,1] at plot
-                    # top-left; data[rows,cols] at plot bottom-right. Y axis is
-                    # inverted so y_min sits at the top — pass swapped y bounds so
-                    # the texture's data[1,:] row stays at the top.
-                    has_x_axis = !isnothing(store.x_axis)
-                    has_y_axis = !isnothing(store.y_axis)
-                    x_min = has_x_axis ? first(store.x_axis) : 0
-                    x_max = has_x_axis ? last(store.x_axis) : cols
-                    y_min = has_y_axis ? first(store.y_axis) : 0
-                    y_max = has_y_axis ? last(store.y_axis) : rows
-                    ImPlot.PlotImage("", tex_ref,
-                                     ImPlot.ImPlotPoint(x_min, y_max),
-                                     ImPlot.ImPlotPoint(x_max, y_min))
-
-                    draw_roi_overlays(plot, x_min, x_max, y_min, y_max)
-
-                    # Show pixel coordinates and intensity when hovering
-                    if ImPlot.IsPlotHovered()
-                        mouse = ImPlot.GetPlotMousePos()
-                        j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
-                        i = floor(Int, (mouse.y - y_min) / (y_max - y_min) * rows) + 1
-                        if 1 <= i <= rows && 1 <= j <= cols
-                            val = data[i, j]
-                            ImPlot.AnnotationClamped(mouse.x, mouse.y,
-                                                     ImVec2(10, -10),
-                                                     "[$i, $j] $val")
-                        end
-                    end
-
-                    check_plot_interaction!(plot)
-                    ImPlot.EndPlot()
-                end
-
-                ig.SameLine()
-                if interactive_colorbar(plot, ImVec2(colorbar_width, plot_size.y))
-                    render_colormapped!(gpu, ctx,
-                                        plot.colorbar_clip_min[],
-                                        plot.colorbar_clip_max[],
-                                        plot.log_scale[])
+                if isempty(ylabel)
+                    ylabel = yl
                 end
             end
+
+            if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+                ImPlot.SetupAxis(ImPlot.ImAxis_X1, xlabel)
+                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, ylabel)
+                apply_log_scales(plot)
+                for (L, fs) in zip(plot.layers, layer_frames)
+                    for f in fs
+                        if !(f isa Empty)
+                            plot_frame!(L, f)
+                            draw_overlay(L, plot, f)
+                        end
+                    end
+                end
+                check_plot_interaction!(plot)
+                ImPlot.EndPlot()
+            end
+
+            if !isnothing(img_layer)
+                ig.SameLine()
+                if interactive_colorbar(img_layer, ImVec2(colorbar_width, plot_size.y))
+                    img = img_layer.image
+                    cb = img.colorbar
+                    render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
+                                        cb.clip_min[], cb.clip_max[], img.log_scale[])
+                end
+            end
+
+            side_panel_tab(plot, tab_w, plot_size.y)
         end
 
-        end_plot_area!(plot, side_panel_width, plot_area_h, is_plottable,
-                       () -> draw_side_panel(plot, store, is_scalar, is_matrix))
+        end_plot_area!(plot, side_panel_width, plot_area_h,
+                       () -> foreach(L -> side_panel(L, plot), plot.layers))
 
-        if is_plottable
+        if !all_empty
             autoscale_buttons(plot)
-
-            if !(data isa AbstractMatrix)
-                ig.SameLine()
-                log_scale_buttons(plot)
-            end
-
-            if is_scalar
-                ig.SameLine()
-                if ig.Button("Clear##$(plot.id)")
-                    clear_variable_data(store)
-                end
-            end
-
-            if data isa AbstractMatrix
-                ig.SameLine()
-                ig.Checkbox("Fixed aspect", plot.fixed_aspect)
-                ig.SameLine()
-                if ig.Checkbox("Auto colorbar##$(plot.id)", plot.autoscale_colorbar)
-                    if plot.autoscale_colorbar[]
-                        plot.colorbar_display_zoomed = false
-                    end
-                end
-                ig.SameLine()
-                ig.Checkbox("Log##$(plot.id)", plot.log_scale)
+            ig.SameLine()
+            log_scale_buttons(plot)
+            for L in plot.layers
+                bottom_controls(L, plot)
             end
         end
     end
 
     ig.End()
-end
-
-# --- Correlation plot ---
-
-@kwdef mutable struct CorrelationPlot
-    const id::String
-    const open::Ref{Bool} = Ref(true)
-    const variable_names::Vector{String} = String[]
-    const x_var::Ref{Cint} = Ref(Cint(0))
-    const y_var::Ref{Cint} = Ref(Cint(0))
-    const x_data::Vector{Float64} = Float64[]
-    const y_data::Vector{Float64} = Float64[]
-    const autoscale_x::Ref{Bool} = Ref(true)
-    const autoscale_y::Ref{Bool} = Ref(true)
-    const log_x::Ref{Bool} = Ref(false)
-    const log_y::Ref{Bool} = Ref(false)
-    const show_side_panel::Ref{Bool} = Ref(false)
-    const fit::FitSettings = FitSettings()
-    const subscribed::Vector{String} = ["", ""]
-    # Motor-position binning resolution for scalar correlations. 0 disables
-    # binning; >0 routes samples through an AccuPairSequence keyed on x.
-    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
-
-    accu::Maybe{AccuPairSequence} = nothing
-    trainId::Int = -1
-    dock_id::UInt32 = 0
-end
-
-function clear_plot(plot::CorrelationPlot)
-    empty!(plot.x_data)
-    empty!(plot.y_data)
-    plot.accu = nothing
-end
-
-function CorrelationPlot(counter::Integer)
-    CorrelationPlot(; id="CorrelationPlot##plot-$(counter)")
-end
-
-function CorrelationPlot(id::String, dock_id::Integer = 0)
-    CorrelationPlot(; id, dock_id=UInt32(dock_id))
-end
-
-function Base.close(plot::CorrelationPlot)
-    unsubscribe_variable(state[], plot.subscribed[1])
-    unsubscribe_variable(state[], plot.subscribed[2])
 end
 
 function var_type_label(store)
@@ -1515,7 +1863,7 @@ function var_type_label(store)
     end
 end
 
-function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
+function var_combo(label, selected::Ref{Cint}, var_names, variable_data)
     n = length(var_names)
     preview = if n > 0
         name = var_names[selected[] + 1]
@@ -1553,208 +1901,327 @@ function _var_combo(label, selected::Ref{Cint}, var_names, variable_data)
     return changed
 end
 
-function swap_arrays(x, y)
-    for i in eachindex(x, y)
-        x[i], y[i] = y[i], x[i]
-    end
-end
+# --- CorrelationLayer methods ---
 
-function draw_plot(plot::CorrelationPlot, variable_data, updated_variables)
-    # Update variable names
-    empty!(plot.variable_names)
+function top_controls(layer::CorrelationLayer, ::Plot)
+    client = state[].client
+    variable_data = client.variable_data
+
+    empty!(layer.variable_names)
     for (name, variable) in variable_data
         if variable.type in (VariableType_Scalar, VariableType_Vector)
-            push!(plot.variable_names, name)
+            push!(layer.variable_names, name)
         end
     end
-    sort!(plot.variable_names)
+    sort!(layer.variable_names)
 
-    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
-
-    # Clamp indices to valid range
-    n_variables = length(plot.variable_names)
+    n_variables = length(layer.variable_names)
     if n_variables > 0
-        plot.x_var[] = clamp(plot.x_var[], 0, n_variables - 1)
-        plot.y_var[] = clamp(plot.y_var[], 0, n_variables - 1)
+        layer.x_var[] = clamp(layer.x_var[], 0, n_variables - 1)
+        layer.y_var[] = clamp(layer.y_var[], 0, n_variables - 1)
     end
 
-    if ig.Begin(plot.id, plot.open)
-        plot.dock_id = ig.GetWindowDockID()
-        if ig.Button("Swap axes")
-            plot.x_var[], plot.y_var[] = plot.y_var[], plot.x_var[]
-            swap_arrays(plot.x_data, plot.y_data)
-            reverse!(plot.subscribed)
-            plot.accu = nothing
-        end
-
-        ig.SameLine()
-        x_changed = _var_combo("X", plot.x_var, plot.variable_names, variable_data)
-        ig.SameLine()
-        y_changed = _var_combo("Y", plot.y_var, plot.variable_names, variable_data)
-
-        if x_changed || y_changed
-            empty!(plot.x_data)
-            empty!(plot.y_data)
-            plot.accu = nothing
-        end
-
-        side_panel_width = 300f0
-        plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
-
-        # Resolved on each frame when there's a variable selection; reused by
-        # the bottom-row controls after end_plot_area!.
-        x = y = nothing
-        x_name = y_name = ""
-        types_match = false
-
-        if n_variables > 0
-            x_name = plot.variable_names[plot.x_var[] + 1]
-            y_name = plot.variable_names[plot.y_var[] + 1]
-            x = variable_data[x_name]
-            y = variable_data[y_name]
-
-            if x_name != plot.subscribed[1]
-                unsubscribe_variable(state[], plot.subscribed[1])
-                subscribe_variable(state[], x_name)
-                plot.subscribed[1] = x_name
-            end
-            if y_name != plot.subscribed[2]
-                unsubscribe_variable(state[], plot.subscribed[2])
-                subscribe_variable(state[], y_name)
-                plot.subscribed[2] = y_name
-            end
-
-            if x.type != y.type
-                ig.Text("Both variables must have the same type to correlate against each other.")
-            else
-                types_match = true
-                apply_autoscale(plot)
-
-                if x.type == VariableType_Scalar
-                    data_updated = false
-                    if haskey(updated_variables, x_name) || haskey(updated_variables, y_name)
-                        new_tids = get(updated_variables, x_name, Set{Int}())
-                        if haskey(updated_variables, y_name)
-                            union!(new_tids, updated_variables[y_name])
-                        end
-
-                        for tid in new_tids
-                            xi = findfirst(==(tid), x.scalar_tids)
-                            yi = findfirst(==(tid), y.scalar_tids)
-                            if !isnothing(xi) && !isnothing(yi)
-                                xv = x.data[xi]
-                                yv = y.data[yi]
-                                push!(plot.x_data, xv)
-                                push!(plot.y_data, yv)
-                                if !isnothing(plot.accu)
-                                    append!(plot.accu, xv, yv)
-                                end
-                                data_updated = true
-                            end
-                        end
-                    end
-
-                    # Sync accu with the current resolution: rebuild from the
-                    # raw sample history whenever the plot's resolution disagrees
-                    # with what's stored in accu (covers initial creation,
-                    # widget edits, swaps, and variable changes).
-                    res = plot.binning_resolution[]
-                    accu_changed = false
-                    if res > 0 && (isnothing(plot.accu) || plot.accu.resolution != res)
-                        plot.accu = AccuPairSequence(plot.x_data, plot.y_data, res)
-                        accu_changed = true
-                    elseif res <= 0 && !isnothing(plot.accu)
-                        plot.accu = nothing
-                        accu_changed = true
-                    end
-
-                    if data_updated || accu_changed
-                        if isnothing(plot.accu)
-                            compute_fit!(plot.fit, plot.y_data, plot.x_data)
-                        else
-                            compute_fit!(plot.fit, plot.accu.y_values, plot.accu.x_values;
-                                         sigma=plot.accu.sigma)
-                        end
-                    end
-
-                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
-                        apply_log_scales(plot)
-                        label = "$(x_name) vs $(y_name)"
-                        if !isnothing(plot.accu)
-                            # Same label_id ties the band and line to one
-                            # legend entry, so ImPlot gives them matching
-                            # colors.
-                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-                            ImPlot.PlotShaded(label, plot.accu.x_values,
-                                              plot.accu.y_lower, plot.accu.y_upper)
-                            ImPlot.PopStyleVar()
-                            ImPlot.PlotLine(label, plot.accu.x_values, plot.accu.y_values)
-                        else
-                            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-                            ImPlot.PlotScatter(label, plot.x_data, plot.y_data)
-                            ImPlot.PopStyleVar()
-                        end
-                        draw_fit_overlay(plot.fit)
-                        check_plot_interaction!(plot)
-                        ImPlot.EndPlot()
-                    end
-                elseif x.type == VariableType_Vector
-                    # Only update both buffers together when both variables have
-                    # data from the same train.
-                    needs_copy = x.type == VariableType_Vector && x.trainId == y.trainId && x.trainId != plot.trainId
-                    if needs_copy
-                        resize!(plot.x_data, length(x.data))
-                        resize!(plot.y_data, length(y.data))
-                        copyto!(plot.x_data, x.data)
-                        copyto!(plot.y_data, y.data)
-                        plot.trainId = x.trainId
-                        compute_fit!(plot.fit, plot.y_data, plot.x_data)
-                    end
-
-                    if ImPlot.BeginPlot(plot.id, x_name, y_name, plot_size)
-                        apply_log_scales(plot)
-                        ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-                        ImPlot.PlotScatter("$(x_name) vs $(y_name)", plot.x_data, plot.y_data)
-                        ImPlot.PopStyleVar()
-                        draw_fit_overlay(plot.fit)
-                        check_plot_interaction!(plot)
-                        ImPlot.EndPlot()
-                    end
-                else
-                    ig.Text("Unsupported correlation of data type '$(x.type)'")
-                end
-            end
-        end
-
-        end_plot_area!(plot, side_panel_width, plot_area_h, n_variables > 0,
-                       () -> draw_side_panel(plot))
-
-        if types_match
-            autoscale_buttons(plot)
-            ig.SameLine()
-            log_scale_buttons(plot)
-
-            if x.type == VariableType_Scalar
-                ig.SameLine()
-                if ig.Button("Clear##$(plot.id)")
-                    clear_variable_data(x)
-                    clear_variable_data(y)
-                    clear_plot(plot)
-                end
-
-                ig.SameLine()
-                ig.SetNextItemWidth(120)
-                ig.DragFloat("Binning resolution##$(plot.id)",
-                             plot.binning_resolution, 0.01f0,
-                             0.0f0, typemax(Cfloat), "%.8f",
-                             ig.ImGuiSliderFlags_AlwaysClamp)
-            end
-        end
+    id = layer.layer_id_str
+    if ig.Button("Swap axes##$(id)")
+        layer.x_var[], layer.y_var[] = layer.y_var[], layer.x_var[]
+        swap!(layer.matcher)
+        reverse!(layer.subscribed)
     end
 
-    ig.End()
+    ig.SameLine()
+    x_changed = var_combo("X##$(id)", layer.x_var, layer.variable_names, variable_data)
+    ig.SameLine()
+    y_changed = var_combo("Y##$(id)", layer.y_var, layer.variable_names, variable_data)
+
+    if x_changed || y_changed
+        empty!(layer.matcher)
+    end
 end
 
-function draw_side_panel(plot::CorrelationPlot)
-    draw_fitting_settings(plot.id, plot.fit)
+function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
+    client = state[].client
+    variable_data = client.variable_data
+    n_variables = length(layer.variable_names)
+    if n_variables == 0
+        return Empty("No scalar or vector variables available to correlate.")
+    end
+
+    x_name = layer.variable_names[layer.x_var[] + 1]
+    y_name = layer.variable_names[layer.y_var[] + 1]
+    x = variable_data[x_name]
+    y = variable_data[y_name]
+
+    if x_name != layer.subscribed[1]
+        unsubscribe_variable(state[], layer.subscribed[1])
+        subscribe_variable(state[], x_name)
+        layer.subscribed[1] = x_name
+    end
+    if y_name != layer.subscribed[2]
+        unsubscribe_variable(state[], layer.subscribed[2])
+        subscribe_variable(state[], y_name)
+        layer.subscribed[2] = y_name
+    end
+
+    if x.type != y.type
+        return Empty("Both variables must have the same type to correlate against each other.")
+    end
+
+    m = layer.matcher
+    label = "$(x_name) vs $(y_name)"
+    if x.type == VariableType_Scalar
+        data_updated = ingest_scalar!(m, x, y, updated_variables, x_name, y_name)
+        accu_changed = set_resolution!(m, layer.binning_resolution[])
+        if data_updated || accu_changed
+            if isnothing(m.accu)
+                compute_fit!(layer.fit, m.y_data, m.x_data)
+            else
+                compute_fit!(layer.fit, m.accu.y_values, m.accu.x_values;
+                             sigma=m.accu.sigma)
+            end
+        end
+        if !isnothing(m.accu)
+            return Band(m.accu.x_values, m.accu.y_lower, m.accu.y_upper,
+                        m.accu.y_values, label)
+        else
+            return Line(m.x_data, m.y_data, label, :scatter)
+        end
+    elseif x.type == VariableType_Vector
+        if ingest_vector!(m, x, y)
+            compute_fit!(layer.fit, m.y_data, m.x_data)
+        end
+        return Line(m.x_data, m.y_data, label, :scatter)
+    else
+        return Empty("Unsupported correlation of data type '$(x.type)'")
+    end
+end
+
+function plot_frame!(::CorrelationLayer, frame::Line)
+    ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+    ImPlot.PlotScatter(frame.label, frame.xs, frame.ys)
+    ImPlot.PopStyleVar()
+end
+
+function plot_frame!(::CorrelationLayer, frame::Band)
+    # Same label_id ties the band and line to one legend entry so ImPlot
+    # gives them matching colors.
+    ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
+    ImPlot.PlotShaded(frame.label, frame.xs, frame.lower, frame.upper)
+    ImPlot.PopStyleVar()
+    ImPlot.PlotLine(frame.label, frame.xs, frame.line_ys)
+end
+
+draw_overlay(layer::CorrelationLayer, ::Plot, ::PlotType) = draw_fit_overlay(layer.fit)
+
+function axis_labels(layer::CorrelationLayer)
+    n = length(layer.variable_names)
+    if n == 0
+        return ("", "")
+    end
+    (layer.variable_names[layer.x_var[] + 1], layer.variable_names[layer.y_var[] + 1])
+end
+
+side_panel(layer::CorrelationLayer, ::Plot) = draw_fitting_settings(layer.layer_id_str, layer.fit)
+
+function bottom_controls(layer::CorrelationLayer, ::Plot)
+    n = length(layer.variable_names)
+    if n == 0
+        return
+    end
+    variable_data = state[].client.variable_data
+    x_name = layer.variable_names[layer.x_var[] + 1]
+    x = variable_data[x_name]
+    if x.type != VariableType_Scalar
+        return
+    end
+    id = layer.layer_id_str
+    y_name = layer.variable_names[layer.y_var[] + 1]
+    y = variable_data[y_name]
+
+    ig.SameLine()
+    if ig.Button("Clear##$(id)")
+        clear_variable_data(x)
+        clear_variable_data(y)
+        clear_layer_data!(layer)
+    end
+
+    ig.SameLine()
+    ig.SetNextItemWidth(120)
+    ig.DragFloat("Binning resolution##$(id)",
+                 layer.binning_resolution, 0.01f0,
+                 0.0f0, typemax(Cfloat), "%.8f",
+                 ig.ImGuiSliderFlags_AlwaysClamp)
+end
+
+# --- SpecLayer methods (struct defined above with the other layers) ---
+
+# Latest spec for this layer, falling back to the last-seen one when the source
+# variable is no longer advertising it.
+function current_spec(layer::SpecLayer)
+    store = get(state[].client.variable_data, layer.source_var, nothing)
+    if !isnothing(store)
+        idx = findfirst(s -> s.name == layer.spec_name, store.plot_specs)
+        if !isnothing(idx)
+            layer.last_spec = store.plot_specs[idx]
+        end
+    end
+    return layer.last_spec
+end
+
+# Variables a spec references: each layer's primary `data`, plus any channel
+# bound to a sibling variable (a String, as opposed to a Symbol dim).
+function spec_variables(spec::PlotSpec)
+    vars = Set{String}()
+    for ls in spec.layers
+        push!(vars, ls.data)
+        for ch in (ls.x, ls.y, ls.color)
+            if ch isa String
+                push!(vars, ch)
+            end
+        end
+    end
+    return vars
+end
+
+# Subscribe to newly-referenced variables and drop ones no longer in the spec.
+function reconcile_subscriptions!(layer::SpecLayer, spec::PlotSpec)
+    desired = spec_variables(spec)
+    for name in setdiff(desired, layer.subscribed)
+        subscribe_variable(state[], name)
+    end
+    for name in setdiff(layer.subscribed, desired)
+        unsubscribe_variable(state[], name)
+    end
+    empty!(layer.subscribed)
+    union!(layer.subscribed, desired)
+end
+
+# Resolve x-axis values for a (possibly sliced) series. A String channel pulls
+# from a sibling variable, a Symbol selects a dim of `data`, and nothing infers:
+# a DimArray's first remaining dim lookup, else the integer index.
+function resolve_x(ls::LayerSpec, data)
+    if ls.x isa String
+        other = get(state[].client.variable_data, ls.x, nothing)
+        if !isnothing(other) && !(other.data isa ArrayMetadata)
+            return other.data isa DimArray ? parent(other.data) : other.data
+        end
+        return 1:length(data)
+    elseif ls.x isa Symbol && data isa DimArray && DD.hasdim(data, ls.x)
+        return parent(lookup(data, ls.x))
+    elseif data isa DimArray
+        return parent(lookup(data)[1])
+    else
+        return 1:length(data)
+    end
+end
+
+# Axis vectors for an image mark: a Symbol channel selects a dim's lookup,
+# otherwise fall back to the store's axes (which may be nothing → pixel coords).
+function image_axes(ls::LayerSpec, data, store)
+    xax = (ls.x isa Symbol && data isa DimArray && DD.hasdim(data, ls.x)) ?
+        parent(lookup(data, ls.x)) : store.x_axis
+    yax = (ls.y isa Symbol && data isa DimArray && DD.hasdim(data, ls.y)) ?
+        parent(lookup(data, ls.y)) : store.y_axis
+    return xax, yax
+end
+
+function series_frame(ls::LayerSpec, xs, ys, label, color)
+    if ls.mark === :bars
+        bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
+        return Bars(xs, ys, label, bar_size, false)
+    else
+        style = ls.mark === :scatter ? :scatter : :line
+        return Line(xs, ys, label, style, color)
+    end
+end
+
+# Append the frame(s) for one LayerSpec to `frames`.
+function layerspec_frames!(layer::SpecLayer, ls::LayerSpec, updated_variables, frames::Vector{PlotType})
+    store = get(state[].client.variable_data, ls.data, nothing)
+    if isnothing(store) || store.data isa ArrayMetadata
+        return
+    end
+    data = store.data
+    if !(eltype(data) <: Real) || isempty(data)
+        return
+    end
+
+    if ls.mark === :image || (data isa AbstractMatrix && !(ls.color isa Symbol))
+        if isnothing(layer.image)
+            layer.image = ImageState()
+            layer.image.fixed_aspect[] = store.fixed_aspect
+        end
+        was_updated = haskey(updated_variables, ls.data)
+        xax, yax = image_axes(ls, data, store)
+        push!(frames, prepare_heatmap!(layer.image, data, xax, yax, was_updated))
+        return
+    end
+
+    colordim = ls.color isa Symbol ? ls.color : nothing
+    if !isnothing(colordim) && data isa DimArray && DD.hasdim(data, colordim)
+        # coords are the grouping dim's lookup values (or its index range when
+        # the dim has no explicit lookup), so the legend reads "<dim> - <value>".
+        coords = parent(lookup(data, colordim))
+        n = length(coords)
+        for (i, slice) in enumerate(eachslice(data; dims = DD.dimnum(data, colordim)))
+            # Always set an explicit colour (gradient → Viridis sample, otherwise
+            # the discrete palette) so toggling `gradient` updates live: ImPlot
+            # caches item->Color and only refreshes it when given a non-auto
+            # colour, so handing back `nothing` would keep the stale colour.
+            # Start at 0.2, not 0: Viridis near t=0 is almost black and vanishes
+            # against the plot background.
+            color = ls.gradient ?
+                ImPlot.SampleColormap(Cfloat(0.2 + 0.8 * (i - 1) / max(n - 1, 1)), ImPlot.ImPlotColormap_Viridis) :
+                ImPlot.GetColormapColor(i - 1)
+            push!(frames, series_frame(ls, resolve_x(ls, slice), parent(slice), "$(colordim) - $(coords[i])", color))
+        end
+    else
+        ys = data isa DimArray ? parent(data) : data
+        label = isnothing(ls.label) ? ls.data : ls.label
+        push!(frames, series_frame(ls, resolve_x(ls, data), ys, label, nothing))
+    end
+end
+
+function prepare!(layer::SpecLayer, ::Plot, updated_variables)
+    spec = current_spec(layer)
+    if isnothing(spec)
+        return Empty("Waiting for plot spec: $(layer.spec_name)")
+    end
+    reconcile_subscriptions!(layer, spec)
+
+    frames = PlotType[]
+    for ls in spec.layers
+        layerspec_frames!(layer, ls, updated_variables, frames)
+    end
+    if isempty(frames)
+        return Empty("Waiting for data: $(layer.spec_name)")
+    end
+    return frames
+end
+
+function axis_labels(layer::SpecLayer)
+    spec = current_spec(layer)
+    isnothing(spec) && return ("", "")
+    return (something(spec.xlabel, ""), something(spec.ylabel, ""))
+end
+
+function window_title(layer::SpecLayer)
+    spec = current_spec(layer)
+    isnothing(spec) ? "" : something(spec.title, layer.spec_name)
+end
+
+function bottom_controls(layer::SpecLayer, ::Plot)
+    if !isnothing(layer.image)
+        image_controls(layer.image, layer.layer_id_str)
+    end
+end
+
+function Base.close(layer::SpecLayer)
+    if !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap)
+        destroy!(layer.image.gpu_heatmap)
+        layer.image.gpu_heatmap = nothing
+    end
+    for name in layer.subscribed
+        unsubscribe_variable(state[], name)
+    end
+    empty!(layer.subscribed)
 end

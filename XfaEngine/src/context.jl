@@ -1054,9 +1054,10 @@ function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
     ctx_module = Module(Symbol(:XfaContext, gensym()))
     init_expr = quote
         using XfaEngine.Context.NaNStatistics
+        using XfaEngine.Context.DimensionalData
 
         using XfaEngine.Context
-        using XfaEngine.Context: VariableData, Parameter, KaraboBridge, Meta
+        using XfaEngine.Context: VariableData, PlotSpec, LayerSpec, Parameter, KaraboBridge, Meta
     end
     @eval ctx_module $init_expr
 
