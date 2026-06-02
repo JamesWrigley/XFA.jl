@@ -192,6 +192,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     unit::Maybe{String} = nothing
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
+    compress::Bool = true
 end
 
 struct LinkInfo

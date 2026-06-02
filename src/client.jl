@@ -735,6 +735,7 @@ function store_variable_data!(client, variable::VariableData)
         store.update_rate = variable.update_rate
         store.compression_ratio = compression_ratio
         store.received_bytes = received_bytes
+        store.compress = variable.compress
         return
     end
 
@@ -809,6 +810,7 @@ function store_variable_data!(client, variable::VariableData)
     store.update_rate = variable.update_rate
     store.compression_ratio = compression_ratio
     store.received_bytes = received_bytes
+    store.compress = variable.compress
 end
 
 @enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor ParameterOwner_Global
