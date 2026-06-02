@@ -7,6 +7,7 @@ const VARIABLE_CHANNEL_SIZE = 100
 
 include("zfp_workspace.jl")
 include("karabo_bridge.jl")
+include("detector_assembly.jl")
 include("context.jl")
 
 import TOML
