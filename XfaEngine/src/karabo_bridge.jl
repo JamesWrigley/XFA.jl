@@ -3,7 +3,7 @@ module KaraboBridge
 import ZMQ
 import MsgPack
 import Sockets
-using ..XfaEngine: VARIABLE_CHANNEL_SIZE
+using XfaContext: VARIABLE_CHANNEL_SIZE
 
 # Per-(source, path) ring of reusable Vector{T} buffers for receiving Karabo
 # array payloads without aliasing libzmq memory. Depth matches the inter-task

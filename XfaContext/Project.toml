@@ -1,0 +1,25 @@
+name = "XfaContext"
+uuid = "bfd66c52-b205-4445-8c0d-7f0378e755b2"
+authors = ["JamesWrigley <james.wrigley@xfel.eu>"]
+version = "0.1.0"
+
+[deps]
+Accessors = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+DistributedNext = "fab6aee4-877b-4bac-a744-3eca44acbb6f"
+FHist = "68837c9b-b678-4cd5-9925-8a54edc8f695"
+MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
+NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
+OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+
+[compat]
+Accessors = "0.1.44"
+DataStructures = "0.18, 0.19"
+DimensionalData = "0.30"
+DistributedNext = "1.0.0"
+FHist = "0.11"
+MacroTools = "0.5"
+NaNStatistics = "0.6.55"
+OrderedCollections = "1"
+julia = "1.11"

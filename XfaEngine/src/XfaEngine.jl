@@ -1,21 +1,20 @@
 module XfaEngine
 
-# Capacity of the per-train variable channels (see Context.variable_channel).
-# Used as the depth of the Karabo recv buffer pool too, so a recycled buffer
-# has had a full window of trains to drain through every consumer.
-const VARIABLE_CHANNEL_SIZE = 100
+# The pipeline core. `Context` is kept as a back-compat alias for the module so
+# existing `Context.foo` references (here and in macro-generated code) resolve.
+using XfaContext
+using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter
+const Context = XfaContext
 
 include("zfp_workspace.jl")
 include("karabo_bridge.jl")
-include("detector_assembly.jl")
-include("context.jl")
 
 import TOML
 import Glob
 include("settings.jl")
 include("protocol.jl")
 
-using .Context: KaraboDevice
+using .KaraboBridge: KaraboBridgeClient, BufferPool
 include("webproxy.jl")
 
 import TOML
@@ -32,8 +31,11 @@ using DimensionalData: DimArray
 
 using .Protocol
 using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
-import .Context: XfaContext, VariableData, ArrayMetadata
 using Accessors: @set
+
+# The KaraboInput @Group/@Input lives here (not in Context) because it depends
+# on the engine's webproxy/device discovery and the ZMQ KaraboBridge transport.
+include("karabo_input.jl")
 
 
 """Find the closest available port to `port_hint`."""
@@ -86,7 +88,7 @@ end
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
 
-    ctx::XfaContext = XfaContext()
+    ctx::ContextState = ContextState()
 
     # One zfp workspace per qualified variable name. Sized to the variable's
     # data on first use and reused across trains; switching precision on the
@@ -204,6 +206,20 @@ function forward_output(state::EngineState, stream_output)
     end
 end
 
+# Installed as the context's on_parameter_changed hook: broadcast an
+# engine-initiated parameter change to every connected client so their GUIs
+# stay in sync. Runs on proc 1 (where set_parameter calls the hook).
+function broadcast_parameter_changed(state::EngineState, name, value)
+    msg = Protocol.ParameterChanged(Context.Parameter(name, value))
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
+        end
+    end
+end
+
 # Periodically broadcast a snapshot of every variable channel's drop count,
 # fill level, and capacity to all connected clients. Used by the GUI to color
 # pipeline edges by load.
@@ -213,7 +229,7 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
     while !state.stop_event.set
         sleep(period)
         # Re-read state.ctx each iteration — LoadContext swaps it for a fresh
-        # XfaContext, so capturing it outside the loop would leave us pinned
+        # ContextState, so capturing it outside the loop would leave us pinned
         # to the never-running default context.
         ctx = state.ctx
         if !ctx.is_running[] || isempty(state.clients)
@@ -350,14 +366,17 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
         new_ctx_or_ex = try
-            ctx = Context.load_from_file(path; routing_rules=state.routing_rules)
+            dep_router = (topic, source) -> match_rule(state.routing_rules, topic, source)
+            prelude = [:(using XfaEngine: KaraboInput)]
+            ctx = Context.load_from_file(path; dep_router, prelude)
             ctx.forwarder = Base.Fix1(forward_output, state)
+            ctx.on_parameter_changed = (name, value) -> broadcast_parameter_changed(state, name, value)
             ctx
         catch ex
             Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
-        if new_ctx_or_ex isa XfaContext
+        if new_ctx_or_ex isa ContextState
             state.ctx = new_ctx_or_ex
             if was_running
                 @invokelatest Context.start_pipeline(state.ctx)

@@ -5,7 +5,7 @@
     auto_select_output::Bool = false
 end
 
-function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
+function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var_data, gui_state)
     var_data["draw_parameters"] = false
     client = state[].client
     params = var_data["parameters"]
@@ -194,7 +194,7 @@ function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, g
     return gui_state
 end
 
-function draw_postprocessor_params(::Val{Symbol("XfaEngine.Context.Histogram1D")}, pp, min_node_width)
+function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp, min_node_width)
     param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
     for param_name in param_order
         if param_name == "buffer_size" && !pp.params["windowed"].value

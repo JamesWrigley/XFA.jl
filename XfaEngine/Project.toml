@@ -23,10 +23,12 @@ Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+XfaContext = "bfd66c52-b205-4445-8c0d-7f0378e755b2"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
+XfaContext = {path = "../XfaContext"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
@@ -38,5 +40,6 @@ FHist = "0.11"
 Glob = "1"
 HTTP = "1"
 NaNStatistics = "0.6.55"
+OrderedCollections = "1"
 RemoteREPL = "0.3.0"
 Revise = "3"

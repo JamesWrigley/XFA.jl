@@ -12,7 +12,7 @@ include("imnodes.jl")
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
-using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
+using XfaContext: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
     ArrayMetadata, RectROI, PlotSpec, LayerSpec
 include("plotting.jl")
 
@@ -22,7 +22,7 @@ using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKin
     RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
-    decompress_array!, allocate_array
+    decompress_array!, allocate_array, restore_dims
 include("states.jl")
 
 using TOML: TOML
@@ -31,7 +31,7 @@ using CRC32c: crc32c
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
+using XfaContext: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
 include("imgui_helpers.jl")

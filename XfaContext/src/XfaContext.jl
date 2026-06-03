@@ -1,9 +1,19 @@
-module Context
+module XfaContext
 
 export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    RectROI
+    RectROI, Context
+
+# Macro-generated code and context files refer to this module as `Context`. It's
+# exported so `using XfaContext` binds it the way `using XfaEngine.Context` used
+# to, and it doubles as a back-compat alias for the engine.
+const Context = @__MODULE__
+
+# Capacity of the per-train variable channels (see variable_channel). Also used
+# as the depth of the engine's Karabo recv buffer pool, so a recycled buffer has
+# had a full window of trains to drain through every consumer.
+const VARIABLE_CHANNEL_SIZE = 100
 
 import Base.ScopedValues: @with
 
@@ -14,14 +24,13 @@ import MacroTools: @capture, postwalk, prettify
 import OrderedCollections: OrderedDict
 using Accessors: @set
 using DimensionalData: DimensionalData, DimensionalData as DD
-import ..XfaEngine
 
 using DataStructures: DataStructures, CircularBuffer, isfull
 include("circular_channel.jl")
 
 # Factory for RemoteChannels carrying per-train variable data. Oldest items
 # are overwritten when a consumer falls behind; drops are counted per channel.
-variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(XfaEngine.VARIABLE_CHANNEL_SIZE))
+variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(VARIABLE_CHANNEL_SIZE))
 
 struct ChannelStat
     drops::Int
@@ -87,8 +96,8 @@ end
 
 include("context_types.jl")
 include("trainmatching.jl")
+include("detector_assembly.jl")
 
-import ..KaraboBridge: KaraboBridgeClient, BufferPool
 using DataStructures: CircularBuffer
 using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges
 using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
@@ -101,7 +110,7 @@ include("context_builtins.jl")
     current_ctx_module::Module = Module()
 end
 
-@kwdef mutable struct XfaContext
+@kwdef mutable struct ContextState
     functions::Dict{String, Any} = Dict()
     group_types::Dict{DataType, Group} = Dict()
     groups::Dict{String, Any} = Dict()
@@ -116,6 +125,7 @@ end
     exprs::Vector{Expr} = Expr[]
 
     inputs::Dict{String, Any} = Dict()
+    prelude::Vector{Expr} = Expr[]
     input_channels::Dict{String, Channel} = Dict()
     input_tasks::Dict{String, Task} = Dict()
     available_sources::Dict{String, Vector{String}} = Dict()
@@ -140,6 +150,11 @@ end
     forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
 
+    # Invoked on proc 1 when a parameter changes value via `tryset`, as
+    # (name, value). The engine installs a closure that broadcasts the change
+    # to connected clients; offline runners leave it as the no-op default.
+    on_parameter_changed::Function = Returns(nothing)
+
     path::String = ""
 
     is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
@@ -148,18 +163,18 @@ end
 end
 
 worker_state::WorkerState = WorkerState()
-current_ctx::Union{XfaContext, Nothing} = nothing
+current_ctx::Union{ContextState, Nothing} = nothing
 
-function Base.show(io::IO, ctx::XfaContext)
+function Base.show(io::IO, ctx::ContextState)
     n_variables = length(ctx.functions)
     n_params = length(ctx.parameters)
-    print(io, "XfaContext($(n_variables) variables, $(n_params) parameters)")
+    print(io, "ContextState($(n_variables) variables, $(n_params) parameters)")
 end
 
 """
 Finds all external dependencies (i.e. from Karabo) required by the context.
 """
-function external_dependencies(ctx::XfaContext; per_variable=false)
+function external_dependencies(ctx::ContextState; per_variable=false)
     deps_per_variable = Dict{String, Vector{Dependency}}()
     all_deps = Dependency[]
 
@@ -177,7 +192,7 @@ function external_dependencies(ctx::XfaContext; per_variable=false)
 end
 
 # Returns the group object for an input, or nothing if it has no group.
-function get_input_group(ctx::XfaContext, input_name)
+function get_input_group(ctx::ContextState, input_name)
     for (_, dep) in ctx.inputs[input_name]
         if dep isa Dependency && dep.kind == DepKind_Group
             return ctx.groups[dep.name]
@@ -193,7 +208,7 @@ end
 # 2. Topic match: dep has a topic, input group's input_topic() matches
 # 3. Source match: dep's source is in the input group's get_sources() result
 # 4. Single input fallback: only one input exists
-function build_dep_routing(ctx::XfaContext, routing_rules=nothing)
+function build_dep_routing(ctx::ContextState, dep_router=Returns(nothing))
     dep_to_input = Dict{String, String}()
     deps = external_dependencies(ctx)
 
@@ -226,29 +241,26 @@ function build_dep_routing(ctx::XfaContext, routing_rules=nothing)
         end
     end
 
-    rules = isnothing(routing_rules) ? [] : routing_rules
-
     for dep in deps
         dep_name = string(dep)
 
-        # 1. Routing rule. The rule's `input` is parsed as a KaraboDevice —
+        # 1. Routing. `dep_router` (supplied by the engine) maps (topic, source)
+        # to an input device string, which we parse as a KaraboDevice —
         # topic-qualified ("T//DEV") matches exactly, bare ("DEV") matches by
         # name only (first-hit wins if multiple topics share a device name).
-        if !isempty(rules)
-            dep_topic = isnothing(dep.topic) ? "" : dep.topic
-            matched = XfaEngine.match_rule(rules, dep_topic, dep.source)
-            if !isnothing(matched)
-                target = KaraboDevice(matched)
-                input_name = if !isempty(target.topic)
-                    get(device_map, target, nothing)
-                else
-                    name_hits = [v for (dev, v) in device_map if dev.name == target.name]
-                    isempty(name_hits) ? nothing : first(name_hits)
-                end
-                if !isnothing(input_name)
-                    dep_to_input[dep_name] = input_name
-                    continue
-                end
+        dep_topic = isnothing(dep.topic) ? "" : dep.topic
+        matched = dep_router(dep_topic, dep.source)
+        if !isnothing(matched)
+            target = KaraboDevice(matched)
+            input_name = if !isempty(target.topic)
+                get(device_map, target, nothing)
+            else
+                name_hits = [v for (dev, v) in device_map if dev.name == target.name]
+                isempty(name_hits) ? nothing : first(name_hits)
+            end
+            if !isnothing(input_name)
+                dep_to_input[dep_name] = input_name
+                continue
             end
         end
 
@@ -284,7 +296,7 @@ end
 # channel.
 dep_variable_name(dep::Dependency) = dep.kind == DepKind_Subvariable ? dep.parent : dep.name
 
-function find_downstream_neighbours(ctx::XfaContext, dep_name, kind::DependencyKind)
+function find_downstream_neighbours(ctx::ContextState, dep_name, kind::DependencyKind)
     neighbours = Set{String}()
     for (var_name, deps) in ctx.dag
         for (_, dep) in deps
@@ -305,7 +317,7 @@ function origin_path(x)
     origin = x isa Function ? variable_origin(x) : x
     mod = parentmodule(origin)
     parts = String[]
-    while !startswith(string(nameof(mod)), "XfaContext")
+    while !startswith(string(nameof(mod)), "UserContext")
         pushfirst!(parts, string(nameof(mod)))
         if mod === parentmodule(mod)
             break
@@ -316,7 +328,7 @@ function origin_path(x)
     return join(parts, ".")
 end
 
-function to_dict(ctx::XfaContext)
+function to_dict(ctx::ContextState)
     inputs = Dict{String, Vector{String}}()
     for (name, deps) in ctx.inputs
         # Anonymous args (e.g. `::MockInput`) have `nothing` keys; skip those
@@ -442,9 +454,9 @@ function topological_sort(dag)
     return sorted_graph
 end
 
-topological_sort(ctx::XfaContext) = topological_sort(ctx.dag)
+topological_sort(ctx::ContextState) = topological_sort(ctx.dag)
 
-function execute_variables(ctx::XfaContext, inputs::Dict)
+function execute_variables(ctx::ContextState, inputs::Dict)
     execution_order = topological_sort(ctx)
     results = Dict{String, Any}()
 
@@ -484,7 +496,7 @@ function execute_variables(ctx::XfaContext, inputs::Dict)
     return results
 end
 
-function change_parameter(ctx::XfaContext, new_param::Parameter)
+function change_parameter(ctx::ContextState, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
         if !isnothing(ctx_param.update_handler)
@@ -504,7 +516,7 @@ end
 # Returns the owning group or postprocessor for a parameter, or nothing for
 # top-level parameters. Owners are passed to update handlers so they can
 # mutate additional state alongside the new value.
-function find_parameter_owner(ctx::XfaContext, param_name::String)
+function find_parameter_owner(ctx::ContextState, param_name::String)
     dot_idx = findlast('.', param_name)
     isnothing(dot_idx) && return nothing
     prefix = param_name[1:dot_idx-1]
@@ -749,7 +761,7 @@ end
 
 # Simple function that will asynchronously watch the DAG and close the
 # `stream_output` if all variables are finished.
-function watch_context(ctx::XfaContext)
+function watch_context(ctx::ContextState)
     while true
         if all(istaskdone.(values(ctx.variable_tasks)))
             close(ctx.stream_output)
@@ -774,7 +786,7 @@ function declare_sources(input_name, new_sources)
     end
 end
 
-function update_input_sources(ctx::XfaContext)
+function update_input_sources(ctx::ContextState)
     deps = external_dependencies(ctx)
     for (input_name, _) in ctx.inputs
         group = get_input_group(ctx, input_name)
@@ -797,7 +809,7 @@ function pause_pipeline(f::Function)
     end
 end
 
-function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
+function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
     ctx.stream_output = variable_channel()
     ctx.events_channel = RemoteChannel(() -> Channel(100))
     ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
@@ -939,7 +951,7 @@ function start_pipeline(ctx::XfaContext; input_buffer_size::Int=50)
     return nothing
 end
 
-function stop_pipeline(ctx::XfaContext; timeout=5)
+function stop_pipeline(ctx::ContextState; timeout=5)
     ctx.is_running[] = false
 
     for ch in values(ctx.input_channels)
@@ -993,7 +1005,7 @@ function stop_pipeline(ctx::XfaContext; timeout=5)
     return nothing
 end
 
-function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
+function run(f::Function, ctx::ContextState; timeout=10, kwargs...)
     start_pipeline(ctx; kwargs...)
 
     task = nothing
@@ -1018,7 +1030,7 @@ function run(f::Function, ctx::XfaContext; timeout=10, kwargs...)
 end
 
 function _is_context_method(m::Method)
-    # Check if the method's type parameter belongs to an XfaContext module.
+    # Check if the method's type parameter belongs to a user context module.
     # For variable/input traits: signature is Tuple{typeof(f), typeof(func)}
     #   where parentmodule(func) is the context module
     # For group traits: signature is Tuple{typeof(f), Type{T}}
@@ -1035,7 +1047,7 @@ function _is_context_method(m::Method)
     end
 
     mod_names = string.(fullname(parentmodule(owner)))
-    return any(startswith.(mod_names, "XfaContext"))
+    return any(startswith.(mod_names, "UserContext"))
 end
 
 function _cleanup_context_methods()
@@ -1048,18 +1060,25 @@ function _cleanup_context_methods()
     end
 end
 
-function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
+function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), prelude=Expr[])
     _cleanup_context_methods()
 
-    ctx_module = Module(Symbol(:XfaContext, gensym()))
+    ctx_module = Module(Symbol(:UserContext, gensym()))
     init_expr = quote
-        using XfaEngine.Context.NaNStatistics
-        using XfaEngine.Context.DimensionalData
+        using XfaContext.NaNStatistics
+        using XfaContext.DimensionalData
 
-        using XfaEngine.Context
-        using XfaEngine.Context: VariableData, PlotSpec, LayerSpec, Parameter, KaraboBridge, Meta
+        using XfaContext
+        using XfaContext: VariableData, PlotSpec, LayerSpec, Parameter, Meta
     end
     @eval ctx_module $init_expr
+
+    # Splice in any input namespaces supplied by input-providing packages
+    # (e.g. the engine's KaraboInput), so context files can name inputs the
+    # pipeline core doesn't itself define.
+    for expr in prelude
+        @eval ctx_module $expr
+    end
 
     exprs = Expr[]
 
@@ -1075,10 +1094,10 @@ function load_from_string(ctx_str::AbstractString; routing_rules=nothing)
         @eval ctx_module $expr
     end
 
-    @invokelatest load_from_module(ctx_module, exprs; routing_rules)
+    @invokelatest load_from_module(ctx_module, exprs; dep_router, prelude)
 end
 
-function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules=nothing)
+function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Returns(nothing), prelude=Expr[])
     parameters = Dict{String, Parameter}()
 
     # Discover all variables, inputs, group types, and parameters defined
@@ -1377,22 +1396,22 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; routing_rules
         ctx_displays[var_name] = resolved
     end
 
-    ctx = XfaContext(; functions, group_types, groups, dag,
+    ctx = ContextState(; functions, group_types, groups, dag,
                      subvariables=ctx_subvariables,
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
                      displays=ctx_displays,
-                     parameters, exprs, inputs)
-    ctx.dep_to_input = build_dep_routing(ctx, routing_rules)
+                     parameters, exprs, inputs, prelude)
+    ctx.dep_to_input = build_dep_routing(ctx, dep_router)
     return ctx
 end
 
-function load_from_file(ctx_path::AbstractString; routing_rules=nothing)
+function load_from_file(ctx_path::AbstractString; dep_router=Returns(nothing), prelude=Expr[])
     if !isfile(ctx_path)
         throw(ArgumentError("$(ctx_path) is not a file!"))
     end
 
-    ctx = load_from_string(read(ctx_path, String); routing_rules)
+    ctx = load_from_string(read(ctx_path, String); dep_router, prelude)
     ctx.path = ctx_path
     return ctx
 end
@@ -1446,4 +1465,4 @@ function Base.empty!(data::DD.DimVector)
     return DD.rebuild(data)
 end
 
-end
+end # module XfaContext
