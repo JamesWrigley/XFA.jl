@@ -1087,13 +1087,16 @@ function draw_plots()
             tid, x = latest_array
             if x isa CompressedArray
                 ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
-                out = store.data
-                if out isa Array && eltype(out) === x.original_eltype && size(out) == Tuple(x.shape)
-                    decompress_array!(ws, out, x)
+                # Reuse the existing buffer in place when shape/eltype match,
+                # unwrapping any DimArray from a previous frame to get at it.
+                prev = store.data
+                buf = prev isa DimArray ? parent(prev) : prev
+                if buf isa Array && eltype(buf) === x.original_eltype && size(buf) == Tuple(x.shape)
+                    decompress_array!(ws, buf, x)
+                    store.data = restore_dims(buf, x)
                 else
-                    out = decompress_array(ws, x)
+                    store.data = decompress_array(ws, x)
                 end
-                store.data = out
             else
                 store.data = x
             end
