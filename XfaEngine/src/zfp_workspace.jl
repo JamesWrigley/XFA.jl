@@ -3,9 +3,10 @@ module ZfpWorkspaces
 using ZfpCompression: zfp_compress!, zfp_decompress!, zfp_promote!, zfp_demote!,
     zfp_clamp_int!, zfp_max_magnitude
 using NaNStatistics: nanmean
+using DimensionalData: DimensionalData as DD
 
 export ZfpWorkspace, CompressedArray, compress_array,
-       decompress_array, decompress_array!, allocate_array,
+       decompress_array, decompress_array!, allocate_array, restore_dims,
        should_compress, COMPRESSION_THRESHOLD
 
 const COMPRESSION_THRESHOLD = 500
@@ -39,20 +40,35 @@ const KIND_NEGINF = 0x03
     float64_scratch::Vector{Float64} = Float64[]  # NaN/Inf-replaced copy of a Float64 input
 end
 
+# Info needed to rebuild a DimArray on the receiving side. Set when the input
+# to compress_array was a DimArray; the underlying parent array is compressed
+# as usual and these travel alongside. Dimension lookups are stored as-is
+# (uncompressed).
+struct DimArrayInfo
+    dim_names::Vector{Symbol}
+    dim_lookups::Vector{Any}
+    name::String
+    metadata::Dict
+end
+
 # Result of compress_array. `data` and `nonfinite_mask` alias the producing
 # workspace's scratch buffers — copy them if you need to retain past the next
 # compress_array call.
-struct CompressedArray
+@kwdef struct CompressedArray
     data::Vector{UInt8}
     shape::Vector{Int}
     original_eltype::DataType
-    promoted::Bool
-    nonfinite_mask::Union{Nothing, Vector{UInt8}}
+    promoted::Bool = false
+    nonfinite_mask::Union{Nothing, Vector{UInt8}} = nothing
 
     # Set when the input was outside zfp's safe integer range and was clamped
     # to fit. Informational only — receivers see the clamped values and don't
     # need to take any special action.
-    clamped::Bool
+    clamped::Bool = false
+
+    # Set when the input was a DimArray; carries the dimension info needed to
+    # reconstruct it after decompression (see restore_dims).
+    dims::Union{DimArrayInfo, Nothing} = nothing
 end
 
 # A negative precision means "use the engine default", so callers can forward
@@ -66,6 +82,7 @@ function should_compress(arr::AbstractArray)
         length(arr) >= COMPRESSION_THRESHOLD &&
         eltype(arr) <: Compressible
 end
+should_compress(arr::DD.AbstractDimArray) = should_compress(parent(arr))
 should_compress(_) = false
 
 float_scratch(ws::ZfpWorkspace, ::Type{Float32}) = ws.float32_scratch
@@ -115,7 +132,7 @@ function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
     promoted = reshape(ws.int32_scratch, size(arr))
     zfp_promote!(promoted, arr)
     zfp_compress!(ws.compressed, promoted; precision)
-    return CompressedArray(ws.compressed, shape, T, true, nothing, false)
+    return CompressedArray(; data=ws.compressed, shape, original_eltype=T, promoted=true)
 end
 
 # Natively-supported integer types: zero-copy when all values are within
@@ -137,7 +154,7 @@ function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
     end
 
     zfp_compress!(ws.compressed, arr; precision)
-    return CompressedArray(ws.compressed, shape, T, false, nothing, clamped)
+    return CompressedArray(; data=ws.compressed, shape, original_eltype=T, clamped)
 end
 
 # Floats: zero-copy when all values are finite; otherwise sanitize into a
@@ -161,7 +178,27 @@ function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
     end
 
     zfp_compress!(ws.compressed, arr; precision)
-    return CompressedArray(ws.compressed, shape, T, false, mask, false)
+    return CompressedArray(; data=ws.compressed, shape, original_eltype=T, nonfinite_mask=mask)
+end
+
+function compress_array(ws::ZfpWorkspace, arr::DD.AbstractDimArray; precision::Integer=-1)
+    md = DD.metadata(arr)
+    metadata = if md isa Dict
+        md
+    elseif md isa DD.NoMetadata
+        Dict()
+    else
+        @error "Dropping DimArray metadata of unsupported type $(typeof(md)); expected Dict"
+        Dict()
+    end
+
+    ca = compress_array(ws, parent(arr); precision)
+    ds = DD.dims(arr)
+    info = DimArrayInfo(Symbol[DD.name(d) for d in ds],
+                        Any[DD.lookup(d) for d in ds],
+                        string(DD.name(arr)), metadata)
+    return CompressedArray(; ca.data, ca.shape, ca.original_eltype, ca.promoted,
+                           ca.nonfinite_mask, ca.clamped, dims=info)
 end
 
 # Restore the non-finite values into `out` using the compressed kind mask.
@@ -218,9 +255,23 @@ function decompress_array!(ws::ZfpWorkspace, out::DenseArray{T},
     return out
 end
 
-# Convenience: allocate + decompress in one call.
+# Wrap a decompressed array as a DimArray when `ca` carried dimension info,
+# rebuilding the dimensions from their stored names and lookups. Otherwise
+# returns `arr` unchanged.
+function restore_dims(arr::AbstractArray, ca::CompressedArray)
+    if isnothing(ca.dims)
+        return arr
+    else
+        info = ca.dims
+        ds = Tuple(DD.rebuild(DD.name2dim(n), l) for (n, l) in zip(info.dim_names, info.dim_lookups))
+        return DD.DimArray(arr, ds; name=info.name, metadata=info.metadata)
+    end
+end
+
+# Convenience: allocate + decompress in one call. Reconstructs a DimArray when
+# `ca` carried dimension info.
 function decompress_array(ws::ZfpWorkspace, ca::CompressedArray)
-    return decompress_array!(ws, allocate_array(ca), ca)
+    return restore_dims(decompress_array!(ws, allocate_array(ca), ca), ca)
 end
 
 end # module

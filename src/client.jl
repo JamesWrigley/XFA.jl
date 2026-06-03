@@ -764,6 +764,8 @@ function store_variable_data!(client, variable::VariableData)
         variable.title
     elseif data isa DimArray
         DD.label(data)
+    elseif data isa CompressedArray && !isnothing(data.dims)
+        data.dims.name
     else
         name
     end
@@ -782,6 +784,8 @@ function store_variable_data!(client, variable::VariableData)
         DD.label(DD.dims(data)[2])
     elseif data isa DimArray
         DD.label(DD.dims(data)[1])
+    elseif data isa CompressedArray && !isnothing(data.dims)
+        string(length(data.shape) == 2 ? data.dims.dim_names[2] : data.dims.dim_names[1])
     elseif data isa Number
         "trainId"
     else
@@ -793,6 +797,8 @@ function store_variable_data!(client, variable::VariableData)
         DD.label(DD.dims(data)[1])
     elseif data isa DimArray
         DD.label(data)
+    elseif data isa CompressedArray && !isnothing(data.dims)
+        length(data.shape) == 2 ? string(data.dims.dim_names[1]) : data.dims.name
     else
         ""
     end

@@ -1,5 +1,6 @@
 [deps]
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 FHist = "68837c9b-b678-4cd5-9925-8a54edc8f695"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"

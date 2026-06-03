@@ -14,16 +14,18 @@ using HTTP: HTTP, WebSockets
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, bincenters, binedges
+using DimensionalData: DimensionalData as DD, DimArray
 
 using XfaEngine: XfaEngine, Context, KaraboBridge, Protocol, RoutingRule, match_rule,
     build_client_view!, is_scalar_data, ArrayMetadata, EngineState
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array,
-    decompress_array, decompress_array!, allocate_array, should_compress
+    decompress_array, decompress_array!, allocate_array, restore_dims, should_compress
 using XfaEngine: XfaEngine as engine
 using XfaContext: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    XfaContextException, Parameter, FunctionArgument, KaraboDevice, CircularChannel, drop_count
+    XfaContextException, Parameter, FunctionArgument, KaraboDevice, CircularChannel, drop_count,
+    PlotSpec, LayerSpec
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -779,6 +781,15 @@ end
         @test !should_compress(zeros(100))
         @test !should_compress("string")
         @test !should_compress(zeros(Bool, 600))
+
+        # A 2D array plotted as a bunch of lines (a color-bound layer) skips
+        # compression; the same array without that layer still compresses, and
+        # the line exception only applies to matrices.
+        lines = [PlotSpec("p", [LayerSpec(; data="v", color=:pulseId)])]
+        plain = [PlotSpec("p", [LayerSpec(; data="v")])]
+        @test !should_compress(VariableData(; data=rand(100, 5), plot_specs=lines))
+        @test should_compress(VariableData(; data=rand(100, 5), plot_specs=plain))
+        @test should_compress(VariableData(; data=rand(600), plot_specs=lines))
     end
 
     # High precision pins the round-trip fidelity regardless of whatever
@@ -851,6 +862,28 @@ end
         @test_throws DimensionMismatch decompress_array!(ws, zeros(801), ca)
     end
 
+    # DimArrays compress their parent array and ship the dimension info so the
+    # client can rebuild the DimArray after decompression.
+    @testset "DimArray round-trip" begin
+        parent_data = randn(Float64, 30, 40)
+        da = DimArray(parent_data, (DD.Y(1:30), DD.X(101:140));
+                      name="image", metadata=Dict(:units => "eV"))
+
+        @test should_compress(da)
+        ca = compress_array(ws, da; precision=15)
+        @test !isnothing(ca.dims)
+        @test ca.dims.dim_names == [:Y, :X]
+        @test ca.dims.name == "image" && ca.dims.metadata[:units] == "eV"
+
+        out = decompress_array(ws, ca)
+        @test out isa DD.DimArray
+        @test DD.name(out) == "image" && DD.metadata(out)[:units] == "eV"
+        @test DD.dims(out) == DD.dims(da)
+        @test maximum(abs, parent(da) - parent(out)) < 1e-2
+
+        # No-dims CompressedArrays pass through restore_dims unchanged.
+        plain = compress_array(ws, randn(600))
+        @test restore_dims(allocate_array(plain), plain) isa Vector{Float64}
     end
 end
 
