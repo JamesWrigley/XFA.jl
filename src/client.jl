@@ -402,9 +402,9 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
 
-        for dep_pair in deps
-            attr_id = int32_hash("$(name).dependencies.$(dep_pair)")
-            push!(ctx_state[name]["dependencies"], (attr_id, dep_pair))
+        for (arg_name, dep) in deps
+            attr_id = int32_hash("$(name).dependencies.$(arg_name => dep)")
+            push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
         end
 
         # The variable itself is always the first output

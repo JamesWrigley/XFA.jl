@@ -551,8 +551,8 @@ Base.getindex(param::Parameter) = param.value
 Base.setindex!(param::Parameter, value) = param.value = value
 
 # Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
-# into the coordinator's parameter dict and broadcasts a ParameterChanged so
-# every client picks the engine-initiated change up in its GUI.
+# into the coordinator's parameter dict and notifies the context's
+# `on_parameter_changed` hook so the engine can broadcast it to clients.
 function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
 
@@ -560,18 +560,8 @@ function set_parameter(name::String, value, requestor::String)
         worker_state.parameters[name].value = value
     end
 
-    state = XfaEngine.current_engine_state
-    if isnothing(state)
-        return
-    end
-
-    msg = XfaEngine.Protocol.ParameterChanged(Parameter(name, value))
-    for (id, client) in state.clients
-        try
-            XfaEngine.Protocol.server_send(client.websocket, msg)
-        catch ex
-            @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
-        end
+    if !isnothing(current_ctx)
+        current_ctx.on_parameter_changed(name, value)
     end
 end
 

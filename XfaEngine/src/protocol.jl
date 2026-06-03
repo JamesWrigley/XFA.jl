@@ -19,8 +19,8 @@ import Serialization: serialize, deserialize
 
 import HTTP: WebSockets
 
-import ..Context
-using ..Context: XfaContext, VariableData, Parameter
+import XfaContext
+using XfaContext: ContextState, VariableData, Parameter
 using ..XfaEngine: RoutingRule, RemapRule
 
 
@@ -142,7 +142,7 @@ struct ContextInfo <: AbstractMessage
     source::String
 end
 
-ContextInfo(ctx::XfaContext, source::String) = ContextInfo(Context.to_dict(ctx), ctx.is_running[], source)
+ContextInfo(ctx::ContextState, source::String) = ContextInfo(XfaContext.to_dict(ctx), ctx.is_running[], source)
 
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter
@@ -163,7 +163,7 @@ end
 # the downstream variable name. `input_rates` is the smoothed Hz at which
 # each input is pushing data, keyed by input name.
 struct PipelineStats <: AbstractMessage
-    channel_stats::Dict{Tuple{String, String}, Context.ChannelStat}
+    channel_stats::Dict{Tuple{String, String}, XfaContext.ChannelStat}
     input_rates::Dict{String, Float64}
 end
 
