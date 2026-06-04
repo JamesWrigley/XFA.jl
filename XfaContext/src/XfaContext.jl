@@ -28,9 +28,18 @@ using DimensionalData: DimensionalData, DimensionalData as DD
 using DataStructures: DataStructures, CircularBuffer, isfull
 include("circular_channel.jl")
 
-# Factory for RemoteChannels carrying per-train variable data. Oldest items
-# are overwritten when a consumer falls behind; drops are counted per channel.
-variable_channel() = RemoteChannel(() -> CircularChannel{VariableData}(VARIABLE_CHANNEL_SIZE))
+# Factory for channels carrying per-train variable data. Online (`offline=false`)
+# returns a RemoteChannel over a CircularChannel: oldest items are overwritten
+# when a consumer falls behind, and drops are counted per channel. Offline
+# returns a plain bounded Channel, whose `put!` blocks instead of dropping so a
+# finite run is replayed losslessly.
+function variable_channel(offline::Bool=false)
+    if offline
+        Channel{VariableData}(VARIABLE_CHANNEL_SIZE)
+    else
+        RemoteChannel(() -> CircularChannel{VariableData}(VARIABLE_CHANNEL_SIZE))
+    end
+end
 
 struct ChannelStat
     drops::Int
@@ -73,7 +82,7 @@ variable_origin(f) = f
 
 struct Neighbour
     name::String
-    channel::RemoteChannel
+    channel::Union{RemoteChannel, Channel}
 end
 
 # Container module for train/variable-specific information. This conflicts with
@@ -132,21 +141,21 @@ end
 
     dep_to_input::Dict{String, String} = Dict()
 
-    input_variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+    input_variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
     input_variables_tasks::Dict{String, Task} = Dict()
 
-    external_dependency_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+    external_dependency_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
     external_dependency_tasks::Dict{String, Task} = Dict()
 
     variable_tasks::Dict{String, Task} = Dict()
-    variable_channels::Dict{String, Dict{String, RemoteChannel}} = Dict()
+    variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
 
     # Smoothed Hz at which inputs and external dependencies are pushing data,
     # keyed by input/dep name. Variable rates are sent piggy-backed on
     # `VariableData.update_rate` instead.
     input_rates::Dict{String, Float64} = Dict()
 
-    stream_output::Union{RemoteChannel, Nothing} = nothing
+    stream_output::Union{RemoteChannel, Channel, Nothing} = nothing
     forwarder::Function = Returns(nothing)
     output_forwarder_task::Union{Task, Nothing} = nothing
 
@@ -156,6 +165,16 @@ end
     on_parameter_changed::Function = Returns(nothing)
 
     path::String = ""
+
+    # Offline-replay plan, populated on a copy of a loaded context by `run`. The
+    # feeder replaces all of the context's inputs (it pushes `(tid, data)` like a
+    # real @Input). `variable_overrides` maps a variable name to a value emitted
+    # per train in place of computing it; an overridden variable has its
+    # dependencies cut (so its upstream is pruned unless separately requested)
+    # and is driven as a root by `matched_tids`, the run's train list.
+    input_feeder::Union{Function, Nothing} = nothing
+    variable_overrides::Dict{String, Any} = Dict()
+    matched_tids::Vector{Int} = Int[]
 
     is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
     events_channel::Union{RemoteChannel, Nothing} = nothing
@@ -626,11 +645,12 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     end
 end
 
-function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors)
+function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors;
+                         max_train_latency::Integer=20)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
 
-    matcher = Trainmatcher(k for (k, v) in upstream if v isa RemoteChannel)
+    matcher = Trainmatcher((k for (k, v) in upstream if v isa Union{RemoteChannel, Channel}), max_train_latency)
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(deps))
 
@@ -640,7 +660,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     input_data = Channel{VariableData}(max(4, length(upstream) * 4))
     input_task = Threads.@spawn :interactive try
         @sync for arg in values(upstream)
-            if arg isa RemoteChannel
+            if arg isa Union{RemoteChannel, Channel}
                 Threads.@spawn :interactive try
                     while isopen(arg) || isready(arg)
                         put!(input_data, take!(arg))
@@ -746,7 +766,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
         # Close upstream and downstream channels
         for arg in values(upstream)
-            if arg isa RemoteChannel
+            if arg isa Union{RemoteChannel, Channel}
                 close(arg)
             end
         end
@@ -809,13 +829,21 @@ function pause_pipeline(f::Function)
     end
 end
 
-function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
-    ctx.stream_output = variable_channel()
+include("offline.jl")
+
+function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_size::Int=50)
+    ctx.stream_output = variable_channel(offline)
     ctx.events_channel = RemoteChannel(() -> Channel(100))
     ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
     errormonitor(ctx.output_forwarder_task)
 
     global current_ctx = ctx
+
+    # Offline replay registers a single feeder (set up by `run`) as the function
+    # backing the "offline" input that replaces all of the context's inputs.
+    if !isnothing(ctx.input_feeder)
+        worker_state.dag_functions["offline"] = ctx.input_feeder
+    end
 
     # Run one-shot parameter initializers the first time the pipeline starts
     # after loading. Cleared after running so repeat starts don't re-trigger.
@@ -860,11 +888,11 @@ function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
     # Start the input variables, each with downstream channels only for
     # the external deps routed to that input.
     for name in keys(ctx.inputs)
-        downstream_neighbours = Dict{String, RemoteChannel}()
+        downstream_neighbours = Dict{String, Union{RemoteChannel, Channel}}()
         for dep in external_dependencies(ctx)
             dep_name = string(dep)
             if get(ctx.dep_to_input, dep_name, nothing) == name
-                downstream_neighbours[dep_name] = variable_channel()
+                downstream_neighbours[dep_name] = variable_channel(offline)
             end
         end
         ctx.input_variable_channels[name] = downstream_neighbours
@@ -882,9 +910,9 @@ function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
         input_channel = ctx.input_variable_channels[input_name][dep_name]
         input_neighbour = Neighbour(input_name, input_channel)
 
-        downstream_neighbours = Dict{String, RemoteChannel}()
+        downstream_neighbours = Dict{String, Union{RemoteChannel, Channel}}()
         for neighbour in find_downstream_neighbours(ctx, dep_name, DepKind_Karabo)
-            downstream_neighbours[neighbour] = variable_channel()
+            downstream_neighbours[neighbour] = variable_channel(offline)
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
@@ -894,6 +922,9 @@ function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
 
     # Update the inputs
     update_input_sources(ctx)
+
+    # Offline drops nothing: keep partial trains indefinitely (see Trainmatcher).
+    max_train_latency = offline ? -1 : 20
 
     # Start the variables themselves
     execution_order = topological_sort(ctx)
@@ -923,22 +954,31 @@ function start_pipeline(ctx::ContextState; input_buffer_size::Int=50)
 
         # Find downstream variables, including those that depend on our
         # subvariables.
-        downstream = Dict{String, RemoteChannel}()
+        downstream = Dict{String, Union{RemoteChannel, Channel}}()
         for neighbour in find_downstream_neighbours(ctx, name, DepKind_Variable)
-            downstream[neighbour] = variable_channel()
+            downstream[neighbour] = variable_channel(offline)
         end
         for neighbour in find_downstream_neighbours(ctx, name, DepKind_Subvariable)
             if !haskey(downstream, neighbour)
-                downstream[neighbour] = variable_channel()
+                downstream[neighbour] = variable_channel(offline)
             end
         end
         ctx.variable_channels[name] = downstream
+
+        # An overridden variable isn't computed: an emitter pushes its override
+        # value once per matched train instead of running stream_variable.
+        if haskey(ctx.variable_overrides, name)
+            ctx.variable_tasks[name] = Threads.@spawn offline_emitter(name, ctx.stream_output, downstream,
+                                                                      ctx.variable_overrides[name], ctx.matched_tids)
+            errormonitor(ctx.variable_tasks[name])
+            continue
+        end
 
         var_pps = Dict{String, AbstractPostprocessor}(
             pp_name => ctx.postprocessors[pp_name]
             for pp_name in get(ctx.variable_postprocessors, name, String[])
         )
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps)
+        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
         errormonitor(ctx.variable_tasks[name])
     end
 

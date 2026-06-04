@@ -32,7 +32,6 @@ using XfaContext: VariableData, XfaContextException, CircularChannel, drop_count
 
 keyset(dict) = Set(keys(dict))
 
-
 # Helper module that defines variables for reference tests, defined in
 # Main so that load_from_string's context modules can access it.
 @eval Main module VariableLibrary
@@ -1502,6 +1501,126 @@ end
                 expected_stack = revdims(pyconvert(Array{Float64}, ref))
                 @test isequal(Context.assemble(asm, stack), expected_stack)
             end
+        end
+    end
+end
+
+@testset "Offline runner" begin
+    ctx = Context.load_from_string(raw"""
+    @Variable foo -> karabo"camera.data"
+    @Variable function bar(x -> foo)
+        return x * 2
+    end
+    @Variable function baz(x -> foo)
+        return x + 100
+    end
+    @Variable function qux(x -> foo)
+        @add_subvariable("half", x / 2)
+        return x
+    end
+    """)
+    # `values` is keyed by external dependency name; a DimArray with a trainId
+    # dimension feeds a distinct element per train.
+    vals = Dict("camera.data" => Context.DD.DimArray([1, 2, 3, 4],
+                                                     (Context.DD.Dim{:trainId}([10, 11, 12, 13]),)))
+
+    # Filtering helpers
+    @test occursin(Context.pattern_regex("baz.*"), "baz.quux")
+    @test !occursin(Context.pattern_regex("baz"), "baz.quux")
+    @test Context.upstream_closure(ctx.dag, ["bar"]) == Set(["bar", "foo"])
+
+    # `select` keeps the named variable plus its upstream closure, prunes the rest
+    r = Context.run(ctx, vals; select=["bar"])
+    @test keyset(r) == Set(["foo", "bar"])
+    @test collect(r["foo"]) == [1, 2, 3, 4]
+    @test collect(r["bar"]) == [2, 4, 6, 8]
+    @test collect(Context.DD.lookup(r["foo"], :trainId)) == [10, 11, 12, 13]
+
+    # A subvariable can be selected by name, keeping its parent
+    r = Context.run(ctx, vals; select=["qux.half"])
+    @test keyset(r) == Set(["foo", "qux", "qux.half"])
+    @test collect(r["qux.half"]) == [0.5, 1.0, 1.5, 2.0]
+
+    # A constant value is sent unchanged on every train
+    r = Context.run(ctx, Dict("camera.data" => vals["camera.data"], "unused" => 7); select=["bar"])
+    @test collect(r["bar"]) == [2, 4, 6, 8]
+
+    # A constant override replaces a variable's output on every train
+    r = Context.run(ctx, vals; select=["bar", "baz"], override=Dict("baz" => 1000))
+    @test keyset(r) == Set(["foo", "bar", "baz"])
+    @test collect(r["baz"]) == fill(1000, 4)
+
+    # A DimArray override carrying a trainId dimension is applied per train, and
+    # provides the train clock even when the input upstream is pruned away.
+    bg = Context.DD.DimArray([100, 200, 300, 400], (Context.DD.Dim{:trainId}([10, 11, 12, 13]),))
+    r = Context.run(ctx, vals; select=["baz"], override=Dict("baz" => bg))
+    @test collect(r["baz"]) == [100, 200, 300, 400]
+
+    # The matched trains are the intersection across per-train sources
+    bg2 = Context.DD.DimArray([100, 200], (Context.DD.Dim{:trainId}([11, 12]),))
+    r = Context.run(ctx, vals; select=["bar", "baz"], override=Dict("baz" => bg2))
+    @test collect(Context.DD.lookup(r["bar"], :trainId)) == [11, 12]
+    @test collect(r["bar"]) == [4, 6]
+
+    # Overriding a variable cuts its deps, so its unused upstream is pruned
+    r = Context.run(ctx, vals; select=["baz"], override=Dict("baz" => 0))
+    @test keyset(r) == Set(["baz"])
+
+    # The loaded context is never mutated by a run
+    @test keyset(ctx.dag) == Set(["foo", "bar", "baz", "qux"])
+
+    @test_throws XfaContextException Context.run(ctx, vals; override=Dict("nope" => 1))
+    @test_throws XfaContextException Context.run(ctx, vals; select=["nomatch"])
+
+    # Nothing carrying a trainId dimension would be an infinite stream
+    @test_throws ArgumentError Context.run(ctx, Dict("camera.data" => 5); select=["bar"])
+
+    @testset "DataCollection method" begin
+        # Drive the PythonCall extension's run against a real extra-data
+        # DataCollection. The AGIPD1M example run carries a constant control
+        # property (integrationTime = 15) for 100 trains starting at 10000.
+        ctx = Context.load_from_string(raw"""
+        @Variable itime -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime"
+
+        @Variable function double(x -> itime)
+            return x * 2
+        end
+
+        @Variable function module0(x -> karabo"SPB_DET_AGIPD1M-1/DET/0CH0:xtdf[image.data]")
+            nanmean(x; dim=(:trainId, :dim_0))
+        end
+
+        @Variable itime_proxied -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime@proxy:output"
+        """)
+
+        mktempdir() do dir
+            dc = PythonCall.GIL.@lock begin
+                pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
+                pyimport("extra_data").RunDirectory(dir)
+            end
+
+            # The type check rejects a Py object that isn't a DataCollection
+            @test_throws ArgumentError Context.run(ctx, PythonCall.GIL.@lock(pylist([1, 2, 3])))
+
+            # Test returning scalars
+            r = Context.run(ctx, dc; select=["double"])
+            @test keyset(r) == Set(["itime", "double"])
+            @test length(r["itime"]) == 100
+            @test all(==(15), collect(r["itime"]))
+            @test all(==(30), collect(r["double"]))
+            @test collect(Context.DD.lookup(r["itime"], :trainId))[1:3] == [10000, 10001, 10002]
+
+            # Test returning arrays
+            r = Context.run(ctx, dc; select=["module0"])
+            @test keyset(r) == Set(["module0"])
+            @test size(r["module0"]) == (128, 512, 100)
+            @test Context.DD.hasdim(r["module0"], :trainId)
+            @test collect(Context.DD.lookup(r["module0"], :trainId))[1:3] == [10000, 10001, 10002]
+
+            # Test that proxied dependencies are ignored
+            r = Context.run(ctx, dc; select=["itime_proxied"])
+            @test keyset(r) == Set(["itime_proxied"])
+            @test all(==(15), collect(r["itime_proxied"]))
         end
     end
 end

@@ -4,3 +4,4 @@ python = "<3.14"
 
 [pip.deps]
 extra_geom = ""
+extra_data = ""
