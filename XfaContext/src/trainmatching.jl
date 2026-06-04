@@ -130,7 +130,8 @@ mutable struct Trainmatcher
     Karabo bridge. `sources` is some iterable of `String`'s. The matching is
     'greedy', which means that if not all sources have been received for a certain
     train after `max_train_latency` trains, then the incomplete train data will be
-    returned.
+    dropped. A negative `max_train_latency` disables this: incomplete trains are
+    kept indefinitely (used for lossless offline replay).
     """
     function Trainmatcher(sources, max_train_latency::Integer=20)
         new(max_train_latency, Set(sources), Dict{Int, Any}(), -1)
@@ -159,7 +160,7 @@ function match_train!(matched_trains::Dict{Int, Any}, tm::Trainmatcher, variable
     for tid in collect(keys(tm.train_data))
         if issetequal(tm.sources, keys(tm.train_data[tid]))
             matched_trains[tid] = pop!(tm.train_data, tid)
-        elseif tm.latest_trainid - tid > tm.max_train_latency
+        elseif tm.max_train_latency >= 0 && tm.latest_trainid - tid > tm.max_train_latency
             pop!(tm.train_data, tid)
         end
     end
