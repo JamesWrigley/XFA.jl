@@ -12,7 +12,7 @@ function AssemblerLUT(detector::AbstractString="AGIPD_1MGeometry";
     script = joinpath(@__DIR__, "generate_assembly_lut.py")
     args = ["--detector", detector, "--n_modules", string(n_modules)]
     if !isnothing(geom_file)
-        push!(args, geom_file)
+        push!(args, expanduser(geom_file))
     end
     bytes = read(`$python $script $args`)
     nx, ny = reinterpret(Int64, @view bytes[1:16])
