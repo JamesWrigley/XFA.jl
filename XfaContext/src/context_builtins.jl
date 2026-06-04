@@ -404,11 +404,10 @@ function center_of_mass(data::AbstractMatrix)
 
     com_x = wx / total
     com_y = wy / total
-    rows, cols = axes(data, 1), axes(data, 2)
-    if round(Int, com_x) ∉ axes(data, 2)
+    if !isfinite(com_x) || round(Int, com_x) ∉ axes(data, 2)
         com_x = NaN
     end
-    if round(Int, com_y) ∉ axes(data, 1)
+    if !isfinite(com_y) || round(Int, com_y) ∉ axes(data, 1)
         com_y = NaN
     end
 
