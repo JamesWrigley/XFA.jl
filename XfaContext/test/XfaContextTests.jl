@@ -1456,6 +1456,14 @@ end
 @testset "Detector assembly" begin
     @test_throws DimensionMismatch Context.assemble!(zeros(3, 3), Context.AssemblerLUT(UInt64[1, 2, 3, 4], (2, 2)), rand(4))
 
+    # Assembling from a vector of per-module arrays matches the equivalent
+    # whole-detector array (single frame and a stack of frames).
+    asm = Context.AssemblerLUT(UInt64[4, 3, 2, 1], (2, 2))
+    frame = rand(2, 2)
+    @test isequal(Context.assemble(asm, [frame[:, 1:1], frame[:, 2:2]]), Context.assemble(asm, frame))
+    stack = rand(2, 2, 3)
+    @test isequal(Context.assemble(asm, [stack[:, 1, :], stack[:, 2, :]]), Context.assemble(asm, stack))
+
     # ReTest may run this body on a migrated task, so hold the GIL around all
     # the PythonCall work to avoid calling into CPython without it.
     PythonCall.GIL.@lock begin
