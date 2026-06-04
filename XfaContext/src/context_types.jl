@@ -88,7 +88,7 @@ RectROI() = RectROI(0.0, 0.0, 0.0, 0.0)
 
 Base.isassigned(roi::RectROI) = !(roi.corner_x == 0 && roi.corner_y == 0 && roi.width == 0 && roi.height == 0)
 
-function (r::RectROI)(image::AbstractMatrix)
+function (r::RectROI)(image::AbstractArray)
     corner_x = round(Int, r.corner_x)
     corner_y = round(Int, r.corner_y)
     width = round(Int, r.width)
@@ -102,7 +102,10 @@ function (r::RectROI)(image::AbstractMatrix)
     min_y = clamp(corner_y, y_range)
     max_y = clamp(min_y + height, y_range)
 
-    @view image[min_y:max_y, min_x:max_x]
+    # Slice the first two dimensions with the ROI and keep all remaining
+    # dimensions in full (e.g. a 3D stack yields a stack of cropped images).
+    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
+    @view image[min_y:max_y, min_x:max_x, trailing...]
 end
 
 struct OptionalDims
