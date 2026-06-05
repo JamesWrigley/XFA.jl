@@ -1475,6 +1475,14 @@ end
 
 # --- VariableLayer methods ---
 
+# A dim's lookup values as a plain vector, but only when ForwardOrdered; an
+# unordered/reverse lookup wouldn't map onto the stretched heatmap axis, so
+# fall back to pixel indices (nothing).
+function forward_lookup(data::DimArray, dim::Int)
+    lo = lookup(data)[dim]
+    return DD.order(lo) isa DD.ForwardOrdered ? parent(lo) : nothing
+end
+
 function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
     client = state[].client
     store = get(client.variable_data, layer.name, nothing)
@@ -1515,7 +1523,23 @@ function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
             layer.image = ImageState()
             layer.image.fixed_aspect[] = store.fixed_aspect
         end
-        return prepare_heatmap!(layer.image, data, store.x_axis, store.y_axis, was_updated)
+        # Fall back to a 2D DimArray's dim lookups for the axes (dim 1 → Y/rows,
+        # dim 2 → X/cols), mirroring the vector branch above.
+        xax = if !isnothing(store.x_axis)
+            store.x_axis
+        elseif data isa DimArray
+            forward_lookup(data, 2)
+        else
+            nothing
+        end
+        yax = if !isnothing(store.y_axis)
+            store.y_axis
+        elseif data isa DimArray
+            forward_lookup(data, 1)
+        else
+            nothing
+        end
+        return prepare_heatmap!(layer.image, data, xax, yax, was_updated)
     end
     return Empty("$(layer.name): unsupported data shape $(typeof(data))")
 end
@@ -1566,6 +1590,15 @@ function image_bounds(frame::Image)
     x_max = isnothing(frame.x_axis) ? cols : last(frame.x_axis)
     y_min = isnothing(frame.y_axis) ? 0 : first(frame.y_axis)
     y_max = isnothing(frame.y_axis) ? rows : last(frame.y_axis)
+    # A degenerate range (all lookup values equal) would give the image zero
+    # extent and divide by zero in the hover index math, so fall back to plain
+    # pixel indices for that axis.
+    if x_max == x_min
+        x_min, x_max = 0, cols
+    end
+    if y_max == y_min
+        y_min, y_max = 0, rows
+    end
     return (rows, cols, x_min, x_max, y_min, y_max)
 end
 
