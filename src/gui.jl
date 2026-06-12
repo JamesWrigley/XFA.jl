@@ -1451,6 +1451,7 @@ function main(; test_engine=nothing)
 
     # Setup ImPlot context
     implot_ctx = ImPlot.CreateContext()
+    add_turbo_colormap()
 
     # Enable docking and viewports by default
     io = ig.GetIO()
