@@ -658,7 +658,7 @@ function coffman_graham(dag; W=3)
     return levels
 end
 
-function schema_property_names(schema::Dict)
+function schema_property_names(schema::AbstractDict)
     props = DeviceProperties()
     collect_properties!(props, "", schema)
     slow_order = sortperm(props.slow.names)
@@ -675,10 +675,10 @@ end
 
 const NDARRAY_PROPERTIES = ("data", "shape", "type", "isBigEndian")
 
-function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
+function collect_properties!(props, prefix, node::AbstractDict, target::PropertyList=props.slow)
     for (key, value) in node
         path = isempty(prefix) ? key : "$(prefix).$(key)"
-        if value isa Dict
+        if value isa AbstractDict
             if get(value, "nodeType", "") == "Leaf"
                 push!(target.names, path)
                 push!(target.displayed_names, get(value, "displayedName", ""))
