@@ -1,5 +1,5 @@
 import HTTP
-import JSON3
+import JSON
 
 # @sum_type WebProxyClientStatus :hidden begin
 #     UNCONNECTED
@@ -79,11 +79,11 @@ end
 # node.
 function strip_metadata!(x)
     for key in keys(x)
-        if x[key] isa Dict && keys(x[key]) == Set(["value", "timestamp", "tid"])
+        if x[key] isa AbstractDict && keys(x[key]) == Set(["value", "timestamp", "tid"])
             x[key] = x[key]["value"]
         end
 
-        if x[key] isa Dict || x[key] isa Vector
+        if x[key] isa AbstractDict || x[key] isa Vector
             strip_metadata!(x[key])
         end
     end
@@ -91,16 +91,16 @@ end
 
 function get_json(wp, path; timeout=5)
     res = HTTP.get(wp.address * path;
-                   connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+                   connect_timeout=timeout, read_idle_timeout=timeout)
+    return JSON.parse(res.body, Dict{String, Any})
 end
 
 function put_json(wp, path, body; timeout=5)
     res = HTTP.put(wp.address * path,
                    ["Content-Type" => "application/json"],
-                   JSON3.write(body);
-                   connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+                   JSON.json(body);
+                   connect_timeout=timeout, read_idle_timeout=timeout)
+    return JSON.parse(res.body, Dict{String, Any})
 end
 
 function get_topology(wp; timeout=5, max_age=10)
@@ -192,9 +192,9 @@ end
 # slots that don't take arguments, which reply with null).
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)
     url = wp.address * "/devices/$(device)/slot/$(slot).json"
-    body = params isa Dict ? JSON3.write(params) : params
-    res = HTTP.put(url, nothing, body; connect_timeout=timeout, readtimeout=timeout)
-    response = JSON3.read(res.body, Dict{String, Any})
+    body = params isa Dict ? JSON.json(params) : params
+    res = HTTP.put(url, nothing, body; connect_timeout=timeout, read_idle_timeout=timeout)
+    response = JSON.parse(res.body, Dict{String, Any})
     if !response["success"]
         error("Calling slot '$(slot)' on '$(device)' failed: $(response["reason"])")
     end

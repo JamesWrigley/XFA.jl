@@ -11,7 +11,7 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 
 using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
-using JSON3: JSON3
+using JSON: JSON
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, bincenters, binedges
@@ -69,12 +69,12 @@ function server_exists(port)
 end
 
 function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
-    server = HTTP.serve!(Sockets.localhost, port) do request
+    server = HTTP.serve!("127.0.0.1", port) do request
         if request.target == "/devices.json"
             return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
         elseif endswith(request.target, "/slot/subscribeSources.json")
             if !isnothing(slot_calls)
-                push!(slot_calls, JSON3.read(request.body, Dict{String, Any}))
+                push!(slot_calls, JSON.parse(String(request.body), Dict{String, Any}))
             end
             # Mirrors the webproxy's SlotResponse format: the device reply is
             # nested under "reply" with {value, timestamp, tid}-wrapped leaves.

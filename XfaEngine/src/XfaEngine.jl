@@ -602,9 +602,6 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         end
     finally
         shutdown(state, ws_server)
-        if isopen(ws_server)
-            HTTP.forceclose(ws_server)
-        end
     end
 
     if wait
