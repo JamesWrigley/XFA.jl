@@ -188,11 +188,24 @@ function get_schema(device::KaraboDevice; timeout=5)
     return get_json(wp, "/devices/$(device.name)/schema.json"; timeout)
 end
 
+# Call a device slot and return its reply Hash as a Dict (or nothing for
+# slots that don't take arguments, which reply with null).
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)
     url = wp.address * "/devices/$(device)/slot/$(slot).json"
     body = params isa Dict ? JSON3.write(params) : params
     res = HTTP.put(url, nothing, body; connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+    response = JSON3.read(res.body, Dict{String, Any})
+    if !response["success"]
+        error("Calling slot '$(slot)' on '$(device)' failed: $(response["reason"])")
+    end
+
+    # The device's reply Hash is nested under "reply", with each value wrapped
+    # in the same {value, timestamp, tid} format as config.json.
+    reply = response["reply"]
+    if !isnothing(reply)
+        strip_metadata!(reply)
+    end
+    return reply
 end
 
 function get_trainmatcher_address(address, device::String; index=1)

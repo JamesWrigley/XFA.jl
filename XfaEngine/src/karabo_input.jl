@@ -11,6 +11,10 @@
 
     sources::Vector{String} = String[]
 
+    # Lease TTL (in seconds) reported by the trainmatchers subscribeSources
+    # slot. Leases are renewed at half this interval while streaming.
+    lease_ttl::Float64 = 30.0
+
     # Reusable receive buffers for array payloads, keyed by (source, path).
     # See karabo_bridge.jl BufferRing for the rotation policy.
     buffer_pool::BufferPool = BufferPool()
@@ -51,7 +55,23 @@ function Context.update_sources(bridge::KaraboInput, sources)
         return
     end
 
-    put_property(bridge.trainmatcher[], "sources", [Dict("source" => s) for s in sources])
+    bridge.sources = sources
+    if !isempty(sources)
+        subscribe_sources(bridge)
+    end
+end
+
+# Lease the current sources from the trainmatcher through its subscribeSources
+# slot. The leases expire after the TTL in the reply, so this must be called
+# periodically while streaming to keep the sources alive.
+function subscribe_sources(bridge::KaraboInput)
+    device = bridge.trainmatcher[]
+    reply = call_slot(get_webproxy(device), device.name, "subscribeSources",
+                      Dict("sources" => bridge.sources))
+    if !reply["success"]
+        @warn "Trainmatcher '$(device.name)' rejected the source subscription" reason=get(reply, "reason", "unknown")
+    end
+    bridge.lease_ttl = reply["ttl"]
 end
 
 @Input function stream(bridge::KaraboInput, output)
@@ -121,8 +141,22 @@ end
     end
 
     try
+        last_renewal = time()
         while isopen(output)
             sleep(0.1)
+
+            # Renew the source leases at half the TTL so that a single slow
+            # or failed call doesn't let them expire. A failed renewal is only
+            # logged since transient webproxy errors shouldn't stop streaming.
+            if !bridge.manual_configuration[] && !isempty(bridge.sources) &&
+               time() - last_renewal > bridge.lease_ttl / 2
+                try
+                    subscribe_sources(bridge)
+                catch ex
+                    @warn "Failed to renew the trainmatcher source leases" exception=ex
+                end
+                last_renewal = time()
+            end
         end
     catch ex
         if !(ex isa InvalidStateException)

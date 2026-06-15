@@ -11,6 +11,7 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 
 using ZMQ: ZMQ
 using HTTP: HTTP, WebSockets
+using JSON3: JSON3
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity
 using FHist: bincounts, bincenters, binedges
@@ -67,12 +68,19 @@ function server_exists(port)
     end
 end
 
-function mock_webproxy(f::Function, port, bridge_port=-1)
+function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
     server = HTTP.serve!(Sockets.localhost, port) do request
         if request.target == "/devices.json"
             return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
-        elseif endswith(request.target, "/set_sources.json")
-            return HTTP.Response("""{"status": "ok"}""")
+        elseif endswith(request.target, "/slot/subscribeSources.json")
+            if !isnothing(slot_calls)
+                push!(slot_calls, JSON3.read(request.body, Dict{String, Any}))
+            end
+            # Mirrors the webproxy's SlotResponse format: the device reply is
+            # nested under "reply" with {value, timestamp, tid}-wrapped leaves.
+            return HTTP.Response("""{"success": true, "reason": "",
+                                     "reply": {"success": {"value": true, "timestamp": 0, "tid": 0},
+                                               "ttl": {"value": 0.5, "timestamp": 0, "tid": 0}}}""")
         elseif endswith(request.target, "/config.json")
             return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)"}]}""")
         else
@@ -483,6 +491,46 @@ end
     """; prelude=KARABO_PRELUDE)
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === XfaEngine.stream
+
+    @testset "Source leases" begin
+        # In automatic configuration mode the bridge should lease its
+        # dependencies' sources through the subscribeSources slot and keep
+        # renewing them while streaming.
+        webproxy_port = XfaEngine.getavailableport(8485)
+        bridge_port = XfaEngine.getavailableport(42000)
+        bridge_server = KaraboBridgeServer("tcp://localhost:$(bridge_port)")
+        KaraboBridge.startbridge(bridge_server)
+
+        ctx = Context.load_from_string("""
+        bridge = KaraboInput(; trainmatcher=KaraboDevice("localhost//MATCHER"))
+        bridge._mock_sources = String[]
+
+        @Variable foo -> karabo"foo.x"
+        """; prelude=KARABO_PRELUDE)
+
+        webproxies = Dict("localhost" => XfaEngine.WebProxy("localhost:$(webproxy_port)"))
+        XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies)
+
+        slot_calls = []
+        put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
+        mock_webproxy(webproxy_port, bridge_port; slot_calls) do
+            Context.run(ctx) do
+                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+                @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
+
+                # The initial subscription leased the karabo dependency, and
+                # the bridge picked up the mocked TTL from the reply
+                @test slot_calls[1]["sources"] == ["foo.x"]
+                bridge = ctx.groups["bridge"]
+                @test bridge.lease_ttl == 0.5
+
+                # The lease is renewed periodically (every TTL/2 = 0.25s)
+                n = length(slot_calls)
+                @test timedwait(() -> length(slot_calls) > n, 5) == :ok
+            end
+        end
+        close(bridge_server)
+    end
 end
 
 @testset "Scheduler" begin
