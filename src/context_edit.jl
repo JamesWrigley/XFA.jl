@@ -1,6 +1,23 @@
 using Base.JuliaSyntax: @K_str, parseall, SyntaxNode, children, is_leaf, kind, byte_range
 
 
+# Resolve a macrocall name child to its @-symbol across JuliaSyntax versions.
+# Julia 1.13 turned the K"MacroName" leaf into a K"macro_name" wrapper node
+# around an Identifier, so we match on the kind name string rather than a
+# K"..." literal (the latter errors at macroexpand time on the wrong version).
+function macro_name_symbol(c)
+    kc = string(kind(c))
+    if kc == "MacroName"        # Julia < 1.13: leaf token, val like Symbol("@Variable")
+        return c.val
+    elseif kc == "macro_name"   # Julia >= 1.13: wrapper around an Identifier
+        cs = children(c)
+        return isnothing(cs) || isempty(cs) ? nothing : Symbol("@", cs[1].val)
+    else
+        return nothing
+    end
+end
+
+
 """
     replace_variable_name(source, old_name, new_name) -> String
 
@@ -14,7 +31,7 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
     # Find all identifier leaves with the old name inside @Variable macrocalls
     variable_macros = find_nodes(tree) do node
         kind(node) == K"macrocall" && any(children(node)) do c
-            is_leaf(c) && kind(c) == K"MacroName" && c.val == Symbol("@Variable")
+            macro_name_symbol(c) == Symbol("@Variable")
         end
     end
 
@@ -97,7 +114,7 @@ Find the `@Variable` macrocall node that defines a given variable name.
 function find_variable_node(tree::SyntaxNode, var_name::String)
     variable_macros = find_nodes(tree) do node
         kind(node) == K"macrocall" && any(children(node)) do c
-            is_leaf(c) && kind(c) == K"MacroName" && c.val == Symbol("@Variable")
+            macro_name_symbol(c) == Symbol("@Variable")
         end
     end
 
