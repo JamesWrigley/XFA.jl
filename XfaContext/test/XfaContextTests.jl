@@ -731,6 +731,27 @@ end
     """)
     @test ctx.dag["foo_group.foo"]["data"] == subvariable_dependency("bar", "sub")
 
+    # An unassigned Parameter{Dependency} is an optional dependency: it's kept in
+    # the DAG (so the variable's positional args line up) as the Parameter
+    # itself, but dropped from the serialized DAG edges. The parameter is still
+    # registered so the client can draw it.
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Dependency} = Parameter{Dependency}()
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo()
+    """)
+    @test !isassigned(ctx.parameters["foo_group.source"])
+    @test ctx.dag["foo_group.foo"]["data"] === ctx.groups["foo_group"].source
+    serialized = Context.to_dict(ctx)
+    @test !haskey(serialized["dag"]["foo_group.foo"], "data")
+    @test haskey(serialized["parameters"], "foo_group.source")
+
     # Test that referencing a non-existent parameter throws
     @test_throws XfaContextException Context.load_from_string(raw"""
     @Group mutable struct Foo end
