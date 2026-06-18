@@ -37,7 +37,7 @@ XfaEngine = {path = "XfaEngine"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
-CImGui = "7"
+CImGui = "8"
 CRC32c = "1"
 CurveFit = "1.9.1"
 DataStructures = "0.19"
@@ -46,7 +46,7 @@ DimensionalData = "0.30"
 FFTW = "1"
 GLFW = "3"
 HTTP = "2"
-ImPlot = "0.7.5"
+ImPlot = "0.8"
 LibSSH = "0.7"
 ModernGL = "1"
 NaNStatistics = "0.6.55"

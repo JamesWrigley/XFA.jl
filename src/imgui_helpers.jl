@@ -112,7 +112,7 @@ function BorderedText(text; color=IM_COL32(255, 0, 0, 255), thickness=2.0, paddi
     text_size = ig.CalcTextSize(text)
     p_min = ImVec2(cursor.x - padding.x, cursor.y - padding.y)
     p_max = ImVec2(cursor.x + text_size.x + padding.x, cursor.y + text_size.y + padding.y)
-    ig.AddRect(draw_list, p_min, p_max, color, 0.0, 0, thickness)
+    ig.AddRect(draw_list, p_min, p_max, color, 0.0, thickness)
     ig.Text(text)
 end
 

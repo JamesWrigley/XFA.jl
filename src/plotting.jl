@@ -1653,29 +1653,37 @@ end
 # Line with its own alpha-blended scatter). `frame.color`, when set, fixes the
 # series colour — used by SpecLayer fan-out; otherwise ImPlot cycles its palette.
 function plot_frame!(::Layer, frame::Line)
-    if !isnothing(frame.color)
-        ImPlot.SetNextLineStyle(frame.color)
-    end
+    spec = isnothing(frame.color) ? ImPlot.ImPlotSpec() : ImPlot.ImPlotSpec(; LineColor=frame.color)
     if frame.style === :scatter
-        ImPlot.PlotScatter(frame.label, frame.xs, frame.ys)
+        ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec)
     else
-        ImPlot.PlotLine(frame.label, frame.xs, frame.ys)
+        ImPlot.PlotLine(frame.label, frame.xs, frame.ys; spec)
     end
 end
 
 function plot_frame!(::Layer, frame::Bars)
-    ImPlot.PushStyleColor(ImPlot.ImPlotCol_Line, ig.ImVec4(0, 0, 0, 1))
-    if frame.horizontal
-        ImPlot.PlotBarsH(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size)
-    else
-        ImPlot.PlotBars(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size)
-    end
-    ImPlot.PopStyleColor()
+    # Black bar outlines; horizontal orientation via the bars flag.
+    flags = frame.horizontal ? ImPlot.ImPlotBarsFlags_Horizontal : ImPlot.ImPlotBarsFlags_None
+    spec = ImPlot.ImPlotSpec(; LineColor=ig.ImVec4(0, 0, 0, 1), Flags=Cint(flags))
+    ImPlot.PlotBars(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size, spec)
 end
 
 function draw_image_frame(gpu, frame::Image)
     _, _, x_min, x_max, y_min, y_max = image_bounds(frame)
     tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
+
+    # ImGui 1.92's GL backend binds a linear sampler for every draw, which
+    # overrides our texture's GL_NEAREST filter and blurs the heatmap when
+    # scaled. Switch the plot draw list to nearest sampling around the image,
+    # then restore linear for everything drawn afterwards.
+    draw_list = ImPlot.GetPlotDrawList()
+    platform_io = ig.GetPlatformIO()
+    set_nearest = unsafe_load(platform_io.DrawCallback_SetSamplerNearest)
+    set_linear = unsafe_load(platform_io.DrawCallback_SetSamplerLinear)
+    if set_nearest != C_NULL
+        ig.AddCallback(draw_list, set_nearest)
+    end
+
     # Matplotlib convention: first dim = row (vertical, top→bottom),
     # second dim = col (horizontal, left→right). data[1,1] at plot top-left;
     # data[rows,cols] at plot bottom-right. Y axis is inverted so y_min sits
@@ -1683,6 +1691,10 @@ function draw_image_frame(gpu, frame::Image)
     ImPlot.PlotImage("", tex_ref,
                      ImPlot.ImPlotPoint(x_min, y_max),
                      ImPlot.ImPlotPoint(x_max, y_min))
+
+    if set_linear != C_NULL
+        ig.AddCallback(draw_list, set_linear)
+    end
 end
 
 plot_frame!(layer::Union{VariableLayer, SpecLayer}, frame::Image) = draw_image_frame(layer.image.gpu_heatmap, frame)
@@ -2076,17 +2088,13 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
 end
 
 function plot_frame!(::CorrelationLayer, frame::Line)
-    ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-    ImPlot.PlotScatter(frame.label, frame.xs, frame.ys)
-    ImPlot.PopStyleVar()
+    ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec=ImPlot.ImPlotSpec(; FillAlpha=0.5))
 end
 
 function plot_frame!(::CorrelationLayer, frame::Band)
     # Same label_id ties the band and line to one legend entry so ImPlot
     # gives them matching colors.
-    ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar_FillAlpha, 0.5)
-    ImPlot.PlotShaded(frame.label, frame.xs, frame.lower, frame.upper)
-    ImPlot.PopStyleVar()
+    ImPlot.PlotShaded(frame.label, frame.xs, frame.lower, frame.upper; spec=ImPlot.ImPlotSpec(; FillAlpha=0.5))
     ImPlot.PlotLine(frame.label, frame.xs, frame.line_ys)
 end
 
