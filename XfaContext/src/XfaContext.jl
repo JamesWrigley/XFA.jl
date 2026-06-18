@@ -199,7 +199,7 @@ function external_dependencies(ctx::ContextState; per_variable=false)
 
     for (name, deps) in ctx.dag
         for (_, dep) in deps
-            if dep.kind == DepKind_Karabo
+            if dep isa Dependency && dep.kind == DepKind_Karabo
                 deps_vec = get!(deps_per_variable, name, Dependency[])
                 push!(deps_vec, dep)
                 push!(all_deps, dep)
@@ -371,16 +371,22 @@ function to_dict(ctx::ContextState)
 
     parameters = Dict{String, Parameter}()
     for (name, param) in ctx.parameters
-        parameters[name] = Parameter(; name=param.name, value=param.value, set_by_user=param.set_by_user)
+        # Preserve the concrete type so an unassigned (nothing-valued) parameter
+        # keeps its element type instead of failing to infer it.
+        parameters[name] = typeof(param)(; name=param.name, value=param.value, set_by_user=param.set_by_user)
     end
 
     # group_type holds a DataType that may live in the context's anonymous
     # module, which doesn't exist on the client and would break deserialization.
     dag = Dict{String, OrderedDict}()
     for (name, deps) in ctx.dag
+        # Unassigned optional dependencies aren't real edges, so they're left out
+        # of the DAG. The client still learns about the parameter itself via the
+        # `parameters` entry below, so it can be drawn in the GUI.
         dag[name] = OrderedDict{Any, Any}(k => v isa Dependency && !isnothing(v.group_type) ?
                                           (@set v.group_type = nothing) : v
-                                          for (k, v) in deps)
+                                          for (k, v) in deps
+                                          if !(v isa Parameter && !isassigned(v)))
     end
 
     # For group variables, recover the original arg_name => group field mapping
@@ -654,6 +660,10 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     matched_trains = Dict{Int, Any}()
     args = Vector{Any}(undef, length(deps))
 
+    # Parameter deps are constant config (e.g. an unassigned optional group
+    # dependency), not per-train data, so they never gate execution.
+    optional_args = Bool[dep isa Parameter for (_, dep) in deps]
+
     # We read inputs asynchronously into a single Channel so as not to lose
     # trains from a quickly updating source while waiting for train data from a
     # slowly updating source.
@@ -689,7 +699,9 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
             # Build args from deps, extracting subvariable values as needed
             for (i, (arg_name, dep)) in enumerate(deps)
-                if dep.kind == DepKind_Group
+                if dep isa Parameter
+                    args[i] = dep.value
+                elseif dep.kind == DepKind_Group
                     args[i] = upstream[dep.name]
                 elseif dep.kind == DepKind_Subvariable
                     parent_data = matched_data[dep.parent]
@@ -700,9 +712,9 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 end
             end
 
-            # Don't execute the variable if any inputs are `nothing`
+            # Don't execute the variable if any required input is `nothing`
             empty_result = VariableData(tid, name, nothing)
-            if any(isnothing, args)
+            if any(i -> !optional_args[i] && isnothing(args[i]), eachindex(args))
                 putall!(values(downstream), empty_result)
                 continue
             end
@@ -1276,25 +1288,29 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                             throw(XfaContextException("Parameter '$head' of group '$(group_name)' cannot be subscripted with '.$tail'"))
                         end
                         param = getproperty(object, head_sym)
-                        if isnothing(param.value)
-                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' has no value"))
-                        end
-                        if !(param.value isa Dependency)
+                        if !isassigned(param)
+                            # Unset optional dependency: kept in the DAG so the
+                            # variable's positional args still line up, but the
+                            # scheduler ignores it (no channel, no trainmatching)
+                            # and stream_variable passes `nothing` for this arg.
+                            dag_deps[arg_name] = param
+                        elseif !(param.value isa Dependency)
                             throw(XfaContextException("Parameter '$head' of group '$(group_name)' must hold a Dependency value"))
-                        end
-                        # A dotted name in a DepKind_Variable means a subvariable
-                        # reference (the user-facing `Dependency("foo.bar")` form
-                        # can't disambiguate). Promote it so topological_sort and
-                        # the group-variable rewrite below see the right kind.
-                        resolved = param.value
-                        if resolved.kind == DepKind_Variable
-                            d = findfirst('.', resolved.name)
-                            if !isnothing(d)
-                                resolved = subvariable_dependency(resolved.name[1:d-1],
-                                                                  resolved.name[d+1:end])
+                        else
+                            # A dotted name in a DepKind_Variable means a subvariable
+                            # reference (the user-facing `Dependency("foo.bar")` form
+                            # can't disambiguate). Promote it so topological_sort and
+                            # the group-variable rewrite below see the right kind.
+                            resolved = param.value
+                            if resolved.kind == DepKind_Variable
+                                d = findfirst('.', resolved.name)
+                                if !isnothing(d)
+                                    resolved = subvariable_dependency(resolved.name[1:d-1],
+                                                                      resolved.name[d+1:end])
+                                end
                             end
+                            dag_deps[arg_name] = resolved
                         end
-                        dag_deps[arg_name] = resolved
                     elseif any(nameof(f) == head_sym for f in group_types[group_type].variables)
                         var_name = "$group_name.$head"
                         dag_deps[arg_name] = isempty(tail) ? Dependency(var_name) : subvariable_dependency(var_name, tail)

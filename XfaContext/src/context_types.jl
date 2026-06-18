@@ -502,8 +502,8 @@ macro Variable(expr)
 end
 
 @kwdef mutable struct Parameter{T}
-    name::String
-    value::Union{T, Nothing}
+    name::String = ""
+    value::Union{T, Nothing} = nothing
     set_by_user::Bool = false
 
     update_handler::Union{Function, Nothing} = nothing
@@ -552,6 +552,8 @@ end
 
 Base.getindex(param::Parameter) = param.value
 Base.setindex!(param::Parameter, value) = param.value = value
+
+Base.isassigned(param::Parameter) = !isnothing(param.value)
 
 # Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
 # into the coordinator's parameter dict and notifies the context's
