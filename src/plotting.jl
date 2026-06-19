@@ -1001,6 +1001,7 @@ layer_id(layer::VariableLayer) = layer.layer_id_str
     const layer_id_str::String
     const x_var::Ref{Cint} = Ref(Cint(0))
     const y_var::Ref{Cint} = Ref(Cint(0))
+    const selected::Vector{String} = ["", ""]
     const subscribed::Vector{String} = ["", ""]
     const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
     const matcher::VariableTrainmatcher = VariableTrainmatcher()
@@ -2014,13 +2015,27 @@ function top_controls(layer::CorrelationLayer, ::Plot)
 
     n_variables = length(layer.variable_names)
     if n_variables > 0
-        layer.x_var[] = clamp(layer.x_var[], 0, n_variables - 1)
-        layer.y_var[] = clamp(layer.y_var[], 0, n_variables - 1)
+        # Seed the selection on first use, then keep x_var/y_var pointing at the
+        # selected variable by name. A context reload reorders/filters
+        # variable_names, so re-derive the index every frame; if the selected
+        # variable is temporarily absent, leave the index clamped without
+        # touching `selected` so the choice is restored once it reappears.
+        if isempty(layer.selected[1])
+            layer.selected[1] = layer.variable_names[clamp(layer.x_var[], 0, n_variables - 1) + 1]
+        end
+        if isempty(layer.selected[2])
+            layer.selected[2] = layer.variable_names[clamp(layer.y_var[], 0, n_variables - 1) + 1]
+        end
+        x_idx = findfirst(==(layer.selected[1]), layer.variable_names)
+        y_idx = findfirst(==(layer.selected[2]), layer.variable_names)
+        layer.x_var[] = isnothing(x_idx) ? clamp(layer.x_var[], 0, n_variables - 1) : x_idx - 1
+        layer.y_var[] = isnothing(y_idx) ? clamp(layer.y_var[], 0, n_variables - 1) : y_idx - 1
     end
 
     id = layer.layer_id_str
     if ig.Button("Swap axes##$(id)")
         layer.x_var[], layer.y_var[] = layer.y_var[], layer.x_var[]
+        layer.selected[1], layer.selected[2] = layer.selected[2], layer.selected[1]
         swap!(layer.matcher)
         reverse!(layer.subscribed)
     end
@@ -2030,6 +2045,13 @@ function top_controls(layer::CorrelationLayer, ::Plot)
     ig.SameLine()
     y_changed = var_combo("Y##$(id)", layer.y_var, layer.variable_names, variable_data)
 
+    # Record the user's choice as the new anchor.
+    if x_changed
+        layer.selected[1] = layer.variable_names[layer.x_var[] + 1]
+    end
+    if y_changed
+        layer.selected[2] = layer.variable_names[layer.y_var[] + 1]
+    end
     if x_changed || y_changed
         empty!(layer.matcher)
     end
