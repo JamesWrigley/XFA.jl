@@ -1527,7 +1527,12 @@ end
 # fall back to pixel indices (nothing).
 function forward_lookup(data::DimArray, dim::Int)
     lo = lookup(data)[dim]
-    return DD.order(lo) isa DD.ForwardOrdered ? parent(lo) : nothing
+
+    if !(lo isa DD.Lookup)
+        lo isa DenseVector ? lo : collect(lo)
+    else
+        DD.order(lo) isa DD.ForwardOrdered ? parent(lo) : nothing
+    end
 end
 
 function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
