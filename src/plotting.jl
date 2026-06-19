@@ -2086,6 +2086,9 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
         if ingest_vector!(m, x, y)
             compute_fit!(layer.fit, m.y_data, m.x_data)
         end
+        if length(m.x_data) != length(m.y_data)
+            return Empty("Cannot correlate vectors of different lengths ($(length(m.x_data)) vs $(length(m.y_data))).")
+        end
         return Line(m.x_data, m.y_data, label, :scatter)
     else
         return Empty("Unsupported correlation of data type '$(x.type)'")
