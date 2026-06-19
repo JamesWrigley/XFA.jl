@@ -404,6 +404,27 @@ end
         """
     end
 
+    @testset "Edit vector parameter" begin
+        @test XFA.format_param_value([1, 2, 3]) == "[1, 2, 3]"
+        @test XFA.format_param_value([1.5, 2.0]) == "[1.5, 2.0]"
+        @test XFA.format_param_value(Int[]) == "[]"
+
+        source = """
+        bins = Parameter([0, 1])
+        """
+        @test XFA.replace_parameter_value(source, "bins", XFA.format_param_value([1, 2, 3])) == """
+        bins = Parameter([1, 2, 3])
+        """
+
+        source = """
+        my_group = MyGroup(; bins=[0.0])
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "bins",
+                                            XFA.format_param_value([1.5, 2.0])) == """
+        my_group = MyGroup(; bins=[1.5, 2.0])
+        """
+    end
+
     @testset "Edit string group parameter" begin
         # Replace an existing string kwarg on a generic group constructor
         source = """

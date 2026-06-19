@@ -137,9 +137,26 @@ function draw_parameter_widget(name, param::Parameter{Vector{String}})
     return false, nothing
 end
 
+function draw_numeric_vector_widget(name, param::Parameter{Vector{T}}) where {T <: Number}
+    current = join(param.value, ", ")
+    edited, new_text = SafeInputText("##$(name)"; current_text=current)
+    if !edited
+        return false, nothing
+    end
+    parts = [strip(s) for s in split(new_text, ","; keepempty=false)]
+    parsed = [tryparse(T, p) for p in parts]
+    if any(isnothing, parsed)
+        return false, nothing
+    end
+    return true, T[parsed...]
+end
+
 function draw_parameter_widget(name, param::Parameter{Vector{Int}})
-    ig.Text("Vector{Int}")
-    return false, nothing
+    return draw_numeric_vector_widget(name, param)
+end
+
+function draw_parameter_widget(name, param::Parameter{Vector{Float64}})
+    return draw_numeric_vector_widget(name, param)
 end
 
 # (lo, hi) range editor. We only commit a new value once lo < hi so the engine
