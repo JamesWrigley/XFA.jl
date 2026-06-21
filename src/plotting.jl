@@ -900,7 +900,7 @@ end
 @kwdef mutable struct VariableTrainmatcher
     const x_data::Vector{Float64} = Float64[]
     const y_data::Vector{Float64} = Float64[]
-    accu::Maybe{AccuPairSequence} = nothing
+    accu::Maybe{Scalar1dScan} = nothing
     # Last vector-mode tid consumed, so we only copy once per matched train.
     last_vector_tid::Int = -1
 end
@@ -957,8 +957,11 @@ end
 # the resolution changes (covers initial creation, widget edits, swaps, var
 # changes). Returns true if the binned series changed.
 function set_resolution!(m::VariableTrainmatcher, res::Cfloat)
-    if res > 0 && (isnothing(m.accu) || m.accu.resolution != res)
-        m.accu = AccuPairSequence(m.x_data, m.y_data, res)
+    if res > 0 && (isnothing(m.accu) || m.accu.axes[1].resolution != res)
+        m.accu = Scalar1dScan(Float64(res))
+        for i in eachindex(m.x_data, m.y_data)
+            append!(m.accu, m.x_data[i], m.y_data[i])
+        end
         return true
     elseif res <= 0 && !isnothing(m.accu)
         m.accu = nothing
@@ -2094,13 +2097,14 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
             if isnothing(m.accu)
                 compute_fit!(layer.fit, m.y_data, m.x_data)
             else
-                compute_fit!(layer.fit, m.accu.y_values, m.accu.x_values;
-                             sigma=m.accu.sigma)
+                compute_fit!(layer.fit, parent(m.accu.mean), positions(m.accu, 1);
+                             sigma=1 ./ sqrt.(parent(m.accu.count)))
             end
         end
         if !isnothing(m.accu)
-            return Band(m.accu.x_values, m.accu.y_lower, m.accu.y_upper,
-                        m.accu.y_values, label)
+            half = 0.5 .* parent(m.accu.std)
+            ys = parent(m.accu.mean)
+            return Band(positions(m.accu, 1), ys .- half, ys .+ half, ys, label)
         else
             return Line(m.x_data, m.y_data, label, :scatter)
         end

@@ -1314,6 +1314,166 @@ end
         @test Context.center_of_mass(m) == (3.0, 2.0)
     end
 
+    @testset "VectorHistory" begin
+        s = Context.VectorHistory(2; max_len=3)
+        @test Context.capacity(s) == 3
+        @test length(s) == 0
+
+        for i in 1:5
+            push!(s, [i, 10i])
+        end
+        # Only the last max_len vectors are retained, in order, as a view.
+        @test length(s) == 3
+        @test Context.data(s) == [3 30; 4 40; 5 50]
+        @test s[3, :] == [5, 50]
+
+        @test_throws ArgumentError push!(s, [1, 2, 3])
+
+        Context.reset!(s)
+        @test length(s) == 0
+        @test isempty(Context.data(s))
+
+        # average_window folds multiple pushes into one committed row.
+        a = Context.VectorHistory(1; max_len=4, average_window=2)
+        append!(a, ([0.0], [10.0], [4.0], [8.0]))
+        @test length(a) == 2
+        @test Context.data(a) == [5.0; 6.0;;]
+    end
+
+    @testset "BinnedSequence" begin
+        @test_throws ArgumentError Context.Scalar2dScan([0.1])  # wrong res count
+
+        # 1-D scalar binning: nearby positions merge, far ones open new levels,
+        # and a revisit folds into the existing bin rather than splitting it.
+        s = Context.Scalar1dScan(0.005)
+        bin0_x, bin0_y = [-0.580, -0.581, -0.580], [10.0, 20.0, 30.0]
+        bin1_x, bin1_y = [-0.570], [100.0]
+        # Interleaved so the third bin-0 sample is a revisit after bin 1 opened.
+        append!(s, bin0_x[1], bin0_y[1])
+        append!(s, bin0_x[2], bin0_y[2])
+        append!(s, bin1_x[1], bin1_y[1])
+        append!(s, bin0_x[3], bin0_y[3])
+        @test length(s) == 2
+        @test Context.positions(s, 1) ≈ [mean(bin0_x), mean(bin1_x)]
+        @test s.mean ≈ [mean(bin0_y), mean(bin1_y)]
+        @test s.count == [length(bin0_y), length(bin1_y)]
+        # Per-bin spread is the population std over the bin's samples, 0 for a singleton.
+        @test s.std ≈ [sqrt(mean(abs2, bin0_y .- mean(bin0_y))), 0.0]
+
+        # Discovery order != sorted order: a level found last but lying between
+        # existing ones is placed correctly in the readout.
+        s = Context.Scalar1dScan(0.5)
+        xs, ys = [0.0, 2.0, 1.0], [1.0, 3.0, 2.0]
+        for (x, y) in zip(xs, ys)
+            append!(s, x, y)
+        end
+        order = sortperm(xs)
+        @test Context.positions(s, 1) ≈ xs[order]
+        @test s.mean ≈ ys[order]
+
+        # 2-D raster of a scalar: A swept while B steps. The repeated A-sweep
+        # reuses A-levels, giving a clean grid.
+        as, bs = [0.0, 0.1, 0.2], [10.0, 20.0]
+        g = Context.Scalar2dScan(0.05, 5.0)
+        expected = zeros(length(as), length(bs))
+        for (j, b) in enumerate(bs), (i, a) in enumerate(as)
+            v = 100.0 * (j - 1) + i
+            append!(g, (a, b), v)
+            expected[i, j] = v
+        end
+        @test length(g) == length(as) * length(bs)
+        @test Context.positions(g, 1) ≈ as
+        @test Context.positions(g, 2) ≈ bs
+        @test g.mean == expected
+        @test g.count == fill(1, length(as), length(bs))
+
+        # N-D (image) value: per-element nan-aware running mean; a NaN element is
+        # skipped rather than dragged into the average.
+        img = Context.BinnedSequence{2, 1}([1.0])
+        f1, f2 = [1.0 2.0; 3.0 4.0], [3.0 NaN; 5.0 6.0]
+        append!(img, 0.0, f1)
+        append!(img, 0.2, f2)   # same bin (within res)
+        means = img.mean
+        @test size(means) == (1, size(f1)...)
+        @test means[1, :, :] == map((a, b) -> isnan(b) ? a : mean((a, b)), f1, f2)
+
+        # max_bins caps bin creation.
+        capped = Context.Scalar1dScan(0.1; max_bins=2)
+        for x in (0.0, 1.0, 2.0)
+            append!(capped, x, x)
+        end
+        @test length(capped) == 2
+
+        # reset! + replay reproduces the same bins (the resolution-change path).
+        rebuilt = Context.Scalar1dScan(0.05)
+        samples = [(-0.580, 10.0), (-0.581, 20.0), (-0.570, 100.0), (-0.580, 30.0)]
+        for (x, y) in samples
+            append!(rebuilt, x, y)
+        end
+        before = copy(rebuilt.mean)
+        Context.reset!(rebuilt)
+        @test length(rebuilt) == 0
+        for (x, y) in samples
+            append!(rebuilt, x, y)
+        end
+        @test rebuilt.mean == before
+    end
+
+    @testset "Scan" begin
+        # The scan body reads Meta.name/subvariables for @add_subvariable, so bind
+        # them and hand back the captured subvariable dict alongside the output.
+        runscan(scn, args...) = begin
+            subvars = Dict{String, Any}()
+            out = Base.ScopedValues.@with(Context.Meta.name => "scan",
+                                          Context.Meta.subvariables => subvars,
+                                          Context.scan(scn, args...))
+            (out, subvars)
+        end
+
+        # 1-D scalar scan: nearby positions merge, a revisit folds into the
+        # existing bin, and the result is a DimArray over the bin positions with a
+        # `counts` subvariable over the same grid.
+        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"mono.energy")
+        scn.resolution[] = [0.005]
+        local out, subvars
+        for (p, v) in [(-0.580, 10.0), (-0.581, 20.0), (-0.570, 100.0), (-0.580, 30.0)]
+            out, subvars = runscan(scn, v, p, nothing)
+        end
+        @test out isa VariableData && out.data isa Context.DD.DimArray && !out.compress
+        @test Context.DD.lookup(out.data, :position1) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
+        @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
+        @test out.xlabel == "mono.energy"
+        @test collect(subvars["scan.counts"].data) == [3, 1]
+
+        # 2-D scalar raster: wiring position2 adds a second axis, giving a clean
+        # grid with one position lookup per motor.
+        scn = Context.Scan(; value=karabo"foo.value",
+                           position1=karabo"a.pos", position2=karabo"b.pos")
+        scn.resolution[] = [0.05, 5.0]
+        xs, ys = [0.0, 0.1, 0.2], [10.0, 20.0]
+        for (j, y) in enumerate(ys), (i, x) in enumerate(xs)
+            out, subvars = runscan(scn, 100.0 * (j - 1) + i, x, y)
+        end
+        @test size(out.data) == (length(xs), length(ys))
+        @test Context.DD.lookup(out.data, :position1) ≈ xs
+        @test Context.DD.lookup(out.data, :position2) ≈ ys
+        @test out.ylabel == "b.pos"
+
+        # A resolution change replays the recompute buffer: coarsening the
+        # resolution re-bins the retained tail, merging the two levels into one.
+        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"a.pos")
+        scn.resolution[] = [0.005]
+        for (p, v) in [(0.0, 1.0), (0.01, 3.0)]
+            runscan(scn, v, p, nothing)
+        end
+        @test length(scn.binner.seq) == 2
+        scn.resolution[] = [1.0]
+        Context.rebin(scn, scn.resolution[])
+        out, _ = runscan(scn, 5.0, 0.02, nothing)
+        @test length(scn.binner.seq) == 1
+        @test collect(out.data) ≈ [mean([1.0, 3.0, 5.0])]
+    end
+
     @testset "Correlation" begin
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 

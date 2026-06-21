@@ -581,61 +581,6 @@ end
     @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
 end
 
-@testset "AccuPairSequence" begin
-    # Constructor validation.
-    @test_throws ArgumentError XFA.AccuPairSequence(0.0)
-    @test_throws ArgumentError XFA.AccuPairSequence(-1.0)
-    @test_throws ArgumentError XFA.AccuPairSequence([1.0, 2.0], [1.0], 0.1)
-
-    # First sample creates a bin immediately with a degenerate band and unit
-    # sigma (single sample → weight 1 in the fit).
-    seq = XFA.AccuPairSequence(0.1)
-    append!(seq, 1.0, 10.0)
-    @test length(seq) == 1
-    @test seq.y_lower[1] == 10.0
-    @test seq.y_upper[1] == 10.0
-    @test seq.sigma[1] == 1.0
-
-    # Samples in the same fixed bin (floor(x/resolution)) merge; running means update.
-    append!(seq, 1.05, 20.0)
-    @test length(seq) == 1
-    @test seq.x_values[1] ≈ 1.025
-    @test seq.y_values[1] ≈ 15.0
-    # y_lower/y_upper are y_mean ± half the population std (5.0 for [10, 20]).
-    @test seq.y_lower[1] ≈ 12.5
-    @test seq.y_upper[1] ≈ 17.5
-    # sigma = 1/sqrt(count) — bin has 2 samples.
-    @test seq.sigma[1] ≈ 1 / sqrt(2)
-
-    # Motor moves to a new position: a separate bin is created.
-    append!(seq, 5.0, 100.0)
-    append!(seq, 5.02, 200.0)
-    @test length(seq) == 2
-    @test seq.x_values[2] ≈ 5.01
-    @test seq.y_values[2] ≈ 150.0
-
-    # Bins are keyed on floor(x/resolution), so assignment is order-independent
-    # and samples straddling a bin boundary don't merge even if their distance
-    # is < resolution.
-    append!(seq, 0.98, 30.0)
-    @test length(seq) == 3
-    @test seq.bin_keys == [9, 10, 50]
-    @test seq.x_values[1] ≈ 0.98
-    @test seq.y_values[1] ≈ 30.0
-
-    # reset! clears everything.
-    XFA.reset!(seq)
-    @test length(seq) == 0
-
-    # Array constructor matches incremental appends.
-    xs = [1.0, 1.02, 5.0, 5.01, 5.0]
-    ys = [10.0, 20.0, 100.0, 200.0, 300.0]
-    seq = XFA.AccuPairSequence(xs, ys, 0.1)
-    @test length(seq) == 2
-    @test seq.x_values ≈ [1.01, 5.0033333333] atol=1e-6
-    @test seq.y_values ≈ [15.0, 200.0]
-end
-
 @testset "Fitting" begin
     @testset "fit_gaussian" begin
         # Recover known parameters from clean data.
