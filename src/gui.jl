@@ -13,7 +13,8 @@ using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
 using XfaContext: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
-    ArrayMetadata, RectROI, PlotSpec, LayerSpec
+    ArrayMetadata, RectROI, PlotSpec, LayerSpec,
+    Scalar1dScan, positions
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh

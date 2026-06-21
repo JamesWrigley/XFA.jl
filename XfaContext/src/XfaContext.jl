@@ -106,6 +106,7 @@ end
 include("context_types.jl")
 include("trainmatching.jl")
 include("detector_assembly.jl")
+include("binning.jl")
 
 using DataStructures: CircularBuffer
 using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges

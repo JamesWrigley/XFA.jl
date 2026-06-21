@@ -424,3 +424,55 @@ function (m::MovingAvg)(data::AbstractArray)
 
     return update_moving_avg!(m.buffer, data, m.nsamples[])
 end
+
+## Scan group
+
+# Streaming step-scan binner. Each train's `value` is folded into the bin
+# selected by snapping its motor position(s) onto per-axis levels — one axis per
+# wired `positionN`, with `position2` optional (unset => 1-D scan). All the
+# binning logic lives in the reusable `ScanBinner` (see binning.jl); this group
+# wires it to tid-matched `value`/`position1`/`position2` inputs.
+@Group mutable struct Scan
+    resolution::Parameter{Vector{Float64}} = Parameter(rebin, [1e-3])
+    history_budget::Parameter{Int} = Parameter(64 * 1024 * 1024)
+    value::Parameter{Dependency}
+    position1::Parameter{Dependency}
+    position2::Parameter{Dependency} = Parameter{Dependency}()
+
+    binner::Union{Nothing, ScanBinner} = nothing
+end
+
+# Flag a resolution change on the live binner; if none exists yet it'll be built
+# fresh with the new resolution, so there's nothing to do.
+function rebin(scn::Scan, _)
+    if !isnothing(scn.binner)
+        rebin!(scn.binner)
+    end
+end
+
+# Bin train-resolved `value` by its motor position(s). The trainmatcher
+# tid-aligns `value`/`position1`/`position2` before the body runs (as
+# `correlate` receives matched `x`/`y`). Returns a DimArray over the discovered
+# bin positions with the value's native dims appended, plus `counts` /
+# `uncertainty` subvariables over the same grid.
+@Variable function scan(scn::Scan, value -> Scan.value,
+                        position1 -> Scan.position1, position2 -> Scan.position2)
+    D = isassigned(scn.position2) ? 2 : 1
+    if isnothing(scn.binner)
+        scn.binner = ScanBinner(D)
+    end
+
+    positions = D == 2 ? (position1, position2) : (position1,)
+    push!(scn.binner, value, positions...; resolutions=scn.resolution[],
+          history_budget=scn.history_budget[])
+
+    # The binner exposes the dense readout as DimArrays over the bin positions.
+    seq = scn.binner.seq
+    @add_subvariable("counts", DD.rebuild(seq.count; name=:counts))
+    @add_subvariable("uncertainty", DD.rebuild(seq.std; name=:uncertainty))
+
+    return VariableData(; data=DD.rebuild(seq.mean; name=:scan),
+                        xlabel=scn.position1.value.name,
+                        ylabel=D == 2 ? scn.position2.value.name : nothing,
+                        compress=false, fixed_aspect=false)
+end
