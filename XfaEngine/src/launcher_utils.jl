@@ -45,7 +45,7 @@ function rotation_callback(old_log)
 
     # Delete the third oldest log file, such that we always store the last two
     # months of logs.
-    if len(files) > 2
+    if length(files) > 2
         rm(files[1])
     end
 end
