@@ -111,8 +111,13 @@ end
             local msg
             try
                 msg = take!(client, bridge.buffer_pool)
-            catch
-                break
+            catch ex
+                if !isopen(client.socket)
+                    break
+                else
+                    @error "Failed to read a train from the Karabo bridge, skipping it" exception=(ex, catch_backtrace())
+                    continue
+                end
             end
 
             # If the channel is full we drop the train data
@@ -120,7 +125,17 @@ end
                 @warn "Input buffer for $(Context.Meta.name[]) is full, dropping train"
                 continue
             else
-                put!(bridge_msgs, msg)
+                # put!() may throw when the channel is closed concurrently
+                # during shutdown
+                try
+                    put!(bridge_msgs, msg)
+                catch ex
+                    if !(ex isa InvalidStateException)
+                        @error "KaraboInput could not push to output channel" exception=(ex, catch_backtrace())
+                    end
+
+                    break
+                end
             end
         end
     finally
