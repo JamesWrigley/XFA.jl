@@ -463,6 +463,30 @@ end
             @test pool[("other", "v")] isa KaraboBridge.BufferRing{Float32}
         end
     end
+
+    @testset "promote_type2" begin
+        # Same signedness and floats fall through to promote_type
+        @test KaraboBridge.promote_type2(UInt8, UInt16) === UInt16
+        @test KaraboBridge.promote_type2(Int8, Int32) === Int32
+        @test KaraboBridge.promote_type2(Float64, Int8) === Float64
+
+        # A signed/unsigned mix widens to a signed type
+        @test KaraboBridge.promote_type2(Int8, UInt8) === Int16
+        @test KaraboBridge.promote_type2(Int8, UInt16) === Int32
+        @test KaraboBridge.promote_type2(UInt16, Int8) === Int32
+        @test KaraboBridge.promote_type2(Int64, UInt16) === Int64
+
+        # End-to-end: a property whose values straddle zero used to crash
+        # deserialize; it should now round-trip as a signed vector.
+        karabo_bridge_test_state(endpoint) do client, server
+            KaraboBridge.startbridge(server)
+            payload = Dict("src" => Dict("mixed" => Any[UInt16(42), Int8(-42)]))
+            put!(server, payload)
+            data, _ = take!(client)
+            @test data["src"]["mixed"] == [42, -42]
+            @test eltype(data["src"]["mixed"]) == Int16
+        end
+    end
 end
 
 # Test postprocessors, also in Main for load_from_string access.
