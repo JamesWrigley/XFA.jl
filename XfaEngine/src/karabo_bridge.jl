@@ -412,6 +412,15 @@ function serialize(data, metadata=nothing)
     return msgs
 end
 
+# Like promote_type but sign-aware. A mix of signed and unsigned integers
+# promotes to a signed type wide enough to hold both (e.g. Int8 + UInt16 ->
+# Int32), instead of promote_type's unsigned result that can't hold negatives.
+# MsgPack encodes each integer at its narrowest width, so a decoded numeric
+# array can arrive as a Vector{Any} mixing signed and unsigned element types.
+promote_type2(a::Type, b::Type) = promote_type(a, b)
+promote_type2(a::Type{<:Signed}, b::Type{<:Unsigned}) = promote_type(a, signed(widen(b)))
+promote_type2(a::Type{<:Unsigned}, b::Type{<:Signed}) = promote_type2(b, a)
+
 """
     deserialize(msgs::Vector{ZMQ.Message})
 
@@ -432,7 +441,7 @@ function deserialize(msgs::Vector{ZMQ.Message}, pool::Union{BufferPool, Nothing}
             data[source] = MsgPack.unpack(payload)
             for (name, value) in data[source]
                 if value isa Vector{Any}
-                    T = isempty(value) ? Float64 : mapreduce(typeof, promote_type, value)
+                    T = isempty(value) ? Float64 : mapreduce(typeof, promote_type2, value)
                     if T !== Any
                         data[source][name] = Vector{T}(value)
                     end
