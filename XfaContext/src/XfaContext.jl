@@ -52,7 +52,7 @@ end
 function channel_stat(rc::RemoteChannel)::ChannelStat
     remotecall_fetch(rc.where, rc) do rc
         ch = DistributedNext.channel_from_id(remoteref_id(rc))
-        ChannelStat(drop_count(ch), size(ch), DataStructures.capacity(ch))
+        ChannelStat(drop_count(ch), length(ch), DataStructures.capacity(ch))
     end
 end
 
