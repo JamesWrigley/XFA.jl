@@ -6,8 +6,7 @@ using CImGui.CSyntax: @c
 using ImPlot: ImPlot
 using GLFW: GLFW
 using ModernGL
-
-include("imnodes.jl")
+import ImGuiNodeEditor as ne
 
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
@@ -43,9 +42,140 @@ include("variable_widgets.jl")
 
 import Revise
 
-import .ImNodes
-
 const state = ScopedValue{GuiState}()
+
+node_handle(client, id) = get!(() -> ne.NodeId(id), client.ne_node_handles, id)
+pin_handle(client, id) = get!(() -> ne.PinId(id), client.ne_pin_handles, id)
+link_handle(client, id) = get!(() -> ne.LinkId(id), client.ne_link_handles, id)
+
+# The node editor persists its own state (node positions, pan, zoom) through
+# these callbacks. It hands us a JSON string to stash and reads it back on load;
+# save_settings writes ne_settings out to settings.toml.
+function ne_save_settings(data::Ptr{Cchar}, size::Csize_t, reason, user::Ptr{Cvoid})::Bool
+    client = unsafe_pointer_to_objref(user)::ClientState
+    client.ne_settings = unsafe_string(data, size)
+    return true
+end
+
+# Called first with a null buffer to query the size, then with a buffer to fill.
+function ne_load_settings(data::Ptr{Cchar}, user::Ptr{Cvoid})::Csize_t
+    client = unsafe_pointer_to_objref(user)::ClientState
+    blob = client.ne_settings
+    if data != C_NULL && !isempty(blob)
+        unsafe_copyto!(Ptr{UInt8}(data), pointer(blob), ncodeunits(blob))
+    end
+    return Csize_t(ncodeunits(blob))
+end
+
+# Create the editor with our save/load callbacks wired up. ne_settings must hold
+# the current context's blob first so the editor's initial LoadSettings restores
+# the layout. The editor is recreated this way whenever the context changes.
+function create_node_editor!(client)
+    save_cb = @cfunction(ne_save_settings, Bool, (Ptr{Cchar}, Csize_t, ne.SaveReasonFlags, Ptr{Cvoid}))
+    load_cb = @cfunction(ne_load_settings, Csize_t, (Ptr{Cchar}, Ptr{Cvoid}))
+
+    config = ne.Config()
+    config.SettingsFile = Ptr{Cchar}(C_NULL)
+    config.SaveSettings = save_cb
+    config.LoadSettings = load_cb
+    config.UserPointer = pointer_from_objref(client)
+
+    # CreateEditor copies the config by value, so the transient one can go.
+    client.ne_editor = ne.CreateEditor(config)
+    ne.Destroy(config)
+    client.ne_editor_path = client.context_path
+end
+
+# Draw a filled circle the size of a text line. The node editor has no built-in
+# pin shapes, so we draw the marker imnodes used to draw automatically.
+function draw_pin_icon()
+    sz = ig.GetTextLineHeight()
+    p = ig.GetCursorScreenPos()
+    ig.AddCircleFilled(ig.GetWindowDrawList(), (p.x + sz * 0.5f0, p.y + sz * 0.5f0),
+                       sz * 0.35f0, IM_COL32(204, 204, 204, 255))
+    ig.Dummy(sz, sz)
+end
+
+# Draw a pin marker. The pivot anchors the link to the left edge of input rows and
+# the right edge of output rows, reproducing the imnodes left-in/right-out wiring.
+function draw_pin(client, id, kind)
+    pivot = kind == ne.PinKind_Input ? ImVec2(0f0, 0.5f0) : ImVec2(1f0, 0.5f0)
+    ne.PushStyleVar(ne.StyleVar_PivotAlignment, pivot)
+    ne.BeginPin(pin_handle(client, id), kind)
+    draw_pin_icon()
+    ne.EndPin()
+    ne.PopStyleVar()
+end
+
+# Show a tooltip at the mouse. An ImGui tooltip created while drawing a node is
+# captured by the editor's zoomed canvas and lands in the wrong place; Suspend()ing
+# to escape it corrupts the node/pin draw list. So inside the editor we draw the
+# tooltip directly on the foreground draw list, which is screen space and never
+# touched by the canvas. Outside the editor, a normal tooltip is fine.
+function node_tooltip(text)
+    if ne.GetCurrentEditor() == C_NULL
+        ig.SetTooltip(text)
+        return
+    end
+
+    # While the canvas is active GetMousePos() is in zoomed canvas space; map it
+    # back to screen space for the (unscaled) foreground draw list. Scale the text
+    # and box by the canvas magnification so they match the zoomed node text, but
+    # clamp to between the default and twice the default so it stays readable.
+    scale = clamp(ne.current_scale(), 1f0, 2f0)
+    font = ig.GetFont()
+    font_size = ig.GetFontSize() * scale
+
+    draw_list = ig.GetForegroundDrawList()
+    mouse = ne.CanvasToScreen(ig.GetMousePos())
+    text_size = ig.CalcTextSize(text)
+    pad = ImVec2(8 * scale, 6 * scale)
+    pos = ImVec2(mouse.x + 16 * scale, mouse.y + 8 * scale)
+
+    # The canvas leaves the foreground list clipped to the (zoom-shrunk) local
+    # viewport, which culls the tooltip when zoomed in; clip to the full screen.
+    ig.PushClipRectFullScreen(draw_list)
+    ig.AddRectFilled(draw_list, (pos.x - pad.x, pos.y - pad.y),
+                     (pos.x + text_size.x * scale + pad.x, pos.y + text_size.y * scale + pad.y),
+                     IM_COL32(35, 35, 40, 240), 4f0 * scale)
+    # The foreground list is unscaled screen space, but when zoomed in the frame
+    # density is cranked up for the canvas-magnified node text; that bakes this
+    # tooltip oversized and minifies it (aliasing). Bake at the displayed size.
+    frame_density = ig.GetFontRasterizerDensity()
+    ig.SetFontRasterizerDensity(1f0)
+    ig.AddText(draw_list, font, font_size, pos, IM_COL32(230, 230, 230, 255), text)
+    ig.SetFontRasterizerDensity(frame_density)
+    ig.PopClipRect(draw_list)
+end
+
+# Node names in front-to-back order so the top node under the mouse wins input on
+# overlapping widgets: ImGui gives the first-submitted overlapping item the click,
+# and the editor keeps the active/selected node last in its order. New nodes the
+# editor hasn't seen yet are appended.
+function node_draw_order(client, ctx_state)
+    n = Int(ne.GetNodeCount())
+    if n == 0
+        return collect(keys(ctx_state))
+    end
+
+    buf = Vector{UInt}(undef, n)
+    GC.@preserve buf ne.GetOrderedNodeIds(Ptr{ne.NodeId}(pointer(buf)), n)
+
+    id_to_name = Dict{UInt, String}(UInt(var_data["id"]) => name for (name, var_data) in ctx_state)
+    ordered = String[]
+    for id in Iterators.reverse(buf)
+        name = get(id_to_name, id, nothing)
+        if !isnothing(name)
+            push!(ordered, name)
+        end
+    end
+    for name in keys(ctx_state)
+        if !(name in ordered)
+            push!(ordered, name)
+        end
+    end
+    return ordered
+end
 
 ## Helper functions for the GUI
 
@@ -210,7 +340,7 @@ end
 
 function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     client = state[].client
-    dep_key = int32_hash(param.name)
+    dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
     device_props = if isnothing(dep_state.device)
         DeviceProperties()
@@ -242,8 +372,8 @@ end
 function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
                          device_only::Bool=false, variable_name::String="")
     client = state[].client
-    dep_state = get!(client.dep_text_states, Int(dep_id)) do
-        DepTextState(dep.kind == DepKind_Karabo)
+    dep_state = get!(client.dep_text_states, dep_id) do
+        DepTextState(; is_karabo=dep.kind == DepKind_Karabo)
     end
     device_props = if isnothing(dep_state.karabo_state.device)
         DeviceProperties()
@@ -256,7 +386,7 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Dependency})
     dep = param.value
-    dep_id = int32_hash(param.name)
+    dep_id = hash(param.name)
     edited, new_dep = draw_dep_editor("param-dep-$(param.name)", dep, dep_id)
     if edited
         return true, new_dep
@@ -445,20 +575,36 @@ function draw_variable(name, var_data)
     variable_store = get(client.variable_data, name, nothing)
 
     ig.PushID(name)
-    ImNodes.BeginNode(var_data["id"])
+    handle = node_handle(client, var_data["id"])
+    ne.BeginNode(handle)
+
+    # Right-align the output/postprocessor pins to the widest left-anchored row.
+    # `content_measured` accumulates each row's width (via origin-independent
+    # GetItemRectSize) this frame; `content_width` reuses last frame's value to
+    # place the pins. The pins are never measured, so they can't ratchet the node
+    # ever-wider.
+    content_measured = Float32(min_node_width)
+    content_width = get(client.ne_node_content_widths, var_data["id"], Float32(min_node_width))
 
     disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started) ||
                    !isnothing(client.pending_parameter_change)
     @Disabled disable_node begin
-        # Draw titlebar
-        ImNodes.BeginNodeTitleBar()
-        edited, new_name = ElidedText("var-name-$(name)", name; editable=true,
-                                      validator=variable_name_validator(name))
+        # Draw the titlebar at a fixed 1.5x canvas size (1.5*current_scale() keeps
+        # the local size constant across zoom) so it doesn't grow the node's
+        # canvas-space width when zoomed out and strand the right-aligned pins.
+        edited, new_name = ne.@with_font_scale 1.5f0 * ne.current_scale() ElidedText("var-name-$(name)", name;
+            editable=true, validator=variable_name_validator(name))
         if edited
             @guiasync rename_variable(state[], name, new_name)
         end
-        ImNodes.EndNodeTitleBar()
-        # Draw custom content
+        # Bottom of the title, used to size the header background drawn after
+        # EndNode. The Dummy adds breathing room between the header and content.
+        title_bottom = ig.GetItemRectMax().y
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
+        ig.Dummy(0, 6)
+        # Group the custom content so we can measure its full width; the helpers
+        # draw several rows and GetItemRectMax alone would only see the last one.
+        ig.BeginGroup()
         origin = var_data["origin"]
         gui_state = get(client.variable_gui_states, name, nothing)
         new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
@@ -469,6 +615,8 @@ function draw_variable(name, var_data)
         if var_data["draw_parameters"]
             draw_parameters(var_data)
         end
+        ig.EndGroup()
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
         ig.Dummy(min_node_width, 20)
 
@@ -482,17 +630,25 @@ function draw_variable(name, var_data)
             end
 
             dep_ts = get!(client.dep_text_states, dep_id) do
-                DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+                DepTextState(; is_karabo=dep isa Dependency && dep.kind == DepKind_Karabo)
             end
-            pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
-            ImNodes.BeginInputAttribute(dep_id, pin_shape)
+            # The pin wraps only the icon so its hover rect doesn't span the whole
+            # row; the label/editor are drawn after EndPin on the same line.
+            draw_pin(client, dep_id, ne.PinKind_Input)
+            ig.SameLine()
+            # Group the post-pin content so we can size the row from it. The pin
+            # icon to its left is a fixed advance (icon + SameLine spacing).
+            ig.BeginGroup()
             if var_data["type"] == :group
                 label = get(var_data["dep_field_names"], dep_id, arg_name)
                 ig.Text(label * ":")
                 ig.SameLine()
             end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
+            ig.EndGroup()
+            pin_advance = ig.GetTextLineHeight() + unsafe_load(ig.GetStyle().ItemSpacing.x)
+            content_measured = max(content_measured, pin_advance + ig.GetItemRectSize().x)
             if edited
                 # For group nodes the kwarg in the constructor uses the group
                 # struct field name, not the @Variable's arg name.
@@ -502,7 +658,6 @@ function draw_variable(name, var_data)
                 end
                 @guiasync rename_dep(state[], name, target_arg, dep, new_dep)
             end
-            ImNodes.EndInputAttribute()
         end
     end # @Disabled
 
@@ -519,8 +674,13 @@ function draw_variable(name, var_data)
     for output in var_data["outputs"]
         label = output.label
         output_name = isempty(label) ? name : "$(name).$(label)"
-        ImNodes.BeginOutputAttribute(output.id, ImNodes.ImNodesPinShape_CircleFilled)
+        pin_start = ig.GetCursorPos()
 
+        # Measure the label group before placing the pin. BeginPin leaves the
+        # cursor's max-x at the far-right pin position, so measuring after it would
+        # make content_width self-sustaining (the node would never shrink). The pin
+        # is drawn afterwards via SetCursorPos.
+        ig.BeginGroup()
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
             label = isempty(label) ? typestr : "$(label) - $(typestr)"
@@ -563,8 +723,20 @@ function draw_variable(name, var_data)
                 ig.Unindent()
             end
         end
+        ig.EndGroup()
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
+        after_label = ig.GetCursorPos()
 
-        ImNodes.EndOutputAttribute()
+        # Right-aligned output pin on the label's row. Drawing it (icon Dummy) after
+        # the rightward SetCursorPos validates the extent (no boundary assert).
+        icon_w = ig.GetTextLineHeight()
+        ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+        draw_pin(client, output.id, ne.PinKind_Output)
+        # Continue below both the label and the pin icon so rows don't overlap.
+        # The trailing Dummy validates the SetCursorPos extent so ImGui's boundary
+        # check doesn't warn.
+        ig.SetCursorPos((pin_start.x, max(after_label.y, pin_start.y + icon_w)))
+        ig.Dummy(0f0, 0f0)
     end
 
     # Draw postprocessors
@@ -578,46 +750,74 @@ function draw_variable(name, var_data)
 
         for pp in postprocessors
             label = pp.display_name * pp.tree_id_suffix
-            ImNodes.BeginOutputAttribute(pp.id, ImNodes.ImNodesPinShape_CircleFilled)
+            pin_start = ig.GetCursorPos()
+            icon_w = ig.GetTextLineHeight()
 
-            # This child window is here to get around an imnodes limitation that
-            # would make a regular TreeNode extend it's width to the edge of the
-            # screen: https://github.com/Nelarius/imnodes/issues/167
-            ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.ImVec4(0, 0, 0, 0))
-            node_width = ImNodes.GetNodeDimensions(var_data["id"]).x
-            child_width = max(min_node_width, node_width * 3 / 4)
+            # The pin wraps only the icon (right-aligned to the node edge) so its
+            # hover rect doesn't span the whole row; the tree is drawn after EndPin
+            # from the left.
+            ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+            draw_pin(client, pp.id, ne.PinKind_Output)
+            ig.SetCursorPos(pin_start)
 
-            if ig.BeginChild("##pp-$(pp.id)", ImVec2(child_width, 0), ig.ImGuiChildFlags_AutoResizeY, ig.ImGuiWindowFlags_HorizontalScrollbar)
-                expanded = ig.TreeNode(label)
-                if haskey(client.variable_data, pp.name)
-                    typestr = get_variable_typeinfo(pp.name)
-                    if !isempty(typestr)
-                        ig.SameLine()
-                        if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
-                            push!(client.plots, variable_plot(pp.name, client.plot_counter))
-                            client.plot_counter += 1
-                        end
+            # Constrain the tree widget width with the old Columns API, otherwise
+            # the TreeNode's clickable area stretches to the window edge (see the
+            # imgui-node-editor widgets example).
+            ig.BeginColumns("##pp-$(pp.id)", 2,
+                            ig.ImGuiOldColumnFlags_NoBorder | ig.ImGuiOldColumnFlags_NoResize |
+                            ig.ImGuiOldColumnFlags_NoPreserveWidths | ig.ImGuiOldColumnFlags_NoForceWithinWindow)
+            ig.SetColumnWidth(0, content_width - icon_w)
+
+            expanded = ig.TreeNode(label)
+            if haskey(client.variable_data, pp.name)
+                typestr = get_variable_typeinfo(pp.name)
+                if !isempty(typestr)
+                    ig.SameLine()
+                    if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
+                        push!(client.plots, variable_plot(pp.name, client.plot_counter))
+                        client.plot_counter += 1
                     end
-                end
-
-                if expanded
-                    if isempty(pp.params)
-                        ig.TextDisabled("(no parameters)")
-                    else
-                        draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
-                    end
-                    ig.TreePop()
                 end
             end
 
-            ig.EndChild()
-            ig.PopStyleColor()
+            if expanded
+                if isempty(pp.params)
+                    ig.TextDisabled("(no parameters)")
+                else
+                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
+                end
+                ig.TreePop()
+            end
 
-            ImNodes.EndOutputAttribute()
+            ig.EndColumns()
         end
     end
 
-    ImNodes.EndNode()
+    # Stash the widest content row for next frame's pin alignment. Postprocessors
+    # are excluded: their tree column is sized to content_width, so measuring it
+    # would feed the imposed width back and re-introduce the ratchet.
+    client.ne_node_content_widths[var_data["id"]] = content_measured
+
+    ne.EndNode()
+
+    # Dark blue header background behind the title (following builders.cpp
+    # BlueprintNodeBuilder::End): drawn after EndNode on the node's background draw
+    # list so it sits above the node fill but below the title text.
+    node_pos = ne.GetNodePosition(handle)
+    node_size = ne.GetNodeSize(handle)
+    border = unsafe_load(ne.GetStyle().NodeBorderWidth)
+    # Shrink the radius with the inset so the band's corner stays concentric with
+    # the border's inner edge.
+    rounding = max(0f0, unsafe_load(ne.GetStyle().NodeRounding) - border)
+    # Match the band's alpha to the node body so it's translucent like the rest.
+    node_alpha = round(Int, unsafe_load(ne.GetStyle().Colors)[ne.StyleColor_NodeBg + 1].w * 255)
+    # Inset by the border width so the band stays inside the node's (selection)
+    # border instead of painting over it.
+    ig.AddRectFilled(ne.GetNodeBackgroundDrawList(handle),
+                     (node_pos.x + border, node_pos.y + border),
+                     (node_pos.x + node_size.x - border, title_bottom),
+                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundCornersTop)
+
     ig.PopID()
 end
 
@@ -625,10 +825,10 @@ end
 # (empty) through orange (half-full) to bright red (at capacity). The green
 # ceiling is lowered so idle channels don't glare.
 function link_load_color(load)
-    green_ceiling = 0xa0
-    r = load < 0.5 ? round(UInt8, 0xff * 2 * load) : 0xff
-    g = load < 0.5 ? green_ceiling : round(UInt8, green_ceiling * 2 * (1 - load))
-    return ig.IM_COL32(r, g, 0, 0xff)
+    green_ceiling = 0xa0 / 0xff
+    r = load < 0.5 ? 2 * load : 1
+    g = load < 0.5 ? green_ceiling : green_ceiling * 2 * (1 - load)
+    return ImVec4(r, g, 0, 1)
 end
 
 function draw_routing_rules()
@@ -861,39 +1061,116 @@ function draw_dag()
 
     ig.Dummy(0, 10)
 
-    ImNodes.BeginNodeEditor()
+    # (Re)create the editor whenever the loaded context changes so it restores
+    # that context's saved layout. Persist the outgoing context's layout first.
+    if client.ne_editor_path != client.context_path
+        if client.ne_editor != C_NULL
+            save_node_editor_state(client.ne_editor_path, client.ne_settings)
+            ne.DestroyEditor(client.ne_editor)
+        end
+        client.ne_settings = load_node_editor_state(client.context_path)
+        create_node_editor!(client)
+    end
 
-    for (name, var_data) in ctx_state
+    # Left edge of the canvas in screen space, used to keep deferred popups from
+    # spilling off the side of the window.
+    canvas_min_x = ig.GetCursorScreenPos().x
+
+    ne.SetCurrentEditor(client.ne_editor)
+    ne.Begin("dag-editor")
+
+    # The editor zooms by scaling the draw list, which blurs text baked at the
+    # base size. Match the font rasterizer density to the magnification (snapped
+    # up to a power of two so the bake cache stays warm) to keep text crisp.
+    magnification = ne.current_scale()
+    ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
+
+    for name in node_draw_order(client, ctx_state)
+        var_data = ctx_state[name]
         ig.PushID(name)
 
         draw_variable(name, var_data)
 
+        # Apply the auto-layout position only to nodes the editor didn't restore
+        # (new nodes sit at the origin); restored nodes keep their saved spot.
         pos = context.node_positions[name]
         if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(var_data["id"], (pos.x, pos.y))
+            handle = node_handle(client, var_data["id"])
+            editor_pos = ne.GetNodePosition(handle)
+            if editor_pos.x == 0 && editor_pos.y == 0
+                ne.SetNodePosition(handle, (pos.x, pos.y))
+            end
             context.node_positions[name] = Point2d(-1, -1)
         end
 
         ig.PopID()
     end
 
+    # The dep-kind and CopyableCombo dropdowns are drawn here, after all nodes,
+    # under Suspend/Resume so they escape the node canvas and position in screen
+    # space (a popup opened mid-node lands in the wrong place). Only one of each is
+    # open at a time; the in-node widgets set the request and a one-shot trigger.
+    ne.Suspend()
+    if !isnothing(client.dep_kind_popup)
+        popup_label, dep_state = client.dep_kind_popup
+        if client.dep_kind_popup_trigger
+            ig.OpenPopup(popup_label)
+            client.dep_kind_popup_trigger = false
+        end
+        if ig.BeginPopup(popup_label)
+            for (is_karabo, kind_label) in ((true, "Karabo"), (false, "Variable"))
+                if ig.Selectable(kind_label, dep_state.is_karabo == is_karabo)
+                    if dep_state.is_karabo != is_karabo
+                        dep_state.is_karabo = is_karabo
+                        dep_state.wants_focus = true
+                        # Reset karabo state when switching
+                        dep_state.karabo_state.cursor_pos = -1
+                        dep_state.karabo_state.device = nothing
+                        dep_state.karabo_state.wanted_text = nothing
+                    end
+                    ig.CloseCurrentPopup()
+                end
+            end
+            ig.EndPopup()
+        else
+            client.dep_kind_popup = nothing
+        end
+    end
+
+    popup = client.combo_popup
+    if !isnothing(popup.label)
+        popup_id = "combo-popup-$(popup.label)"
+        if popup.trigger
+            ig.OpenPopup(popup_id)
+            popup.trigger = false
+        end
+        anchor = ImVec2(max(popup.anchor.x, canvas_min_x), popup.anchor.y)
+        ig.SetNextWindowPos(anchor)
+        new_idx = draw_combo_popup(popup_id, popup.items, popup.width)
+        if !isnothing(new_idx)
+            popup.result_label = popup.label
+            popup.result_index = new_idx
+            popup.label = nothing
+        elseif !ig.IsPopupOpen(popup_id)
+            popup.label = nothing
+        end
+    end
+    ne.Resume()
+
     channel_stats = context.channel_stats
     for var_data in values(ctx_state)
         for link in var_data["links"]
             stat = get(channel_stats, link.channel_key, nothing)
             colored = !isnothing(stat) && stat.capacity > 0
-            if colored
-                ig.imnodes_PushColorStyle(ig.ImNodesCol_Link, link_load_color(stat.size / stat.capacity))
-            end
-            ImNodes.Link(link.id, link.start_id, link.end_id)
-            if colored
-                ig.imnodes_PopColorStyle()
-            end
+            color = colored ? link_load_color(stat.size / stat.capacity) : ImVec4(1, 1, 1, 1)
+            ne.Link(link_handle(client, link.id), pin_handle(client, link.start_id),
+                    pin_handle(client, link.end_id), color)
         end
     end
 
-    ImNodes.MiniMap()
-    ImNodes.EndNodeEditor()
+    ne.End()
+    ig.SetFontRasterizerDensity(1f0)
+    ne.SetCurrentEditor(C_NULL)
 
     # Timer to save the current settings periodically. Mostly useful for the
     # node positions.
@@ -1023,14 +1300,6 @@ function restore_plots(state::GuiState)
     end
 
     ctx = state.saved_contexts[ctx_path]
-
-    context = client.context
-    if haskey(ctx, "node_positions") && isempty(context.node_positions)
-        saved_positions = ctx["node_positions"]
-        for (name, pos) in saved_positions
-            context.node_positions[name] = Point2d(pos[1], pos[2])
-        end
-    end
 
     ## Code to restore plots is buggy, so it's disabled for now
 
@@ -1442,9 +1711,6 @@ function main(; test_engine=nothing)
     imgui_ctx = ig.CreateContext()
     ig.SetCurrentContext(imgui_ctx)
 
-    # Setup ImNodes
-    imnodes_ctx = ImNodes.CreateContext()
-
     # Setup Dear ImGui style
     ig.StyleColorsDark()
     style = ig.GetStyle()
@@ -1505,7 +1771,9 @@ function main(; test_engine=nothing)
         destroy_heatmap_context!()
 
         ImPlot.DestroyContext(implot_ctx)
-        ImNodes.DestroyContext(imnodes_ctx)
+        if client.ne_editor != C_NULL
+            ne.DestroyEditor(client.ne_editor)
+        end
         empty!(safe_input_text_cache)
         close(gui_state)
     end

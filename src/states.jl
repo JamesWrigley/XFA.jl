@@ -66,12 +66,26 @@ end
     proxy_property::Ref{Any} = Ref{Any}(nothing)
 end
 
-mutable struct DepTextState
-    is_karabo::Bool
-    karabo_state::KaraboDepTextState
+@kwdef mutable struct DepTextState
+    is_karabo::Bool = false
+    karabo_state::KaraboDepTextState = KaraboDepTextState()
+    # Set when the kind is switched via the (deferred) selector popup so the new
+    # text field grabs focus on the next frame.
+    wants_focus::Bool = false
 end
 
-DepTextState(is_karabo::Bool) = DepTextState(is_karabo, KaraboDepTextState())
+@kwdef mutable struct CopyableComboPopup
+    # The active dropdown request; label is nothing when no popup is open.
+    label::Maybe{String} = nothing
+    items::Vector{String} = String[]
+    anchor::ImVec2 = ImVec2(0, 0)
+    width::Cfloat = 0
+    # One-shot flag to open the popup on the next deferred draw.
+    trigger::Bool = false
+    # The chosen selection, held until the widget picks it up next frame.
+    result_label::Maybe{String} = nothing
+    result_index::Cint = 0
+end
 
 abstract type AbstractParameterState end
 
@@ -197,14 +211,14 @@ const SCALAR_BUFFER_CAPACITY = 10_000
 end
 
 struct LinkInfo
-    id::Cint
-    start_id::Cint
-    end_id::Cint
+    id::UInt
+    start_id::UInt
+    end_id::UInt
     channel_key::Tuple{String, String}
 end
 
 struct OutputPin
-    id::Cint
+    id::UInt
     label::String
     is_subvariable::Bool
 end
@@ -239,16 +253,7 @@ function ContextState(settings::Dict; kwargs...)
     client_settings = get(settings, "ClientState", Dict{String, Any}())
     context_path = get(client_settings, "context_path", "")
 
-    node_positions = Dict{String, Point2d}()
-    contexts = get(client_settings, "contexts", Dict())
-    if haskey(contexts, context_path)
-        saved_positions = get(contexts[context_path], "node_positions", Dict())
-        for (name, pos) in saved_positions
-            node_positions[name] = Point2d(pos[1], pos[2])
-        end
-    end
-
-    ContextState(; context_path, node_positions, kwargs...)
+    ContextState(; context_path, kwargs...)
 end
 
 Base.lock(ctx::ContextState) = lock(ctx.lock)
@@ -310,6 +315,14 @@ end
     context_path_valid::Bool = true
     context::ContextState = ContextState()
 
+    ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
+    ne_editor_path::String = ""
+    ne_node_handles::Dict{UInt, Ptr{ne.NodeId}} = Dict{UInt, Ptr{ne.NodeId}}()
+    ne_pin_handles::Dict{UInt, Ptr{ne.PinId}} = Dict{UInt, Ptr{ne.PinId}}()
+    ne_link_handles::Dict{UInt, Ptr{ne.LinkId}} = Dict{UInt, Ptr{ne.LinkId}}()
+    ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
+    ne_settings::String = ""
+
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
     whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
@@ -338,9 +351,13 @@ end
     # Parameter widget states, keyed by parameter name
     parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()
     # KaraboDepText widget state, keyed by dependency ID (used for Parameter{KaraboDevice})
-    karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    karabo_dep_states::Dict{UInt, KaraboDepTextState} = Dict{UInt, KaraboDepTextState}()
     # DepText widget state, keyed by dependency ID
-    dep_text_states::Dict{Int, DepTextState} = Dict{Int, DepTextState}()
+    dep_text_states::Dict{UInt, DepTextState} = Dict{UInt, DepTextState}()
+    dep_kind_popup::Maybe{Tuple{String, DepTextState}} = nothing
+    dep_kind_popup_trigger::Bool = false
+    # CopyableCombo dropdown deferred out of the node canvas. Only one is open at a time.
+    combo_popup::CopyableComboPopup = CopyableComboPopup()
     # Variable names available for autocompletion (including subvariable outputs)
     variable_names::Vector{String} = String[]
     source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()

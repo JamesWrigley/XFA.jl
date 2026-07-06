@@ -13,6 +13,7 @@ DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+ImGuiNodeEditor = "85025696-5a8b-405d-b30a-426ddbef1325"
 ImPlot = "e8efc688-5342-4ad4-b4ba-9025a731b363"
 LibSSH = "00483490-30f8-4353-8aba-35b82f51f4d0"
 ModernGL = "66fc600b-dfda-50eb-8b99-91cfa97b1301"
@@ -31,10 +32,10 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
-LibSSH = {rev = "polling", url = "https://github.com/JuliaWeb/LibSSH.jl"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
 ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
+ImGuiNodeEditor = {rev = "master", url = "https://github.com/JuliaImGui/ImGuiNodeEditor.jl.git"}
 
 [compat]
 CImGui = "8"
@@ -46,8 +47,9 @@ DimensionalData = "0.30"
 FFTW = "1"
 GLFW = "3"
 HTTP = "2"
+ImGuiNodeEditor = "1.0.0"
 ImPlot = "0.8"
-LibSSH = "0.7"
+LibSSH = "1"
 ModernGL = "1"
 NaNStatistics = "0.6.55"
 PrecompileTools = "1.2.1"
