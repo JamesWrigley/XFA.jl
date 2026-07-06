@@ -11,6 +11,20 @@ end
 const safe_input_text_cache = Dict{UInt32, SafeInputTextState}()
 
 
+# The last item's rect, mapped to screen space. Inside the node editor the item
+# rect is in canvas-local space (the canvas remaps the ImGui coordinate system),
+# so a popup positioned from it lands in the wrong place unless converted.
+function editor_item_rect()
+    item_min = ig.GetItemRectMin()
+    item_max = ig.GetItemRectMax()
+    if ne.GetCurrentEditor() != C_NULL
+        item_min = ne.CanvasToScreen(item_min)
+        item_max = ne.CanvasToScreen(item_max)
+    end
+    return item_min, item_max
+end
+
+
 function MenuItem(label::String, selected::Ref{Bool}, enabled::Bool=true)
     ig.MenuItem(label, C_NULL, selected, enabled)
 end
@@ -29,11 +43,11 @@ function EditableComboBox(label, text, completions;
         ig.OpenPopup(label)
     end
 
-    ig.SetNextWindowPos(ImVec2(ig.GetItemRectMin().x, ig.GetItemRectMax().y))
+    item_min, item_max = editor_item_rect()
+    ig.SetNextWindowPos(ImVec2(item_min.x, item_max.y))
     popup_flags = ig.ImGuiWindowFlags_NoTitleBar
     popup_flags |= ig.ImGuiWindowFlags_NoMove
     popup_flags |= ig.ImGuiWindowFlags_NoResize
-    popup_flags |= ig.ImGuiWindowFlags_ChildWindow
 
     edited = false
     current_input = unsafe_string(pointer(input))
@@ -117,8 +131,14 @@ function BorderedText(text; color=IM_COL32(255, 0, 0, 255), thickness=2.0, paddi
 end
 
 function BoxedText(label, text)
-    if ig.BeginChild("##webproxy_error_child", ImVec2(0, 0), true,
+    if ig.BeginChild(label, ImVec2(0, 0), true,
                      ig.ImGuiWindowFlags_HorizontalScrollbar)
+        button_w, _ = RowCopyButton_size()
+        win_pos = ig.GetWindowPos()
+        avail_w = ig.GetContentRegionAvail().x
+        ig.SetCursorScreenPos(ImVec2(win_pos.x + avail_w - button_w - 2, win_pos.y + 6))
+        CopyButton("$label-copy", text)
+        ig.SetCursorPos(ImVec2(0, 0))
         ig.TextUnformatted(text)
         ig.EndChild()
     end
@@ -285,9 +305,8 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
     popup_hovered = false
 
     if !isempty(scored)
-        # Position popup below the input
-        input_min = ig.GetItemRectMin()
-        input_max = ig.GetItemRectMax()
+        # Position popup below the input.
+        input_min, input_max = editor_item_rect()
         row_height = ig.GetTextLineHeightWithSpacing()
         max_rows = 8
         popup_height = min(length(scored), max_rows) * row_height + 2 * unsafe_load(ig.GetStyle().WindowPadding.y)
@@ -410,7 +429,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
             ig.AddText(draw_list, text_pos, ig.GetColorU32(ig.ImGuiCol_Text), display_text)
 
             if hovered && elide
-                ig.SetTooltip(text)
+                node_tooltip(text)
             end
             if clicked
                 state.edit = ElidedEditState_WantEdit
@@ -418,7 +437,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
         else
             ig.Text(display_text)
             if ig.IsItemHovered() && elide
-                ig.SetTooltip(text)
+                node_tooltip(text)
             end
         end
     end
@@ -430,9 +449,8 @@ ElidedText(text::AbstractString; max_chars::Int=30) = ElidedText("", text; max_c
 
 function InfoMarker(message::AbstractString, marker::AbstractString="?")
     ig.TextDisabled("[$(marker)]")
-    if ig.IsItemHovered() && ig.BeginTooltip()
-        ig.Text(message)
-        ig.EndTooltip()
+    if ig.IsItemHovered()
+        node_tooltip(message)
     end
 end
 
@@ -463,7 +481,8 @@ function RowCopyButton(label, copy_text, popup_width)
 
     row_min = ig.GetItemRectMin()
     row_max = ig.GetItemRectMax()
-    ig.SameLine(popup_width - width - unsafe_load(ig.GetStyle().WindowPadding.x) * 2)
+    ig.SameLine(0, 0)
+    ig.SetCursorScreenPos(ImVec2(row_min.x + popup_width - width, row_min.y))
     if ig.IsMouseHoveringRect(row_min, ImVec2(row_min.x + popup_width, row_max.y))
         CopyButton(label, copy_text)
     else
@@ -471,60 +490,127 @@ function RowCopyButton(label, copy_text, popup_width)
     end
 end
 
-# A combo box where each item has a copy-to-clipboard button. Also shows a copy
-# button on the combo preview when hovered. Returns true if the selection
-# changed.
+# A dropdown where each item has a copy-to-clipboard button, and the preview shows
+# a copy button on hover. Returns true if the selection changed.
+#
+# Drawn as a button + popup rather than BeginCombo: a combo dropdown can't open
+# mid-node. Inside the node canvas the dropdown is deferred to after EndNode under
+# Suspend/Resume (see draw_dag) via client.combo_popup; outside it's drawn here.
 function CopyableCombo(label, items, selected_idx::Ref{Cint})
+    client = state[].client
     changed = false
+
+    # Pick up a selection produced by a deferred draw on a previous frame.
+    popup = client.combo_popup
+    if popup.result_label == label
+        popup.result_label = nothing
+        if popup.result_index != selected_idx[]
+            selected_idx[] = popup.result_index
+            changed = true
+        end
+    end
+
     sel = selected_idx[] + 1
     preview = 1 <= sel <= length(items) ? items[sel] : ""
-    button_width, button_height = RowCopyButton_size()
+    button_width, _ = RowCopyButton_size()
+    popup_id = "combo-popup-$label"
+    in_editor = ne.GetCurrentEditor() != C_NULL
 
-    # AllowOverlap so the copy button overlaid on the preview can receive clicks
-    ig.SetNextItemAllowOverlap()
-    combo_w = ig.CalcItemWidth() + ig.GetFrameHeight()
-    ig.SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(combo_w, Cfloat(typemax(Int32))))
-    if ig.BeginCombo("##$label", preview)
-        popup_w = combo_w
-        for (i, name) in enumerate(items)
-            ig.SetNextItemAllowOverlap()
-            if ig.Selectable("##$label-$i")
-                new_idx = i - 1
-                if new_idx != selected_idx[]
-                    selected_idx[] = new_idx
-                    changed = true
-                end
-            end
-            ig.SameLine(0, 0)
-            ig.Text(name)
-            RowCopyButton("$label-$i", name, popup_w)
-        end
-        ig.EndCombo()
-    end
-
-    # Overlay a copy button inside the combo preview, just left of the dropdown arrow.
-    # We move the cursor back into the combo's rect to position the button.
-    combo_rect_min = ig.GetItemRectMin()
-    combo_rect_max = ig.GetItemRectMax()
-    combo_w = combo_rect_max.x - combo_rect_min.x
-    combo_h = combo_rect_max.y - combo_rect_min.y
+    # Elide the preview to leave room for the dropdown arrow on the right.
+    item_w = ig.CalcItemWidth()
     arrow_w = ig.GetFrameHeight()
-    save_cursor = ig.GetCursorPos()
-    ig.SameLine(0, 0)
-    ig.SetCursorPosX(ig.GetCursorPosX() - arrow_w - button_width - 4)
-    ig.SetCursorPosY(ig.GetCursorPosY() + (combo_h - button_height) / 2)
-    if ig.IsMouseHoveringRect(combo_rect_min, combo_rect_max)
-        CopyButton("$label-preview", preview)
+    avail = item_w - arrow_w - 2 * unsafe_load(ig.GetStyle().FramePadding.x)
+    display = preview
+    if ig.CalcTextSize(display).x > avail
+        while !isempty(display) && ig.CalcTextSize(display * "…").x > avail
+            display = display[1:prevind(display, lastindex(display))]
+        end
+        display *= "…"
     end
 
-    # Restore the cursor and register the combo's right edge as the line position,
-    # so the caller's SameLine() places content after the combo, not the overlay button.
-    ig.SetCursorPos(save_cursor)
-    ig.SameLine(0, 0)
-    ig.SetCursorPosX(combo_rect_min.x - ig.GetWindowPos().x + combo_w)
-    ig.NewLine()
+    # No AllowOverlap: inside the node editor an overlap-allowing button yields to
+    # the editor's node-interaction area and stops responding, so the copy
+    # affordance is a manual hit-tested sub-region rather than a second button.
+    clicked = ig.Button("$display##$label", ImVec2(item_w, 0))
+
+    rect_min = ig.GetItemRectMin()
+    rect_max = ig.GetItemRectMax()
+    # IsItemHovered (not IsMouseHoveringRect) so the copy icon respects focus and
+    # isn't shown when another window or popup is on top.
+    hovered = ig.IsItemHovered()
+
+    # Anchor the dropdown under the button. In the editor the rect is canvas-local,
+    # so convert to screen space for the deferred (suspended) draw.
+    anchor = ImVec2(rect_min.x, rect_max.y)
+    if in_editor
+        anchor = ne.CanvasToScreen(anchor)
+    end
+
+    # Copy sub-region, just left of the dropdown arrow.
+    copy_min = ImVec2(rect_max.x - arrow_w - button_width - 4, rect_min.y)
+    copy_max = ImVec2(rect_max.x - arrow_w - 4, rect_max.y)
+    over_copy = hovered && ig.IsMouseHoveringRect(copy_min, copy_max)
+
+    if clicked
+        if over_copy
+            ig.SetClipboardText(preview)
+        elseif in_editor
+            popup.label = label
+            popup.items = items
+            popup.anchor = anchor
+            popup.width = item_w
+            popup.trigger = true
+        else
+            ig.OpenPopup(popup_id)
+        end
+    end
+
+    draw_list = ig.GetWindowDrawList()
+    pad_y = unsafe_load(ig.GetStyle().FramePadding.y)
+    # Dropdown arrow at the right edge, matching a real combo.
+    ig.RenderArrow(draw_list, ImVec2(rect_max.x - arrow_w + pad_y, rect_min.y + pad_y),
+                   ig.GetColorU32(ig.ImGuiCol_Text), ig.ImGuiDir_Down, 1f0)
+    # Copy icon on hover, brighter when the cursor is over it.
+    if hovered
+        col = ig.GetColorU32(over_copy ? ig.ImGuiCol_Text : ig.ImGuiCol_TextDisabled)
+        ig.AddText(draw_list, ImVec2(copy_min.x, rect_min.y + pad_y), col, "\uf0c5")
+    end
+
+    # Outside the editor the dropdown is drawn here; inside, draw_dag draws it.
+    if !in_editor
+        ig.SetNextWindowPos(anchor)
+        new_idx = draw_combo_popup(popup_id, items, item_w)
+        if !isnothing(new_idx) && new_idx != selected_idx[]
+            selected_idx[] = new_idx
+            changed = true
+        end
+    end
 
     return changed
+end
+
+# Draws the CopyableCombo dropdown list. Returns the chosen index, or nothing if
+# no selection was made this frame. The caller owns OpenPopup and Suspend/Resume.
+function draw_combo_popup(popup_id, items, min_width)
+    result = nothing
+    if ig.BeginPopup(popup_id)
+        button_width, _ = RowCopyButton_size()
+        text_w = maximum((ig.CalcTextSize(name).x for name in items); init=0f0)
+        # Subtract the window padding so the popup's outer width matches the widget.
+        inner_width = min_width - 2 * unsafe_load(ig.GetStyle().WindowPadding.x)
+        popup_w = max(inner_width, text_w + button_width + 24)
+        for (i, name) in enumerate(items)
+            ig.SetNextItemAllowOverlap()
+            if ig.Selectable("$name##$popup_id-$i", false, 0, ImVec2(popup_w, 0))
+                result = Cint(i - 1)
+                ig.CloseCurrentPopup()
+            end
+            RowCopyButton("$popup_id-$i", name, popup_w)
+        end
+        ig.EndPopup()
+    end
+
+    return result
 end
 
 function dep_text_callback(callback_data::Ptr{ig.ImGuiInputTextCallbackData})::Cint
@@ -761,25 +847,16 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
                  source_list, device_props::DeviceProperties,
                  variable_names::Vector{String}, client::ClientState;
                  device_only::Bool=false, variable_name::String="")
-    # Type selector combo
-    dep_kinds = ["Karabo", "Variable"]
-    current_idx = dep_state.is_karabo ? 0 : 1
-    focus = false
-    frame_padding = unsafe_load(ig.GetStyle().FramePadding.x)
-    ig.SetNextItemWidth(ig.CalcTextSize("Variable ").x)
-    if ig.BeginCombo("##dep-kind-$(label)", dep_kinds[current_idx + 1], ig.ImGuiComboFlags_NoArrowButton)
-        for (i, kind_label) in enumerate(dep_kinds)
-            selected = (i - 1) == current_idx
-            if ig.Selectable(kind_label, selected)
-                focus = dep_state.is_karabo != (i == 1)
-                dep_state.is_karabo = (i == 1)
-                # Reset karabo state when switching
-                dep_state.karabo_state.cursor_pos = -1
-                dep_state.karabo_state.device = nothing
-                dep_state.karabo_state.wanted_text = nothing
-            end
-        end
-        ig.EndCombo()
+    # Type selector. A real combo's dropdown opens mid-node and lands in the wrong
+    # place, so draw a button here that records the request and defer the popup to
+    # after EndNode under Suspend/Resume (see draw_dag). The popup mutates dep_state
+    # and sets wants_focus so the new text field grabs focus next frame.
+    kind_label = dep_state.is_karabo ? "Karabo" : "Variable"
+    focus = dep_state.wants_focus
+    dep_state.wants_focus = false
+    if ig.Button("$(kind_label)##dep-kind-$(label)", ImVec2(ig.CalcTextSize("Variable ").x, 0))
+        client.dep_kind_popup = ("dep-kind-$(label)", dep_state)
+        client.dep_kind_popup_trigger = true
     end
 
     ig.SameLine()

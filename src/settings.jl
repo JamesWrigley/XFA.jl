@@ -75,20 +75,36 @@ function save_settings(client::ClientState, updated_field=nothing)
     client_settings["context_path"] = client.context_path
     contexts = get!(client_settings, "contexts", Dict{String, Any}())
 
-    # Query actual node positions from ImNodes rather than using
-    # client.context.node_positions, which contains stale sentinel values.
-    node_positions = Dict{String, Vector}()
-    for (name, var_data) in client.context.context_state
-        pos = ImNodes.GetNodeGridSpacePos(var_data["id"])
-        node_positions[name] = [pos.x, pos.y]
-    end
-
     contexts[client.context_path] = Dict(
         "plots" => plots,
         "plot_counter" => client.plot_counter,
         "saved_layout" => ini_data,
-        "node_positions" => node_positions,
+        "node_editor_state" => client.ne_settings,
     )
+
+    write_settings(settings)
+end
+
+# The node editor's serialized state (positions, pan, zoom) for a context.
+function load_node_editor_state(context_path)
+    settings = load_settings()
+    contexts = get(get(settings, "ClientState", Dict()), "contexts", Dict())
+    ctx = get(contexts, context_path, Dict())
+    return get(ctx, "node_editor_state", "")
+end
+
+# Persist just the editor state for a context without touching its other
+# entries; used when switching away from a context before recreating the editor.
+function save_node_editor_state(context_path, blob)
+    if isempty(context_path)
+        return
+    end
+
+    settings = load_settings()
+    client_settings = get!(settings, "ClientState", Dict{String, Any}())
+    contexts = get!(client_settings, "contexts", Dict{String, Any}())
+    ctx = get!(contexts, context_path, Dict{String, Any}())
+    ctx["node_editor_state"] = blob
 
     write_settings(settings)
 end

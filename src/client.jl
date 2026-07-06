@@ -368,8 +368,8 @@ function restart_engine(state)
     initialize_engine(state)
 end
 
-# Create an Int32 hash, used for ImNodes ids and ImPlot drag-tool ids
-int32_hash(x) = reinterpret(Cint, crc32c(x))
+# 32-bit hash for ImPlot drag-tool ids, whose id parameter is a C int. Node
+# editor ids use hash() directly (a Csize_t-width, content-derived id).
 int32_hash(x, y) = reinterpret(Cint, crc32c(y, crc32c(x)))
 
 function build_context_state(state, ctx_info)
@@ -393,7 +393,7 @@ function build_context_state(state, ctx_info)
             continue
         end
 
-        ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => hash(name))
 
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
@@ -403,16 +403,16 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
 
         for (arg_name, dep) in deps
-            attr_id = int32_hash("$(name).dependencies.$(arg_name => dep)")
+            attr_id = hash("$(name).dependencies.$(arg_name => dep)")
             push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], OutputPin(int32_hash("$(name).outputs."), ""))
+        push!(ctx_state[name]["outputs"], OutputPin(hash("$(name).outputs."), ""))
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
-            subvar_id = int32_hash("$(name).outputs.$(subvar)")
+            subvar_id = hash("$(name).outputs.$(subvar)")
             if subvar in pp_names
                 pp_prefix = "$(subvar)."
                 pp_params = Dict{String, Any}()
@@ -440,7 +440,7 @@ function build_context_state(state, ctx_info)
     for name in ctx_info["groups"]
         group_filter = startswith("$(name).")
 
-        ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => hash(name))
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
         ctx_state[name]["type"] = :group
@@ -452,7 +452,7 @@ function build_context_state(state, ctx_info)
         # Parameter{Dependency} field of the group. The client uses the field
         # name (not the @Variable's arg_name) when rewriting the constructor
         # kwarg in source.
-        ctx_state[name]["dep_field_names"] = Dict{Int, String}()
+        ctx_state[name]["dep_field_names"] = Dict{UInt, String}()
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
@@ -476,7 +476,7 @@ function build_context_state(state, ctx_info)
                     continue
                 end
                 push!(seen_field_names, field_name)
-                attr_id = int32_hash("$(var_name).dependencies.$(arg_name => dep)")
+                attr_id = hash("$(var_name).dependencies.$(arg_name => dep)")
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
                 ctx_state[name]["dep_field_names"][attr_id] = field_name
                 push!(dep_param_names, field_name)
@@ -487,7 +487,7 @@ function build_context_state(state, ctx_info)
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
-            push!(ctx_state[name]["outputs"], OutputPin(int32_hash(input_name), stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(hash(input_name), stripped_name))
         end
 
         # Add group variables from the DAG as outputs
@@ -498,12 +498,12 @@ function build_context_state(state, ctx_info)
             stripped_name = chopprefix(var_name, "$(name).")
 
             # The variable itself
-            attr_id = int32_hash("$(var_name).outputs.")
+            attr_id = hash("$(var_name).outputs.")
             push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
 
             # Its subvariables
             for subvar in ctx_info["subvariables"][var_name]
-                subvar_id = int32_hash("$(var_name).outputs.$(subvar)")
+                subvar_id = hash("$(var_name).outputs.$(subvar)")
                 push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
             end
         end
@@ -525,9 +525,9 @@ function build_context_state(state, ctx_info)
         end
 
         if !haskey(ctx_info, name)
-            ctx_state[name] = Dict{String, Any}("id" => int32_hash(name))
+            ctx_state[name] = Dict{String, Any}("id" => hash(name))
             ctx_state[name]["dependencies"] = []
-            ctx_state[name]["outputs"] = [OutputPin(int32_hash(name), name)]
+            ctx_state[name]["outputs"] = [OutputPin(hash(name), name)]
             ctx_state[name]["type"] = :input
             ctx_state[name]["links"] = LinkInfo[]
         end
@@ -538,7 +538,7 @@ function build_context_state(state, ctx_info)
     # Reverse lookup: (group_name, field_name) -> the single attr_id used as the
     # group's pin for that field. Multiple member-variable deps bound to the
     # same group field collapse to one link.
-    group_field_pins = Dict{Tuple{String, String}, Int32}()
+    group_field_pins = Dict{Tuple{String, String}, UInt}()
     for gname in ctx_info["groups"]
         for (aid, fname) in ctx_state[gname]["dep_field_names"]
             group_field_pins[(gname, fname)] = aid
@@ -547,7 +547,7 @@ function build_context_state(state, ctx_info)
     group_param_args_all = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
     new_links = LinkInfo[]
-    seen_link_ids = Set{Int32}()
+    seen_link_ids = Set{UInt}()
     for (name, deps) in ctx_info["dag"]
         # Determine which node this variable belongs to
         node_name = is_group_var(name) ? group_of(name) : name
@@ -562,7 +562,7 @@ function build_context_state(state, ctx_info)
                 field_name = get(get(group_param_args_all, name, Dict{String, String}()), arg_name, nothing)
                 isnothing(field_name) ? nothing : get(group_field_pins, (node_name, field_name), nothing)
             else
-                int32_hash("$(name).dependencies.$(arg_name => dep)")
+                hash("$(name).dependencies.$(arg_name => dep)")
             end
             if isnothing(link_end_id)
                 continue
@@ -570,9 +570,9 @@ function build_context_state(state, ctx_info)
 
             if dep isa Dependency && dep.kind in (DepKind_Variable, DepKind_Subvariable)
                 owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
-                link_start_id = int32_hash("$(owner).outputs.$(pin_suffix)")
+                link_start_id = hash("$(owner).outputs.$(pin_suffix)")
                 dep_node = is_group_var(owner) ? group_of(owner) : owner
-                link_id = int32_hash("$(link_start_id)->$(link_end_id)")
+                link_id = hash("$(link_start_id)->$(link_end_id)")
                 if !(link_id in seen_link_ids)
                     push!(seen_link_ids, link_id)
                     push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
@@ -583,8 +583,8 @@ function build_context_state(state, ctx_info)
                 end
             elseif dep isa Dependency && dep.kind == DepKind_Karabo
                 input_name = ctx_info["dep_to_input"][dep.name]
-                link_start_id = int32_hash(input_name)
-                link_id = int32_hash("$(link_start_id)->$(link_end_id)")
+                link_start_id = hash(input_name)
+                link_id = hash("$(link_start_id)->$(link_end_id)")
                 if !(link_id in seen_link_ids)
                     push!(seen_link_ids, link_id)
                     push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
