@@ -342,16 +342,11 @@ function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     client = state[].client
     dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
-    device_props = if isnothing(dep_state.device)
-        DeviceProperties()
-    else
-        get_source_properties(client, dep_state.device)
-    end
 
     device = param.value
     text = "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     client.source_list, device_props, client; device_only=true)
+                                     client.source_list, client; device_only=true)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
@@ -375,12 +370,7 @@ function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
     dep_state = get!(client.dep_text_states, dep_id) do
         DepTextState(; is_karabo=dep.kind == DepKind_Karabo)
     end
-    device_props = if isnothing(dep_state.karabo_state.device)
-        DeviceProperties()
-    else
-        get_source_properties(client, dep_state.karabo_state.device)
-    end
-    return DepText(label, dep, dep_state, client.source_list, device_props,
+    return DepText(label, dep, dep_state, client.source_list,
                    client.variable_names, client; device_only, variable_name)
 end
 
@@ -515,11 +505,7 @@ function draw_device_tree(device_tree)
     end
 end
 
-function get_source_properties(client, device_name)
-    idx = findfirst(s -> s.name == device_name, client.source_list)
-    isnothing(idx) && return DeviceProperties()
-
-    topic = client.source_list[idx].topic
+function get_source_properties(client, topic::AbstractString, device_name::AbstractString)
     key = (topic, device_name)
     return get!(client.source_properties, key) do
         id = send(client, GetDeviceSchema(topic, device_name))
@@ -926,14 +912,9 @@ function draw_routing_rules()
                 ig.TableNextColumn()
                 ig.SetNextItemWidth(-1)
                 src_state = get!(client.routing_rule_source_states, i, KaraboDepTextState())
-                src_props = if isnothing(src_state.device)
-                    DeviceProperties()
-                else
-                    get_source_properties(client, src_state.device)
-                end
                 filtered_sources = get(client.sources_by_topic, rule.topic, SourceInfo[])
                 edited, new_source = KaraboDepText("##rule-source-$i", rule.source, src_state,
-                                                   filtered_sources, src_props, client;
+                                                   filtered_sources, client;
                                                    allow_slow=false)
                 if edited
                     client.routing_rules[i] = RoutingRule(rule.topic, new_source, rule.input)
@@ -1123,10 +1104,6 @@ function draw_dag()
                     if dep_state.is_karabo != is_karabo
                         dep_state.is_karabo = is_karabo
                         dep_state.wants_focus = true
-                        # Reset karabo state when switching
-                        dep_state.karabo_state.cursor_pos = -1
-                        dep_state.karabo_state.device = nothing
-                        dep_state.karabo_state.wanted_text = nothing
                     end
                     ig.CloseCurrentPopup()
                 end
@@ -1675,6 +1652,10 @@ function draw_gui()
         ig.End()
     end
 
+    # The Karabo source editor, opened by any inline KaraboDepText widget. Drawn
+    # here at the top level so it escapes the node canvas and works from any tab.
+    draw_karabo_editor(client)
+
     # Display tooling windows
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
                                       (:show_imgui_metrics,  ig.ShowMetricsWindow),
@@ -1779,6 +1760,11 @@ function main(; test_engine=nothing)
     end
 
     t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
+        # Bake GL-backed resources on the first frame, once a GL context exists.
+        if isnothing(gui_state.window_shadow)
+            gui_state.window_shadow = build_window_shadow()
+        end
+
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button

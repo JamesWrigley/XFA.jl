@@ -51,12 +51,44 @@ DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}
 end
 
 @kwdef mutable struct KaraboDepTextState
-    cursor_pos::Cint = -1
-    device::Maybe{String} = nothing
+    # Working copies of the source/property/proxy fields while the editor window
+    # is open. Seeded from the current value when the window opens and composed
+    # back into a source string on OK.
+    source::String = ""
+    property::String = ""
+    proxy::String = ""
+    proxy_expanded::Bool = false
 
-    # If set, the callback will replace the buffer contents with this text,
-    # move the cursor to the end, and then clear it.
-    wanted_text::Maybe{String} = nothing
+    # Set by the editor window's OK button (the raw composed source string) and
+    # picked up by KaraboDepText on the next frame, which runs the remap and
+    # returns the result to the caller.
+    committed::Maybe{String} = nothing
+
+    # Per-call context captured when the editor window opens, so the deferred
+    # top-level draw has everything it needs. `source_list` is the (possibly
+    # topic-filtered) source list to complete against.
+    label::String = ""
+    source_list::Vector{SourceInfo} = SourceInfo[]
+    device_only::Bool = false
+    allow_slow::Bool = true
+    # One-shot flag to open/focus the window on its first drawn frame.
+    trigger::Bool = false
+    # Frames the window has been drawn, so the focus-loss close check is skipped
+    # on the opening frame.
+    frames::Int = 0
+    # Set each frame when an autocomplete popup is hovered, so losing window
+    # focus to that popup doesn't close the editor.
+    ac_hovered::Bool = false
+    # Set each frame when an autocomplete popup is open, so an Enter that selects
+    # a completion isn't also treated as confirming the whole editor.
+    ac_active::Bool = false
+
+    # Set when a new source is picked: the property is re-checked against the new
+    # source once its schema arrives, and dropped (with focus moved to the
+    # property field) if it no longer belongs.
+    revalidate_property::Bool = false
+    # One-shot request to focus the property field on the next frame.
+    property_focus::Bool = false
 
     # Set when a remap requires an async device-property lookup. The widget
     # stays disabled until the request resolves, then re-runs the remap.
@@ -356,6 +388,9 @@ end
     dep_text_states::Dict{UInt, DepTextState} = Dict{UInt, DepTextState}()
     dep_kind_popup::Maybe{Tuple{String, DepTextState}} = nothing
     dep_kind_popup_trigger::Bool = false
+    # The KaraboDepText editor window currently open, or nothing. Drawn once at
+    # the top level of the frame; the inline widgets set this to request it.
+    karabo_editor::Maybe{KaraboDepTextState} = nothing
     # CopyableCombo dropdown deferred out of the node canvas. Only one is open at a time.
     combo_popup::CopyableComboPopup = CopyableComboPopup()
     # Variable names available for autocompletion (including subvariable outputs)
@@ -455,8 +490,21 @@ function Base.close(client::ClientState)
     empty!(client.variable_data)
 end
 
+# A baked soft drop-shadow texture plus the 9-slice geometry to draw it around a
+# window. Built lazily (needs a live GL context); see build_window_shadow!.
+struct WindowShadow
+    tex::GLuint
+    size::Int
+    cell::Int
+    margin::Float32
+    corner::Float32
+end
+
 @kwdef mutable struct GuiState
     disable_rendering::Bool = false
+
+    # Baked drop-shadow for the Karabo source editor, built on first use.
+    window_shadow::Maybe{WindowShadow} = nothing
 
     # Showing external tool windows
     show_imgui_demo::Bool = false
