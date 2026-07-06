@@ -138,7 +138,7 @@ end
     prelude::Vector{Expr} = Expr[]
     input_channels::Dict{String, Channel} = Dict()
     input_tasks::Dict{String, Task} = Dict()
-    available_sources::Dict{String, Vector{String}} = Dict()
+    available_sources::Base.Lockable{Dict{String, Vector{String}}, ReentrantLock} = Base.Lockable(Dict{String, Vector{String}}())
 
     dep_to_input::Dict{String, String} = Dict()
 
@@ -698,64 +698,72 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             tid, matched_data = only(matched_trains)
             empty!(matched_trains)
 
-            # Build args from deps, extracting subvariable values as needed
-            for (i, (arg_name, dep)) in enumerate(deps)
-                if dep isa Parameter
-                    args[i] = dep.value
-                elseif dep.kind == DepKind_Group
-                    args[i] = upstream[dep.name]
-                elseif dep.kind == DepKind_Subvariable
-                    parent_data = matched_data[dep.parent]
-                    subvar = get(parent_data.subvariables, dep.name, nothing)
-                    args[i] = isnothing(subvar) ? nothing : subvar.data
-                else
-                    args[i] = matched_data[dep.name].data
-                end
-            end
-
-            # Don't execute the variable if any required input is `nothing`
-            empty_result = VariableData(tid, name, nothing)
-            if any(i -> !optional_args[i] && isnothing(args[i]), eachindex(args))
-                putall!(values(downstream), empty_result)
-                continue
-            end
-
-            # Execute the variable
             f = worker_state.dag_functions[name]
             subvar_values = Dict{String, Any}()
+            empty_result = VariableData(tid, name, nothing)
             @debug "Executing variable '$(name)'..."
-            @lock worker_state.task_locks[name] try
-                out = @with(Meta.tid => tid,
-                            Meta.name => name,
-                            Meta.scratch => scratch,
-                            Meta.subvariables => subvar_values,
-                            @invokelatest f(args...))
-            catch ex
-                @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
-                putall!(values(downstream), empty_result)
-                continue
+            @lock worker_state.task_locks[name] begin
+                # Build args from deps, extracting subvariable values as
+                # needed. Parameter reads happen under the lock so
+                # pause_pipeline() (e.g. from change_parameter) can't mutate a
+                # parameter between here and the execution below.
+                for (i, (arg_name, dep)) in enumerate(deps)
+                    if dep isa Parameter
+                        args[i] = dep.value
+                    elseif dep.kind == DepKind_Group
+                        args[i] = upstream[dep.name]
+                    elseif dep.kind == DepKind_Subvariable
+                        parent_data = matched_data[dep.parent]
+                        subvar = get(parent_data.subvariables, dep.name, nothing)
+                        args[i] = isnothing(subvar) ? nothing : subvar.data
+                    else
+                        args[i] = matched_data[dep.name].data
+                    end
+                end
+
+                # Don't execute the variable if any required input is `nothing`
+                if any(i -> !optional_args[i] && isnothing(args[i]), eachindex(args))
+                    putall!(values(downstream), empty_result)
+                    continue
+                end
+
+                # Execute the variable
+                try
+                    out = @with(Meta.tid => tid,
+                                Meta.name => name,
+                                Meta.scratch => scratch,
+                                Meta.subvariables => subvar_values,
+                                @invokelatest f(args...))
+                catch ex
+                    @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
+                    putall!(values(downstream), empty_result)
+                    continue
+                end
+
+                # Run postprocessors on the variable output. Reuse the variable's
+                # train-scoped metadata so `tryset` (and anything else reading
+                # Meta.*) works the same as inside the variable body. They run
+                # under the same lock acquisition as the variable so that
+                # pause_pipeline() (e.g. from change_parameter) can't mutate
+                # postprocessor state between or during the two.
+                if !isempty(postprocessors)
+                    raw_out = out isa VariableData ? out.data : out
+                    for (pp_name, pp) in postprocessors
+                        try
+                            subvar_values[pp_name] = @with(Meta.tid => tid,
+                                                           Meta.name => pp_name,
+                                                           Meta.scratch => scratch,
+                                                           Meta.subvariables => subvar_values,
+                                                           pp(raw_out))
+                        catch ex
+                            @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
+                        end
+                    end
+                end
             end
 
             if !isnothing(out)
                 tick!(rate)
-            end
-
-            # Run postprocessors on the variable output. Reuse the variable's
-            # train-scoped metadata so `tryset` (and anything else reading
-            # Meta.*) works the same as inside the variable body.
-            if !isempty(postprocessors)
-                raw_out = out isa VariableData ? out.data : out
-                for (pp_name, pp) in postprocessors
-                    try
-                        subvar_values[pp_name] = @with(Meta.tid => tid,
-                                                       Meta.name => pp_name,
-                                                       Meta.scratch => scratch,
-                                                       Meta.subvariables => subvar_values,
-                                                       pp(raw_out))
-                    catch ex
-                        @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
-                    end
-                end
             end
 
             # Wrap subvariable values in VariableData
@@ -812,7 +820,7 @@ Notify the system of a new list of sources that can be read from `input`.
 An Input should call this function whenever its sources changes.
 """
 function declare_sources(input_name, new_sources)
-    current_ctx.available_sources[input_name] = new_sources
+    @lock current_ctx.available_sources current_ctx.available_sources[][input_name] = new_sources
 
     pause_pipeline() do
         update_input_sources(current_ctx)
@@ -898,6 +906,10 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         errormonitor(ctx.input_tasks[name])
     end
 
+    for name in keys(ctx.inputs)
+        ctx.input_rates[name] = 0.0
+    end
+
     # Start the input variables, each with downstream channels only for
     # the external deps routed to that input.
     for name in keys(ctx.inputs)
@@ -910,7 +922,6 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_rates[name] = 0.0
         ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
         errormonitor(ctx.input_variables_tasks[name])
     end

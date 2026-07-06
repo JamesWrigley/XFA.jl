@@ -562,7 +562,9 @@ function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
 
     if haskey(worker_state.parameters, name)
-        worker_state.parameters[name].value = value
+        pause_pipeline() do
+            worker_state.parameters[name].value = value
+        end
     end
 
     if !isnothing(current_ctx)
