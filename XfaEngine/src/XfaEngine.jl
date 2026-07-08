@@ -544,7 +544,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     state.remap_rules = load_remap_rules()
     @info "Loaded remap rules" n=length(state.remap_rules) path=engine_settings_path()
 
-    ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
+    ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port; maxframesize=Protocol.MAX_FRAME_SIZE) do ws
         id = create_id()
         try
             # Select their identifier
