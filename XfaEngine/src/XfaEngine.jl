@@ -107,10 +107,10 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 # forwarded; multi-element arrays must be opted into via subscription.
 is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
 
-# Whether a whole variable's data should be compressed. Extends the array-level
-# check with a plotting exception: a 2D array with a color-bound plot layer is
-# rendered as a bunch of lines, whose fine per-line detail lossy compression
-# mangles. Such arrays are typically small, so we skip compression entirely.
+# Whether a variable's array is eligible for lossy compression. Extends the
+# array-level check with a plotting exception: a 2D array with a color-bound
+# plot layer is rendered as a bunch of lines, whose fine per-line detail lossy
+# compression mangles, so it's compressed losslessly instead (see client_view_for).
 function ZfpWorkspaces.should_compress(variable::VariableData)
     data = variable.data
     plotted_as_lines = data isa AbstractMatrix &&
@@ -139,10 +139,10 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
         nothing
     elseif isnothing(requested)
         METADATA_PRECISION
-    elseif should_compress(variable)
-        # compress=false variables are still compressed, but reversibly rather
-        # than at the client's precision.
-        variable.compress ? Int(requested) : 0
+    elseif should_compress(data)
+        # Compress losslessly when the client didn't opt into lossy compression,
+        # or when the array must stay exact because it's plotted as lines.
+        (variable.compress && should_compress(variable)) ? Int(requested) : 0
     else
         nothing
     end
