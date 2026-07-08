@@ -756,11 +756,23 @@ end
     b = build_client_view!(state, big, sub("big" => -1), c)
     @test a.data isa CompressedArray
     @test a === b
+
     # A different precision recompresses and overwrites the cache slot.
     d = build_client_view!(state, big, sub("big" => 8), c)
     @test d.data isa CompressedArray
     @test d !== a
     @test c["big"][1] == 8
+
+    # A 2D array plotted as lines (color-bound layer) must be compressed
+    # losslessly regardless of the client's requested precision that so its
+    # per-line detail is preserved.
+    spec = [PlotSpec("traces", [LayerSpec(; data="traces", color=:pulseId)])]
+    traces = rand(300, 2)
+    lines = VariableData(; tid=0, name="traces", data=traces, plot_specs=spec)
+    v = build_client_view!(state, lines, sub("traces" => 8), c)
+    @test v.data isa CompressedArray
+    @test c["traces"][1] == 0  # lossless, not the requested lossy precision 8
+    @test decompress_array(ZfpWorkspace(), v.data) == traces
 end
 
 @testset "Serialization" begin
