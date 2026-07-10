@@ -214,6 +214,15 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
     scalar_tids::Maybe{CircularBuffer{Int}} = nothing
 
+    # Background array decompression. `decode_task` is this variable's in-flight
+    # decode (or nothing); while it's running draw_plots drops newer frames
+    # instead of spawning another. `decode_tid` is that frame's train ID.
+    # `spare_buffer` is the off-screen buffer the task decodes into, swapped with
+    # `data` on pickup so decoding never mutates the array being rendered.
+    decode_task::Maybe{Task} = nothing
+    decode_tid::Int = -1
+    spare_buffer::Maybe{Array} = nothing
+
     # Contiguous caches for plotting scalar CircularBuffer data
     const scalar_data_cache::Vector{Float64} = Float64[]
     const scalar_tids_cache::Vector{Float64} = Float64[]
