@@ -409,23 +409,24 @@ gl_convert_type(::Type)          = Float32  # fallback
 const GLNativeTypes = Union{Float32, Int32, UInt32, Int16, UInt16, Int8, UInt8}
 
 """
-Convert matrix data into the reusable `convert_buf`, reinterpreted as a matrix
-of the target GL type. Returns either the original data (if no conversion
-needed) or a zero-copy view over the resized buffer.
+Materialize matrix data as a dense, GL-uploadable matrix. Returns the original
+data zero-copy when it's already a native-eltype dense array, otherwise copies
+(and type-converts if needed) into the reusable `convert_buf`.
 """
 function prepare_data!(h::GPUHeatmap, data::AbstractMatrix{T}) where T
-    if T <: GLNativeTypes
-        return data
+    base = data isa DimArray ? parent(data) : data
+    if T <: GLNativeTypes && base isa DenseArray
+        return base
+    else
+        # Copy into the cached byte buffer, converting to the GL-native type
+        # when necessary.
+        G = T <: GLNativeTypes ? T : gl_convert_type(T)
+        nbytes = length(data) * sizeof(G)
+        resize!(h.convert_buf, nbytes)
+        buf = unsafe_wrap(Matrix{G}, Ptr{G}(pointer(h.convert_buf)), size(data))
+        copyto!(buf, data)
+        return buf
     end
-
-    # Convert into the cached byte buffer to avoid per-frame allocations
-    G = gl_convert_type(T)
-    nbytes = length(data) * sizeof(G)
-    resize!(h.convert_buf, nbytes)
-    buf = unsafe_wrap(Matrix{G}, Ptr{G}(pointer(h.convert_buf)), size(data))
-    copyto!(buf, data)
-
-    return buf
 end
 
 """
