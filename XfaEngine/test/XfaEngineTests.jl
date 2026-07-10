@@ -705,8 +705,8 @@ end
     @test !is_scalar_data([1, 2, 3])
 
     state = EngineState()
-    cache() = Dict{String, Tuple{Int, VariableData}}()
-    sub(pairs::Pair{String, Int}...) = Dict{String, Int}(pairs...)
+    cache() = Dict{String, Tuple{Float64, VariableData}}()
+    sub(pairs::Pair{String, <:Real}...) = Dict{String, Float64}(pairs...)
 
     # Scalars always pass through. Non-compressible arrays (Int, length below
     # the compression threshold) round-trip raw when subscribed, and become
@@ -749,7 +749,7 @@ end
     @test f.subvariables["p.arr"].data isa ArrayMetadata
 
     # Compressible payload: a long enough Float array triggers ZFP. With two
-    # clients sharing the same precision the cache reuses the compressed view.
+    # clients sharing the same k the cache reuses the compressed view.
     big = VariableData(; tid=0, name="big", data=randn(Float64, 600))
     c = cache()
     a = build_client_view!(state, big, sub("big" => -1), c)
@@ -757,21 +757,21 @@ end
     @test a.data isa CompressedArray
     @test a === b
 
-    # A different precision recompresses and overwrites the cache slot.
-    d = build_client_view!(state, big, sub("big" => 8), c)
+    # A different k recompresses and overwrites the cache slot.
+    d = build_client_view!(state, big, sub("big" => 0.5), c)
     @test d.data isa CompressedArray
     @test d !== a
-    @test c["big"][1] == 8
+    @test c["big"][1] == 0.5
 
     # A 2D array plotted as lines (color-bound layer) must be compressed
-    # losslessly regardless of the client's requested precision that so its
-    # per-line detail is preserved.
+    # losslessly regardless of the client's requested k so its per-line detail
+    # is preserved.
     spec = [PlotSpec("traces", [LayerSpec(; data="traces", color=:pulseId)])]
     traces = rand(300, 2)
     lines = VariableData(; tid=0, name="traces", data=traces, plot_specs=spec)
-    v = build_client_view!(state, lines, sub("traces" => 8), c)
+    v = build_client_view!(state, lines, sub("traces" => 0.5), c)
     @test v.data isa CompressedArray
-    @test c["traces"][1] == 0  # lossless, not the requested lossy precision 8
+    @test c["traces"][1] == 0  # lossless, not the requested lossy k
     @test decompress_array(ZfpWorkspace(), v.data) == traces
 end
 
@@ -876,17 +876,17 @@ end
         @test should_compress(VariableData(; data=rand(600), plot_specs=lines))
     end
 
-    # High precision pins the round-trip fidelity regardless of whatever
-    # lossy default the engine currently uses.
+    # k=0 requests lossless compression; zfp's reversible mode reconstructs
+    # floats bit-for-bit.
     @testset "Float round-trip (all finite)" begin
         for T in (Float32, Float64), shape in ((1000,), (40, 40))
             arr = randn(T, shape)
-            ca = compress_array(ws, arr; precision=15)
-            @test !ca.promoted && isnothing(ca.nonfinite_mask)
+            ca = compress_array(ws, arr; k=0)
+            @test isnothing(ca.nonfinite_mask)
             @test ca.original_eltype === T && Tuple(ca.shape) == shape
             out = decompress_array(ws, ca)
             @test eltype(out) === T && size(out) == shape
-            @test maximum(abs, arr - out) < 1e-2
+            @test out == arr
         end
     end
 
@@ -897,46 +897,38 @@ end
         a[200] = -Inf32
         a[1500] = NaN32
 
-        ca = compress_array(ws, a; precision=15)
+        ca = compress_array(ws, a; k=0)
         @test !isnothing(ca.nonfinite_mask)
         out = decompress_array(ws, ca)
         @test isnan(out[10]) && out[100] == Inf32 && out[200] == -Inf32 && isnan(out[1500])
         fin = isfinite.(a)
-        @test maximum(abs, a[fin] - out[fin]) < 1e-2
+        @test a[fin] == out[fin]
     end
 
-    # Int round-trip uses precision=0 (lossless) to exercise the
-    # promote/demote machinery; the default lossy precision=15 would zero
-    # out small integer values and obscure whether promotion is correct.
-    @testset "Low-bit int promote/demote" begin
+    # Integers are staged through a float intermediate and rounded back; k=0
+    # round-trips them exactly.
+    @testset "Low-bit int round-trip" begin
         for T in (Int8, UInt8, Int16, UInt16)
             arr = T.(rand(0:50, 800))
-            ca = compress_array(ws, arr; precision=0)
-            @test ca.promoted && ca.original_eltype === T
+            ca = compress_array(ws, arr; k=0)
+            @test ca.original_eltype === T
             out = decompress_array(ws, ca)
             @test eltype(out) === T && out == arr
         end
     end
 
-    @testset "Native int (no promotion)" begin
-        arr = Int32.(rand(-100:100, 1000))
-        ca = compress_array(ws, arr; precision=0)
-        @test !ca.promoted && !ca.clamped
+    # The Float64 intermediate covers the whole Int32 range exactly, so even
+    # the type extremes survive a lossless round-trip (no clamping).
+    @testset "Native int round-trip" begin
+        arr = Int32[0, 1, -2, typemax(Int32), typemin(Int32), 100, rand(-100:100, 1000)...]
+        ca = compress_array(ws, arr; k=0)
+        @test ca.original_eltype === Int32
         @test decompress_array(ws, ca) == arr
-    end
-
-    @testset "Native int out-of-range gets clamped" begin
-        mag = Int32(2)^30 - one(Int32)
-        arr = Int32[0, 1, -2, typemax(Int32), typemin(Int32), 100]
-        ca = compress_array(ws, arr; precision=0)
-        @test ca.clamped
-        out = decompress_array(ws, ca)
-        @test out == Int32[0, 1, -2, mag, -mag, 100]
     end
 
     @testset "decompress_array! into provided buffer" begin
         arr = randn(Float64, 800)
-        ca = compress_array(ws, arr; precision=15)
+        ca = compress_array(ws, arr; k=0)
         out = allocate_array(ca)
         @test eltype(out) === Float64 && size(out) == size(arr)
         decompress_array!(ws, out, ca)
@@ -954,7 +946,7 @@ end
                       name="image", metadata=Dict(:units => "eV"))
 
         @test should_compress(da)
-        ca = compress_array(ws, da; precision=15)
+        ca = compress_array(ws, da; k=0)
         @test !isnothing(ca.dims)
         @test ca.dims.dim_names == [:Y, :X]
         @test ca.dims.name == "image" && ca.dims.metadata[:units] == "eV"

@@ -70,9 +70,9 @@ end
     # heartbeat_task::Task
 
     # Fully-qualified names of array-valued variables this client wants
-    # forwarded, mapped to the requested zfp precision (-1 for default).
+    # forwarded, mapped to the noise multiplier k (0 lossless, -1 for default).
     # Updated via `SetVariableSubscriptions`.
-    subscriptions::Dict{String, Int} = Dict{String, Int}()
+    subscriptions::Dict{String, Float64} = Dict{String, Float64}()
 end
 
 @kwdef mutable struct EngineState
@@ -91,7 +91,7 @@ end
     ctx::ContextState = ContextState()
 
     # One zfp workspace per qualified variable name. Sized to the variable's
-    # data on first use and reused across trains; switching precision on the
+    # data on first use and reused across trains; switching k on the
     # same variable just runs zfp again over the same buffers.
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
@@ -118,47 +118,48 @@ function ZfpWorkspaces.should_compress(variable::VariableData)
     return should_compress(data) && !plotted_as_lines
 end
 
-# Sentinel precision used to cache the metadata-only view of a non-subscribed
-# array payload. Real precisions are >= 0 (and -1 maps to the per-eltype
-# default inside compress_array), so this never collides with a real client request.
-const METADATA_PRECISION = typemin(Int)
+# Sentinel k used to cache the metadata-only view of a non-subscribed array
+# payload. Real k values are finite (>= -1), so -Inf never collides with a real
+# client request while still comparing equal for cache hits.
+const METADATA_K = -Inf
 
 # Build (or fetch from `cache`) the per-client view of a single (sub)variable:
 # scalars pass through, non-subscribed arrays become ArrayMetadata, subscribed
-# compressible arrays become a CompressedArray at the requested precision, and
+# compressible arrays become a CompressedArray at the requested k, and
 # subscribed non-compressible arrays pass through raw. The cache stores at most
-# one (precision, VariableData) per qualified name; if a client asks for a
-# different precision than the cached one we just recompress and overwrite.
+# one (k, VariableData) per qualified name; if a client asks for a different k
+# than the cached one we just recompress and overwrite.
 function client_view_for(state::EngineState, variable::VariableData, qualified::String,
-                         subscriptions::Dict{String, Int},
-                         cache::Dict{String, Tuple{Int, VariableData}})
+                         subscriptions::Dict{String, Float64},
+                         cache::Dict{String, Tuple{Float64, VariableData}})
     data = variable.data
     requested = get(subscriptions, qualified, nothing)
 
-    precision = if is_scalar_data(data)
+    k = if is_scalar_data(data)
         nothing
     elseif isnothing(requested)
-        METADATA_PRECISION
+        METADATA_K
     elseif should_compress(data)
-        # Compress losslessly when the client didn't opt into lossy compression,
-        # or when the array must stay exact because it's plotted as lines.
-        (variable.compress && should_compress(variable)) ? Int(requested) : 0
+        # Compress losslessly (k=0) when the client didn't opt into lossy
+        # compression, or when the array must stay exact because it's plotted
+        # as lines.
+        (variable.compress && should_compress(variable)) ? requested : 0.0
     else
         nothing
     end
 
-    if !isnothing(precision)
+    if !isnothing(k)
         hit = get(cache, qualified, nothing)
-        if !isnothing(hit) && hit[1] == precision
+        if !isnothing(hit) && hit[1] == k
             return hit[2]
         end
     end
 
-    new_data = if precision == METADATA_PRECISION
+    new_data = if k == METADATA_K
         ArrayMetadata(eltype(data), collect(size(data)))
-    elseif !isnothing(precision)
+    elseif !isnothing(k)
         ws = get!(() -> ZfpWorkspace(), state.zfp_workspaces, qualified)
-        compress_array(ws, data; precision)
+        compress_array(ws, data; k)
     else
         data
     end
@@ -169,8 +170,8 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
         @set variable.data = new_data
     end
 
-    if !isnothing(precision)
-        cache[qualified] = (precision, view)
+    if !isnothing(k)
+        cache[qualified] = (k, view)
     end
     return view
 end
@@ -179,8 +180,8 @@ end
 # from the shared cache. Falls through to the parent's existing subvariables
 # dict when nothing actually changed for any subvar (avoids an allocation).
 function build_client_view!(state::EngineState, variable::VariableData,
-                            subscriptions::Dict{String, Int},
-                            cache::Dict{String, Tuple{Int, VariableData}})
+                            subscriptions::Dict{String, Float64},
+                            cache::Dict{String, Tuple{Float64, VariableData}})
     parent_view = client_view_for(state, variable, variable.name, subscriptions, cache)
 
     if isempty(variable.subvariables)
@@ -203,7 +204,7 @@ function build_client_view!(state::EngineState, variable::VariableData,
 end
 
 function forward_output(state::EngineState, stream_output)
-    cache = Dict{String, Tuple{Int, VariableData}}()
+    cache = Dict{String, Tuple{Float64, VariableData}}()
     for data in stream_output
         empty!(cache)
         for (id, client) in state.clients
