@@ -1312,74 +1312,112 @@ function restore_plots(state::GuiState)
     # end
 end
 
+# Decode one array frame, reusing `spare` in place when its shape/eltype match.
+# Runs on a background task, so it touches only `ws`, `ca`, and `spare` — never
+# the store's live `data`.
+function decode_frame(ws::ZfpWorkspace, ca::CompressedArray, spare)
+    if spare isa Array && eltype(spare) === ca.original_eltype && size(spare) == Tuple(ca.shape)
+        decompress_array!(ws, spare, ca)
+        return restore_dims(spare, ca)
+    else
+        return decompress_array(ws, ca)
+    end
+end
+
 function draw_plots()
     client = state[].client
 
     # Update all the observables
     updated_variables = Dict{String, Set{Int}}()
     for (name, store) in client.variable_data
-        if !isready(store.updates)
-            continue
-        end
-
         new_tids = Set{Int}()
-        latest_array = nothing  # (tid, payload) — only the last array frame is kept
-        while isready(store.updates)
-            tid, x, type = take!(store.updates)
-            push!(new_tids, tid)
-            store.type = type
-            if x isa Number
-                # Reset scalar_tids too, to preserve the parallel-length
-                # invariant — store.data may have been overwritten outside this
-                # loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
-                if !(store.data isa CircularBuffer)
-                    store.data = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
-                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-                elseif isnothing(store.scalar_tids)
-                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-                end
-                push!(store.data, x)
-                push!(store.scalar_tids, tid)
-            else
-                # Arrays are latest-wins: discard intermediate frames and
-                # decompress only the most recent one after the loop.
-                latest_array = (tid, x)
-            end
-        end
 
-        if !isnothing(latest_array)
-            tid, x = latest_array
-            if x isa CompressedArray
-                ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
-                # Reuse the existing buffer in place when shape/eltype match,
-                # unwrapping any DimArray from a previous frame to get at it.
+        # Pick up a finished background decode (may finish on an idle frame, so
+        # this runs before the isready check).
+        if !isnothing(store.decode_task) && istaskdone(store.decode_task)
+            # Clear before fetching so a failed decode drops the frame instead of
+            # wedging the variable on a task that rethrows every frame.
+            task = store.decode_task
+            store.decode_task = nothing
+            decoded = try
+                fetch(task)
+            catch err
+                @error "Failed to decompress array for $name" exception=(err, catch_backtrace())
+                nothing
+            end
+            if !isnothing(decoded)
                 prev = store.data
-                buf = prev isa DimArray ? parent(prev) : prev
-                if buf isa Array && eltype(buf) === x.original_eltype && size(buf) == Tuple(x.shape)
-                    decompress_array!(ws, buf, x)
-                    store.data = restore_dims(buf, x)
-                else
-                    store.data = decompress_array(ws, x)
+                # Retire the old display buffer as the next spare. nothing (fresh
+                # alloc) when prev isn't a plain array, else the spare would alias
+                # the just-decoded buffer and a later decode would clobber it.
+                store.spare_buffer = prev isa DimArray ? parent(prev) : prev isa Array ? prev : nothing
+                store.data = decoded
+                store.trainId = store.decode_tid
+                push!(new_tids, store.decode_tid)
+                if !isnothing(store.scalar_tids)
+                    empty!(store.scalar_tids)
                 end
-            else
-                store.data = x
-            end
-            store.trainId = tid
-            if !isnothing(store.scalar_tids)
-                empty!(store.scalar_tids)
             end
         end
 
-        # Update contiguous caches for scalar data so plotting doesn't allocate
-        if !isnothing(store.scalar_tids) && store.data isa CircularBuffer
-            n = length(store.data)
-            resize!(store.scalar_data_cache, n)
-            resize!(store.scalar_tids_cache, n)
-            copyto!(store.scalar_data_cache, store.data)
-            copyto!(store.scalar_tids_cache, store.scalar_tids)
+        if isready(store.updates)
+            latest_array = nothing  # (tid, payload) — only the last array frame is kept
+            while isready(store.updates)
+                tid, x, type = take!(store.updates)
+                push!(new_tids, tid)
+                store.type = type
+                if x isa Number
+                    # Reset scalar_tids too, to preserve the parallel-length
+                    # invariant — store.data may have been overwritten outside
+                    # this loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
+                    if !(store.data isa CircularBuffer)
+                        store.data = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
+                        store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                    elseif isnothing(store.scalar_tids)
+                        store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                    end
+                    push!(store.data, x)
+                    push!(store.scalar_tids, tid)
+                else
+                    # Arrays are latest-wins: discard intermediate frames and
+                    # decompress only the most recent one after the loop.
+                    latest_array = (tid, x)
+                end
+            end
+
+            if !isnothing(latest_array)
+                tid, x = latest_array
+                if x isa CompressedArray
+                    # Skip if already decoding (drop the frame, a newer one will
+                    # arrive); otherwise decode off-thread into the spare buffer.
+                    if isnothing(store.decode_task)
+                        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
+                        spare = store.spare_buffer
+                        store.decode_tid = tid
+                        store.decode_task = Threads.@spawn decode_frame(ws, x, spare)
+                    end
+                else
+                    store.data = x
+                    store.trainId = tid
+                    if !isnothing(store.scalar_tids)
+                        empty!(store.scalar_tids)
+                    end
+                end
+            end
+
+            # Update contiguous caches for scalar data so plotting doesn't allocate
+            if !isnothing(store.scalar_tids) && store.data isa CircularBuffer
+                n = length(store.data)
+                resize!(store.scalar_data_cache, n)
+                resize!(store.scalar_tids_cache, n)
+                copyto!(store.scalar_data_cache, store.data)
+                copyto!(store.scalar_tids_cache, store.scalar_tids)
+            end
         end
 
-        updated_variables[name] = new_tids
+        if !isempty(new_tids)
+            updated_variables[name] = new_tids
+        end
     end
 
     # Draw plot windows
