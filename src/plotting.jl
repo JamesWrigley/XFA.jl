@@ -992,7 +992,7 @@ end
 @kwdef mutable struct VariableLayer <: Layer
     const name::String
     const layer_id_str::String
-    const precision::Ref{Cint} = Ref(Cint(-1))
+    const k::Ref{Cfloat} = Ref(Cfloat(-1))
     const fit::FitSettings = FitSettings()
     image::Maybe{ImageState} = nothing
 end
@@ -1048,16 +1048,16 @@ layer_id(layer::SpecLayer) = layer.layer_id_str
 end
 
 # Build a VariableLayer wired to `name`, suitable for pushing onto `plot.layers`.
-# Seeds precision from any existing subscription and bumps the subscription count.
+# Seeds k from any existing subscription and bumps the subscription count.
 function VariableLayer(plot::Plot, name::AbstractString)
     subscriptions = state[].client.subscriptions
-    precision = haskey(subscriptions, name) ? subscriptions[name].precision : -1
+    k = haskey(subscriptions, name) ? subscriptions[name].k : -1.0
     layer = VariableLayer(;
         name = String(name),
         layer_id_str = "$(plot.id)/$(name)/$(length(plot.layers) + 1)",
-        precision = Ref(Cint(precision)),
+        k = Ref(Cfloat(k)),
     )
-    subscribe_variable(state[], name; precision)
+    subscribe_variable(state[], name; k)
     return layer
 end
 
@@ -1223,18 +1223,20 @@ function apply_autoscale(plot)
     end
 end
 
-# zfp precision input, ratio, and throughput readout. `id` namespaces the
-# imgui widgets, `name` is the qualified variable name to retune.
-function draw_compression_settings(id, name, precision::Ref{Cint}, store)
+# zfp accuracy `k` input (0 = lossless), ratio, and throughput readout. `id`
+# namespaces the imgui widgets, `name` is the qualified variable name to retune.
+function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     compressed = isfinite(store.compression_ratio)
     enabled = compressed && store.compress
     if !enabled
         ig.BeginDisabled()
     end
     ig.SetNextItemWidth(120)
-    if ig.InputInt("zfp precision##$(id)", precision)
-        set_subscription_precision(state[], name, Int(precision[]))
+    if ig.InputFloat("zfp accuracy k##$(id)", k, 0.1f0, 1.0f0, "%.2f")
+        set_subscription_k(state[], name, Float64(k[]))
     end
+    ig.SameLine()
+    ig.TextDisabled("(0 = lossless)")
     if !enabled
         ig.EndDisabled()
     end
@@ -1742,7 +1744,7 @@ function side_panel(layer::VariableLayer, ::Plot)
     is_matrix = store.data isa AbstractMatrix
     id = layer.layer_id_str
     if !is_scalar && ig.CollapsingHeader("Compression##$(id)")
-        draw_compression_settings(id, layer.name, layer.precision, store)
+        draw_compression_settings(id, layer.name, layer.k, store)
     end
     if is_matrix
         ig.BeginDisabled()

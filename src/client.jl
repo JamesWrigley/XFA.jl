@@ -1286,24 +1286,24 @@ function set_remoterepl(state)
 end
 
 function send_subscriptions(client)
-    variables = Dict{String, Int}(name => sub.precision
-                                  for (name, sub) in client.subscriptions
-                                  if sub.active)
+    variables = Dict{String, Float64}(name => sub.k
+                                      for (name, sub) in client.subscriptions
+                                      if sub.active)
     send(client, SetVariableSubscriptions(variables))
 end
 
-# Update the requested zfp precision for a subscribed variable. Callers only
-# invoke this on a real change (e.g. InputInt edit), so we always send.
-function set_subscription_precision(state, name, precision::Int)
+# Update the requested zfp accuracy `k` for a subscribed variable. Callers only
+# invoke this on a real change (e.g. InputFloat edit), so we always send.
+function set_subscription_k(state, name, k::Float64)
     client = state.client
     if isempty(name) || !haskey(client.subscriptions, name)
         return
     end
-    client.subscriptions[name].precision = precision
+    client.subscriptions[name].k = k
     send_subscriptions(client)
 end
 
-function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
+function subscribe_variable(state, name; k::Maybe{Float64}=nothing)
     if isempty(name)
         return
     end
@@ -1313,7 +1313,7 @@ function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
 
     if !haskey(client.subscriptions, name)
         client.subscriptions[name] = SubscriptionState(; count=1,
-                                                       precision=something(precision, -1))
+                                                       k=something(k, -1))
         needs_send = true
     else
         sub = client.subscriptions[name]
@@ -1322,8 +1322,8 @@ function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
             sub.active = true
             needs_send = true
         end
-        if !isnothing(precision) && sub.precision != precision
-            sub.precision = precision
+        if !isnothing(k) && sub.k != k
+            sub.k = k
             needs_send = true
         end
     end

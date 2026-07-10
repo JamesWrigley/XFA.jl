@@ -80,10 +80,11 @@ end
 # Tells the engine which array-valued variables this client wants forwarded.
 # Scalar variables are always sent; everything else is suppressed unless its
 # fully-qualified name (e.g. "var", "var.subvar") is a key in this dict.
-# The value is the requested zfp precision for the compressed payload; -1
-# means "use the engine default".
+# The value is the noise multiplier k for fixed-accuracy compression
+# (tol = k * per-frame noise sigma); 0 means lossless and -1 means "use the
+# engine default".
 struct SetVariableSubscriptions <: AbstractMessage
-    variables::Dict{String, Int}
+    variables::Dict{String, Float64}
 end
 
 struct Start <: AbstractMessage end

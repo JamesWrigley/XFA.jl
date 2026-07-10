@@ -310,11 +310,13 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
 
 # Per-variable subscription state. `count` tracks open plots referencing the
 # variable; when it drops to zero we flip `active` off (so the engine stops
-# streaming) but keep the entry around to remember the user's chosen
-# `precision` for the next time a plot of this variable is opened.
+# streaming) but keep the entry around to remember the user's chosen zfp
+# accuracy `k` for the next time a plot of this variable is opened. `k = 0`
+# means lossless, `k < 0` lets the engine pick its default, `k > 0` sets the
+# fixed-accuracy tolerance.
 @kwdef mutable struct SubscriptionState
     count::Int = 0
-    precision::Int = -1
+    k::Float64 = -1
     active::Bool = true
 end
 
@@ -406,7 +408,7 @@ end
 
     # Variable subscriptions, keyed by fully-qualified name. Entries are
     # removed when the open-plot count drops to zero. The keys (and each
-    # entry's precision) get sent to the engine via SetVariableSubscriptions.
+    # entry's zfp accuracy k) get sent to the engine via SetVariableSubscriptions.
     subscriptions::Dict{String, SubscriptionState} = Dict{String, SubscriptionState}()
 
     # One zfp workspace per qualified variable name, reused across trains so

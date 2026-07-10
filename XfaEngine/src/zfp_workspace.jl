@@ -1,8 +1,8 @@
 module ZfpWorkspaces
 
-using ZfpCompression: zfp_compress!, zfp_decompress!, zfp_promote!, zfp_demote!,
-    zfp_clamp_int!, zfp_max_magnitude
+using ZfpCompression: zfp_compress!, zfp_decompress!, zfp_promote!, zfp_demote!
 using NaNStatistics: nanmean
+using Statistics: median!
 using DimensionalData: DimensionalData as DD
 
 export ZfpWorkspace, CompressedArray, compress_array,
@@ -11,14 +11,39 @@ export ZfpWorkspace, CompressedArray, compress_array,
 
 const COMPRESSION_THRESHOLD = 500
 
-default_precision(::Type{<:Integer}) = 11
-default_precision(::Type{<:AbstractFloat}) = 7
-const NONFINITE_RADIUS = 5  # half-window: ~10 surrounding elements total
+# zfp float fixed-accuracy mode: an absolute error tolerance, which (unlike
+# fixed-precision's block-relative step) keeps faint signal alive and stops hot
+# pixels smearing their neighbours. Integer inputs go via a float intermediate.
+#
+# k picks the tolerance: 0 = lossless; k > 0 = manual override, tol = k * noise
+# sigma; k < 0 = adaptive default (auto_tol), value-range relative error.
+#
+# The default sets tol = max(range/n_levels, k_noise*noise): n_levels steps across
+# the displayed range, but never finer than k_noise * the per-frame noise. Integer
+# inputs on this path are always cameras (line plots are forced lossless upstream),
+# shown only for monitoring, so they get an aggressive level count and a large
+# k_noise that washes out incompressible sensor noise: a noise-only frame spans
+# ~5-7 sigma, so k_noise ~20 pushes tol well past the range and collapses it toward
+# its mean. Floats are derived/analysis data: fine level count and a small k_noise
+# that only avoids wasting bits below the noise. The max() with range/n_levels is
+# continuous, so structured frames (range/n_levels > k_noise*noise) keep their
+# detail; the larger k_noise just treats more marginal frames as noise.
+const N_LEVELS_INT = 6
+const N_LEVELS_FLOAT = 64
+const K_NOISE_INT = 20.0
+const K_NOISE_FLOAT = 0.4
 
 const LowBitInt = Union{Int8, UInt8, Int16, UInt16}
 const ZfpNativeInt = Union{Int32, Int64}
 const ZfpFloat = Union{Float32, Float64}
 const Compressible = Union{LowBitInt, ZfpNativeInt, ZfpFloat}
+
+# Float intermediate used to hand a value to zfp. Low-bit ints fit exactly in
+# Float32 (max 65535 < 2^24); Int32/Int64 need Float64 (exact to 2^53).
+zfp_float_type(::Type{<:LowBitInt}) = Float32
+zfp_float_type(::Type{<:ZfpNativeInt}) = Float64
+zfp_float_type(::Type{Float32}) = Float32
+zfp_float_type(::Type{Float64}) = Float64
 
 # Non-finite kind encoding stored in the per-element mask.
 const KIND_FINITE = 0x00
@@ -32,12 +57,12 @@ const KIND_NEGINF = 0x03
 @kwdef mutable struct ZfpWorkspace
     compressed::Vector{UInt8}        = UInt8[]    # main compressed payload
     mask_compressed::Vector{UInt8}   = UInt8[]    # compressed non-finite mask payload
-    int32_scratch::Vector{Int32}     = Int32[]    # promoted low-bit ints / clamped Int32 input
-    int64_scratch::Vector{Int64}     = Int64[]    # clamped Int64 input
     mask_kinds::Vector{UInt8}        = UInt8[]    # raw 0..3 non-finite mask
     mask_int32::Vector{Int32}        = Int32[]    # promoted-to-Int32 view of mask_kinds for ZFP
-    float32_scratch::Vector{Float32} = Float32[]  # NaN/Inf-replaced copy of a Float32 input
-    float64_scratch::Vector{Float64} = Float64[]  # NaN/Inf-replaced copy of a Float64 input
+    float32_scratch::Vector{Float32} = Float32[]  # Float32 staging/restore buffer
+    float64_scratch::Vector{Float64} = Float64[]  # Float64 staging/restore buffer
+    noise_scratch::Vector{Float64}   = Float64[]  # sampled adjacent differences for the noise estimate
+    value_scratch::Vector{Float64}   = Float64[]  # sampled values for the range estimate
 end
 
 # Info needed to rebuild a DimArray on the receiving side. Set when the input
@@ -58,23 +83,59 @@ end
     data::Vector{UInt8}
     shape::Vector{Int}
     original_eltype::DataType
-    promoted::Bool = false
     nonfinite_mask::Union{Nothing, Vector{UInt8}} = nothing
-
-    # Set when the input was outside zfp's safe integer range and was clamped
-    # to fit. Informational only — receivers see the clamped values and don't
-    # need to take any special action.
-    clamped::Bool = false
 
     # Set when the input was a DimArray; carries the dimension info needed to
     # reconstruct it after decompression (see restore_dims).
     dims::Union{DimArrayInfo, Nothing} = nothing
 end
 
-# A negative precision means "use the engine default", so callers can forward
-# a per-client setting through without resolving it themselves.
-resolve_precision(precision::Integer, ::Type{T}) where {T} =
-    precision < 0 ? default_precision(T) : Int(precision)
+# Adaptive default tolerance (negative k): quantize the robust displayed range
+# into n_levels steps, but never finer than k_noise * the per-frame noise (see
+# the constants above for the two regimes this floor serves).
+function auto_tol(noise_sigma::Float64, signal_range::Float64, n_levels::Int, k_noise::Float64)
+    return max(signal_range / n_levels, k_noise * noise_sigma)
+end
+
+# Fast, robust per-frame scale estimates from one subsampled pass over every 4th
+# element. noise_sigma is the MAD of adjacent differences (differencing high-passes
+# away the pedestal, /sqrt(2) undoes the variance doubling; 1.4826 is the Gaussian
+# factor). signal_range is the 1st-99th percentile spread of the values — the
+# robust displayed range, which unlike a central MAD tracks bimodal / HDR frames.
+# Samples touching a non-finite value are skipped.
+function estimate_scales(ws::ZfpWorkspace, arr::DenseArray{<:AbstractFloat})
+    a = vec(arr)
+    n = length(1:4:length(a) - 1)
+    resize!(ws.noise_scratch, n)
+    resize!(ws.value_scratch, n)
+    m = 0
+    @inbounds for i in 1:4:length(a) - 1
+        x = Float64(a[i])
+        d = Float64(a[i + 1]) - x
+        if isfinite(d)
+            m += 1
+            ws.noise_scratch[m] = d
+            ws.value_scratch[m] = x
+        end
+    end
+    if m < 2
+        return 0.0, 0.0
+    end
+
+    diffs = @view ws.noise_scratch[1:m]
+    med = median!(diffs)
+    @inbounds for j in eachindex(diffs)
+        diffs[j] = abs(diffs[j] - med)
+    end
+    noise_sigma = 1.4826 * median!(diffs) / sqrt(2)
+
+    vals = @view ws.value_scratch[1:m]
+    lo = partialsort!(vals, clamp(round(Int, 0.01 * (m - 1)) + 1, 1, m))
+    hi = partialsort!(vals, clamp(round(Int, 0.99 * (m - 1)) + 1, 1, m))
+    signal_range = hi - lo
+
+    return noise_sigma, signal_range
+end
 
 function should_compress(arr::AbstractArray)
     isa(arr, DenseArray) &&
@@ -88,16 +149,11 @@ should_compress(_) = false
 float_scratch(ws::ZfpWorkspace, ::Type{Float32}) = ws.float32_scratch
 float_scratch(ws::ZfpWorkspace, ::Type{Float64}) = ws.float64_scratch
 
-native_int_scratch(ws::ZfpWorkspace, ::Type{Int32}) = ws.int32_scratch
-native_int_scratch(ws::ZfpWorkspace, ::Type{Int64}) = ws.int64_scratch
-
 # Copy `src` into `dest`, replacing non-finite values with the local nanmean
 # and recording each element's kind (finite / NaN / +Inf / -Inf) into `kinds`.
 function sanitize_floats!(dest::DenseArray{T}, kinds::Vector{UInt8},
                           src::DenseArray{T}) where {T <: AbstractFloat}
     fill_value = nanmean(src)
-
-    n = length(src)
 
     for i in eachindex(src)
         x = src[i]
@@ -121,67 +177,50 @@ function compress_mask!(ws::ZfpWorkspace)
     return ws.mask_compressed
 end
 
-# Low-bit ints: promote to Int32 via the workspace scratch, then compress.
-# No non-finites possible. Promoted values fit comfortably inside zfp's safe
-# range (UInt16's full range is well below 2^30) so no clamping is needed.
-function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
-                        precision::Integer=-1) where {T <: LowBitInt}
-    precision = resolve_precision(precision, T)
-    shape = collect(size(arr))
-    resize!(ws.int32_scratch, length(arr))
-    promoted = reshape(ws.int32_scratch, size(arr))
-    zfp_promote!(promoted, arr)
-    zfp_compress!(ws.compressed, promoted; precision)
-    return CompressedArray(; data=ws.compressed, shape, original_eltype=T, promoted=true)
+# Stage an integer input as its float intermediate in the workspace scratch.
+# No non-finites are possible, so there's no mask.
+function stage_float_input(ws::ZfpWorkspace, arr::DenseArray{T}) where {T <: Integer}
+    F = zfp_float_type(T)
+    scratch = float_scratch(ws, F)
+    resize!(scratch, length(arr))
+    copyto!(scratch, arr)
+    return reshape(scratch, size(arr)), nothing
 end
 
-# Natively-supported integer types: zero-copy when all values are within
-# zfp's safe range; otherwise stage a clamped copy in the workspace scratch.
-function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
-                        precision::Integer=-1) where {T <: ZfpNativeInt}
-    precision = resolve_precision(precision, T)
-    shape = collect(size(arr))
-    mag = zfp_max_magnitude(T)
-    lo, hi = extrema(arr)
-
-    clamped = false
-    if lo < -mag || hi > mag
-        scratch = native_int_scratch(ws, T)
-        resize!(scratch, length(arr))
-        copyto!(scratch, arr)
-        clamped = zfp_clamp_int!(scratch)
-        arr = reshape(scratch, size(arr))
-    end
-
-    zfp_compress!(ws.compressed, arr; precision)
-    return CompressedArray(; data=ws.compressed, shape, original_eltype=T, clamped)
-end
-
-# Floats: zero-copy when all values are finite; otherwise sanitize into a
-# float scratch and ship the kind mask alongside.
-function compress_array(ws::ZfpWorkspace, arr::DenseArray{T};
-                        precision::Integer=-1) where {T <: ZfpFloat}
-    precision = resolve_precision(precision, T)
-    shape = collect(size(arr))
-    n = length(arr)
-
-    mask = nothing
+# Stage a float input: zero-copy when all values are finite, otherwise sanitize
+# into the float scratch and build the non-finite kind mask to ship alongside.
+function stage_float_input(ws::ZfpWorkspace, arr::DenseArray{T}) where {T <: ZfpFloat}
     if any(!isfinite, arr)
         scratch = float_scratch(ws, T)
-        resize!(scratch, n)
+        resize!(scratch, length(arr))
         sanitized = reshape(scratch, size(arr))
-        resize!(ws.mask_kinds, n)
+        resize!(ws.mask_kinds, length(arr))
         sanitize_floats!(sanitized, ws.mask_kinds, arr)
-
-        arr = sanitized
-        mask = compress_mask!(ws)
+        return sanitized, compress_mask!(ws)
+    else
+        return arr, nothing
     end
+end
 
-    zfp_compress!(ws.compressed, arr; precision)
+# Fixed-accuracy compression; k = 0 is lossless, k < 0 the adaptive default, k > 0
+# a manual override (see the k semantics up top). Integer inputs go through a
+# float intermediate (see stage_float_input) and are rounded back on decompression.
+function compress_array(ws::ZfpWorkspace, arr::DenseArray{T}; k::Real=-1) where {T <: Compressible}
+    shape = collect(size(arr))
+    src, mask = stage_float_input(ws, arr)
+
+    if k == 0
+        zfp_compress!(ws.compressed, src)  # lossless
+    else
+        noise_sigma, signal_range = estimate_scales(ws, src)
+        n_levels, k_noise = T <: Integer ? (N_LEVELS_INT, K_NOISE_INT) : (N_LEVELS_FLOAT, K_NOISE_FLOAT)
+        tol = k < 0 ? auto_tol(noise_sigma, signal_range, n_levels, k_noise) : k * noise_sigma
+        zfp_compress!(ws.compressed, src; tol)
+    end
     return CompressedArray(; data=ws.compressed, shape, original_eltype=T, nonfinite_mask=mask)
 end
 
-function compress_array(ws::ZfpWorkspace, arr::DD.AbstractDimArray; precision::Integer=-1)
+function compress_array(ws::ZfpWorkspace, arr::DD.AbstractDimArray; k::Real=-1)
     md = DD.metadata(arr)
     metadata = if md isa Dict
         md
@@ -192,13 +231,12 @@ function compress_array(ws::ZfpWorkspace, arr::DD.AbstractDimArray; precision::I
         Dict()
     end
 
-    ca = compress_array(ws, parent(arr); precision)
+    ca = compress_array(ws, parent(arr); k)
     ds = DD.dims(arr)
     info = DimArrayInfo(Symbol[DD.name(d) for d in ds],
                         Any[DD.lookup(d) for d in ds],
                         string(DD.name(arr)), metadata)
-    return CompressedArray(; ca.data, ca.shape, ca.original_eltype, ca.promoted,
-                           ca.nonfinite_mask, ca.clamped, dims=info)
+    return CompressedArray(; ca.data, ca.shape, ca.original_eltype, ca.nonfinite_mask, dims=info)
 end
 
 # Restore the non-finite values into `out` using the compressed kind mask.
@@ -241,15 +279,23 @@ function decompress_array!(ws::ZfpWorkspace, out::DenseArray{T},
         throw(DimensionMismatch("size(out) = $(size(out)), expected $(ca.shape)"))
     end
 
-    if ca.promoted
-        resize!(ws.int32_scratch, length(out))
-        intermediate = reshape(ws.int32_scratch, ca.shape...)
-        zfp_decompress!(intermediate, ca.data)
-        zfp_demote!(out, intermediate)
-    else
+    if T <: ZfpFloat
         zfp_decompress!(out, ca.data)
         if !isnothing(ca.nonfinite_mask)
             restore_nonfinite!(ws, out, ca.nonfinite_mask)
+        end
+    else
+        # Integer original: decompress the float payload, then round back into
+        # the integer type, clamping so lossy values near the type bounds don't
+        # overflow the conversion.
+        F = zfp_float_type(T)
+        scratch = float_scratch(ws, F)
+        resize!(scratch, length(out))
+        fbuf = reshape(scratch, size(out))
+        zfp_decompress!(fbuf, ca.data)
+        lo, hi = F(typemin(T)), F(typemax(T))
+        @inbounds for i in eachindex(out)
+            out[i] = round(T, clamp(fbuf[i], lo, hi))
         end
     end
     return out
