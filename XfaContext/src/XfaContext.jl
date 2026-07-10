@@ -1018,40 +1018,40 @@ end
 function stop_pipeline(ctx::ContextState; timeout=5)
     ctx.is_running[] = false
 
+    # Close every channel up front, before waiting on any task. Each stage loops
+    # `while isopen(ch) || isready(ch)`, so leaving downstream channels open
+    # would make the stages drain (process) their whole buffered backlog before
+    # exiting. With everything closed, a stage's `putall!(downstream)` throws
+    # InvalidStateException after at most one more item, so the pipeline stops
+    # promptly and any buffered items are discarded.
     for ch in values(ctx.input_channels)
         close(ch)
     end
-
-    # Close the input tasks
-    for task in values(ctx.input_tasks)
-        wait(task)
-    end
-
-    # Close the streaming input tasks
     for outputs in values(ctx.input_variable_channels)
         for channel in values(outputs)
             close(channel)
         end
     end
-    for task in values(ctx.input_variables_tasks)
-        wait(task)
-    end
-
-    # Close the external dependency tasks
     for outputs in values(ctx.external_dependency_channels)
         for channel in values(outputs)
             close(channel)
         end
     end
-    for task in values(ctx.external_dependency_tasks)
-        wait(task)
-    end
-
-    # Close the variables tasks
     for outputs in values(ctx.variable_channels)
         for channel in values(outputs)
             close(channel)
         end
+    end
+
+    # Wait for the tasks to finish, in topological order.
+    for task in values(ctx.input_tasks)
+        wait(task)
+    end
+    for task in values(ctx.input_variables_tasks)
+        wait(task)
+    end
+    for task in values(ctx.external_dependency_tasks)
+        wait(task)
     end
     for task in values(ctx.variable_tasks)
         wait(task)
