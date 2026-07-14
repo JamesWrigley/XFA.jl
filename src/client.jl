@@ -379,6 +379,8 @@ function build_context_state(state, ctx_info)
     empty!(state.client.parameter_states)
     empty!(state.client.karabo_dep_states)
     empty!(state.client.dep_text_states)
+    empty!(state.client.ne_dep_pins)
+    empty!(state.client.ne_output_pins)
     empty!(safe_input_text_cache)
 
     group_names = Set(ctx_info["groups"])
@@ -405,14 +407,20 @@ function build_context_state(state, ctx_info)
         for (arg_name, dep) in deps
             attr_id = hash("$(name).dependencies.$(arg_name => dep)")
             push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
+            if dep isa Dependency
+                state.client.ne_dep_pins[attr_id] = DepPinInfo(name, arg_name, name, dep)
+            end
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], OutputPin(hash("$(name).outputs."), ""))
+        output_id = hash("$(name).outputs.")
+        push!(ctx_state[name]["outputs"], OutputPin(output_id, ""))
+        state.client.ne_output_pins[output_id] = OutputPinInfo(name, name)
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
             subvar_id = hash("$(name).outputs.$(subvar)")
+            state.client.ne_output_pins[subvar_id] = OutputPinInfo(name, subvar)
             if subvar in pp_names
                 pp_prefix = "$(subvar)."
                 pp_params = Dict{String, Any}()
@@ -480,6 +488,11 @@ function build_context_state(state, ctx_info)
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
                 ctx_state[name]["dep_field_names"][attr_id] = field_name
                 push!(dep_param_names, field_name)
+                # The group's kwarg is what gets rewritten, not the member
+                # variable's argument.
+                if dep isa Dependency
+                    state.client.ne_dep_pins[attr_id] = DepPinInfo(name, field_name, var_name, dep)
+                end
             end
         end
 
@@ -500,11 +513,13 @@ function build_context_state(state, ctx_info)
             # The variable itself
             attr_id = hash("$(var_name).outputs.")
             push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
+            state.client.ne_output_pins[attr_id] = OutputPinInfo(var_name, var_name)
 
             # Its subvariables
             for subvar in ctx_info["subvariables"][var_name]
                 subvar_id = hash("$(var_name).outputs.$(subvar)")
                 push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
+                state.client.ne_output_pins[subvar_id] = OutputPinInfo(var_name, subvar)
             end
         end
 
@@ -636,6 +651,7 @@ function build_context_state(state, ctx_info)
 
     # Mirror the engine's parameter dict and @display map onto the client
     # context so plot overlays can look up referenced parameters by name.
+    state.client.context.dag = ctx_info["dag"]
     state.client.context.parameters = Dict{String, Parameter}(ctx_info["parameters"])
     state.client.context.displays = Dict{String, Vector{String}}(get(ctx_info, "displays", Dict{String, Vector{String}}()))
 
