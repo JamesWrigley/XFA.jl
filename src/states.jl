@@ -263,12 +263,31 @@ struct OutputPin
 end
 OutputPin(id, label) = OutputPin(id, label, false)
 
+# A dependency pin, as needed to rewrite the dependency when a link is dragged
+# onto it.
+struct DepPinInfo
+    node::String
+    arg::String
+    variable::String
+    dep::Dependency
+end
+
+# An output pin a dependency can point at
+struct OutputPinInfo
+    variable::String
+    name::String
+end
+
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     source::String = ""
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    # The engine's variable-level DAG (variable -> arg -> dependency), used to
+    # reject links that would introduce a cycle.
+    dag::Dict{String, OrderedDict} = Dict()
 
     # All parameters in the loaded context, keyed by fully-qualified name.
     # Used by plot overlays to look up @display references without walking
@@ -362,6 +381,15 @@ end
     ne_link_handles::Dict{UInt, Ptr{ne.LinkId}} = Dict{UInt, Ptr{ne.LinkId}}()
     ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
     ne_settings::String = ""
+
+    # Pin registries for link dragging, keyed by pin id. Pins that can't take part
+    # in a link (the output pins of input nodes, whose Karabo property can't be
+    # recovered from the pin) are absent from both.
+    ne_dep_pins::Dict{UInt, DepPinInfo} = Dict{UInt, DepPinInfo}()
+    ne_output_pins::Dict{UInt, OutputPinInfo} = Dict{UInt, OutputPinInfo}()
+    # Scratch handles that QueryNewLink() writes the dragged pin ids into.
+    ne_new_link_start::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
+    ne_new_link_end::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
 
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()

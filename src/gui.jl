@@ -13,7 +13,7 @@ using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At
 using DataStructures: CircularBuffer, OrderedDict
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
     ArrayMetadata, RectROI, PlotSpec, LayerSpec,
-    Scalar1dScan, positions
+    Scalar1dScan, positions, upstream_closure
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -84,6 +84,12 @@ function create_node_editor!(client)
     client.ne_editor = ne.CreateEditor(config)
     ne.Destroy(config)
     client.ne_editor_path = client.context_path
+
+    # Scratch handles for QueryNewLink(), reused across drags and editors.
+    if client.ne_new_link_start == C_NULL
+        client.ne_new_link_start = ne.PinId(0)
+        client.ne_new_link_end = ne.PinId(0)
+    end
 end
 
 # Draw a filled circle the size of a text line. The node editor has no built-in
@@ -776,6 +782,51 @@ function draw_variable(name, var_data)
     ig.PopID()
 end
 
+# Handle a link dragged between two pins. A dependency has exactly one source, so
+# accepting a link rewrites that dependency in the context source, replacing
+# whatever it was wired to before. EndCreate() must be called even when
+# BeginCreate() returns false, otherwise the editor's create action is left open.
+function handle_link_creation(client)
+    if ne.BeginCreate()
+        if ne.QueryNewLink(client.ne_new_link_start, client.ne_new_link_end)
+            start_id = ne.value(client.ne_new_link_start)
+            end_id = ne.value(client.ne_new_link_end)
+
+            # Both ids are only set once the drag hovers a second pin.
+            if start_id != 0 && end_id != 0
+                # The drag can start at either end, so normalise to (output, dep).
+                output_id, dep_id = if haskey(client.ne_dep_pins, start_id)
+                    (end_id, start_id)
+                else
+                    (start_id, end_id)
+                end
+                output = get(client.ne_output_pins, output_id, nothing)
+                dep_pin = get(client.ne_dep_pins, dep_id, nothing)
+
+                # Only the pins of input nodes are in neither registry.
+                is_input_pin(id) = !haskey(client.ne_output_pins, id) && !haskey(client.ne_dep_pins, id)
+
+                # A link must go from an output pin to a dependency pin of an editable
+                # graph, and must not close a cycle (self-links land there too).
+                acceptable = !is_input_pin(output_id) && !is_input_pin(dep_id) &&
+                    !isnothing(output) && !isnothing(dep_pin) && graph_editable(client) &&
+                    !(dep_pin.variable in upstream_closure(client.context.dag, [output.variable]))
+
+                if acceptable
+                    # AcceptNewItem() only returns true once the mouse is released.
+                    if ne.AcceptNewItem(ImVec4(0.4f0, 0.9f0, 0.4f0, 1f0), 3f0)
+                        @guiasync rename_dep(state[], dep_pin.node, dep_pin.arg,
+                                             dep_pin.dep, Dependency(output.name))
+                    end
+                else
+                    ne.RejectNewItem(ImVec4(1f0, 0.3f0, 0.3f0, 1f0), 2f0)
+                end
+            end
+        end
+    end
+    ne.EndCreate()
+end
+
 # Link color for a channel-fill ratio (load ∈ [0, 1]). Ramps from muted green
 # (empty) through orange (half-full) to bright red (at capacity). The green
 # ceiling is lowered so idle channels don't glare.
@@ -1115,6 +1166,8 @@ function draw_dag()
     end
 
     ne.End()
+    handle_link_creation(client)
+
     ig.SetFontRasterizerDensity(1f0)
     ne.SetCurrentEditor(C_NULL)
 
