@@ -180,33 +180,6 @@ function IsItemDisabled()
     return (imgui_ctx.LastItemData.ItemFlags & ig.ImGuiItemFlags_Disabled) != 0
 end
 
-@enum ElidedEditState begin
-    ElidedEditState_NoEdit
-    ElidedEditState_WantEdit
-    ElidedEditState_Edit
-end
-
-struct CompletionResult
-    items::Any
-    formatter::Function
-    renderer::Function
-    query::String
-    source::String
-end
-
-@kwdef mutable struct ElidedTextState
-    edit::ElidedEditState = ElidedEditState_NoEdit
-    selected_idx::Int = 1
-    cached_query::String = ""
-    cached_source::String = ""
-    cached_scored::Vector{Tuple{Int, Any}} = Tuple{Int, Any}[]
-    popup_rows::Int = 0
-    # Debounce for lazy channel discovery in the source autocomplete: device
-    # schemas are only fetched once the query has been stable for a short while.
-    last_query::String = ""
-    last_change_time::Float64 = 0.0
-end
-
 const elided_text_states = Dict{UInt32, ElidedTextState}()
 
 """
@@ -282,18 +255,19 @@ end
 
 
 """
-    draw_autocomplete_popup(label, query, completions, completion_text,
-                            completion_renderer) -> Union{Nothing, String}
+    draw_autocomplete_popup(label, state, ac, input_min, input_max)
+        -> (selected::Maybe{String}, hovered::Bool)
 
-Draw the autocomplete popup below the current item. Returns the selected
-completion text if one was chosen, `nothing` otherwise.
+Draw the autocomplete popup under the input whose screen-space rect is
+`input_min`/`input_max`. Returns the selected completion text if one was chosen,
+`nothing` otherwise.
 
-- `completions`: iterable of completion items (any type)
-- `completion_text(item) -> String`: extracts the text to match against and to
-  return on selection
-- `completion_renderer(item, index, is_selected)`: draws a single completion row
+Inside the node canvas the caller must defer this to `draw_dag`'s Suspend/Resume
+block via `client.completion_popup` (see `CompletionPopup`); outside it, the
+widget calls it directly.
 """
-function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionResult)
+function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionResult,
+                                 input_min::ImVec2, input_max::ImVec2)
     popup_label = "##autocomplete-$(label)"
 
     scored = if ac.query == state.cached_query && ac.source == state.cached_source && !isempty(state.cached_scored)
@@ -308,8 +282,6 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
     popup_hovered = false
 
     if !isempty(scored)
-        # Position popup below the input.
-        input_min, input_max = editor_item_rect()
         row_height = ig.GetTextLineHeightWithSpacing()
         max_rows = 8
         popup_height = min(length(scored), max_rows) * row_height + 2 * unsafe_load(ig.GetStyle().WindowPadding.y)
@@ -346,9 +318,8 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
                 end
                 ig.PopID()
             end
-
-            ig.End()
         end
+        ig.End()
     end
 
     state.selected_idx = clamp(state.selected_idx, 1, max(length(scored), 1))
@@ -364,25 +335,25 @@ function ElidedText(label::AbstractString, text::AbstractString;
                     completion_renderer::Function=default_completion_renderer,
                     callback=C_NULL, user_data=C_NULL,
                     validator=nothing)
-    id = ig.GetID(label)
-    state = get!(ElidedTextState, elided_text_states, id)
-    if focus && state.edit == ElidedEditState_NoEdit
-        state.edit = ElidedEditState_WantEdit
+    field_state = get!(ElidedTextState, elided_text_states, ig.GetID(label))
+    if focus && field_state.edit == ElidedEditState_NoEdit
+        field_state.edit = ElidedEditState_WantEdit
     end
 
     min_width = ig.CalcTextSize("m").x * 13  # minimum clickable width
 
-    if editable && state.edit != ElidedEditState_NoEdit
-        just_started = state.edit == ElidedEditState_WantEdit
+    if editable && field_state.edit != ElidedEditState_NoEdit
+        just_started = field_state.edit == ElidedEditState_WantEdit
         if just_started
             ig.SetKeyboardFocusHere()
-            state.edit = ElidedEditState_Edit
-            state.selected_idx = 1
+            field_state.edit = ElidedEditState_Edit
+            field_state.selected_idx = 1
         end
         ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
                                          callback, user_data, validator)
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
+        input_min, input_max = editor_item_rect()
 
         # Draw autocomplete popup if completions are provided
         ac_result = nothing
@@ -393,21 +364,42 @@ function ElidedText(label::AbstractString, text::AbstractString;
             else
                 CompletionResult(completions, completion_text, completion_renderer, new_text, "")
             end
-            ac_result, ac_hovered = draw_autocomplete_popup(label, state, ac)
+
+            if ne.GetCurrentEditor() == C_NULL
+                ac_result, ac_hovered = draw_autocomplete_popup(label, field_state, ac,
+                                                                input_min, input_max)
+            else
+                # Inside the node canvas the popup has to be drawn after EndNode
+                # (see CompletionPopup): pick up the previous frame's outcome, then
+                # record this frame's request for draw_dag to draw.
+                popup = state[].client.completion_popup
+                if popup.drawn_label == label
+                    popup.drawn_label = nothing
+                    ac_result = popup.result
+                    ac_hovered = popup.hovered
+                    popup.result = nothing
+                end
+
+                popup.label = label
+                popup.state = field_state
+                popup.completions = ac
+                popup.input_min = input_min
+                popup.input_max = input_max
+            end
         end
 
         if !isnothing(ac_result)
-            state.edit = ElidedEditState_NoEdit
+            field_state.edit = ElidedEditState_NoEdit
             return true, ac_result
         elseif edited
-            state.edit = ElidedEditState_NoEdit
+            field_state.edit = ElidedEditState_NoEdit
             if new_text != text && !isempty(new_text)
                 return true, new_text
             end
         elseif ig.IsKeyPressed(ig.ImGuiKey_Escape)
-            state.edit = ElidedEditState_NoEdit
+            field_state.edit = ElidedEditState_NoEdit
         elseif lost_focus && !ac_hovered
-            state.edit = ElidedEditState_NoEdit
+            field_state.edit = ElidedEditState_NoEdit
         end
     else
         elide = length(text) > max_chars
@@ -435,7 +427,7 @@ function ElidedText(label::AbstractString, text::AbstractString;
                 node_tooltip(text)
             end
             if clicked
-                state.edit = ElidedEditState_WantEdit
+                field_state.edit = ElidedEditState_WantEdit
             end
         else
             ig.Text(display_text)
@@ -1029,10 +1021,14 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
     end
 end
 
-# Draw the source completion popup: a fuzzy-matched device list with each
-# device's pipeline channels nested beneath it. Device schemas are fetched
-# lazily (only for the visible rows, and only after the query has been stable
-# for 1s) so typing doesn't flood the webproxy. Returns (selected, hovered).
+# The source string for a device, topic-qualified when its name is ambiguous.
+source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
+
+# Draw the source completion popup: a fuzzy-matched device list on the left, and
+# the selected device's pipeline channels in a column on the right (menu style,
+# so the device rows don't move as the selection does). Device schemas are
+# fetched lazily (only for the visible rows, and only after the query has been
+# stable for 1s) so typing doesn't flood the webproxy. Returns (selected, hovered).
 function draw_source_completions(popup_id, field_state::ElidedTextState, text::AbstractString,
                                  source_list::Vector{SourceInfo}, allow_slow::Bool,
                                  client::ClientState)
@@ -1044,6 +1040,7 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
     if text != field_state.last_query
         field_state.last_query = text
         field_state.last_change_time = now
+        field_state.channel_idx = 0
     end
     debounced = now - field_state.last_change_time >= 1.0
 
@@ -1053,11 +1050,75 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
     max_rows = 8
     visible = @view scored[1:min(length(scored), max_rows)]
 
+    # Menu-style navigation: Up/Down move within the current column, Right steps
+    # into the channel column and Left back out. `channel_idx == 0` means the
+    # device row itself is the current row; both indices are clamped below, once
+    # the selected device (and so its channel count) is known.
+    down = ig.IsKeyPressed(ig.ImGuiKey_DownArrow)
+    up = ig.IsKeyPressed(ig.ImGuiKey_UpArrow)
+    if field_state.channel_idx == 0
+        if down
+            field_state.selected_idx += 1
+        elseif up
+            field_state.selected_idx -= 1
+        end
+        if ig.IsKeyPressed(ig.ImGuiKey_RightArrow)
+            field_state.channel_idx = 1
+        end
+    else
+        if down
+            field_state.channel_idx += 1
+        elseif up
+            field_state.channel_idx = max(field_state.channel_idx - 1, 1)
+        end
+        if ig.IsKeyPressed(ig.ImGuiKey_LeftArrow)
+            field_state.channel_idx = 0
+        end
+    end
+    enter = ig.IsKeyPressed(ig.ImGuiKey_Tab) || ig.IsKeyPressed(ig.ImGuiKey_Enter)
+
+    # The channel column follows the selection with a frame of lag: hovering a row
+    # moves the selection only once the device list has been drawn, and the popup
+    # is sized here, before that.
+    field_state.selected_idx = clamp(field_state.selected_idx, 1, length(visible))
+    selected_dev = visible[field_state.selected_idx][2]
+    selected_props = get(client.source_properties,
+                         (selected_dev.topic, selected_dev.name), nothing)
+    channels = isnothing(selected_props) ? String[] : sort!(collect(keys(selected_props.fast)))
+    field_state.channel_idx = clamp(field_state.channel_idx, 0, length(channels))
+
+    # Both columns are sized to their longest row, and the channel column is only
+    # there when the current device actually has fast sources.
+    style = ig.GetStyle()
+    window_padding = unsafe_load(style.WindowPadding)
+    item_spacing_x = unsafe_load(style.ItemSpacing.x)
+    marker_width = ig.CalcTextSize(" > ").x
+
+    # Device row: "name (topic)" with the marker right-aligned after it.
+    device_width = marker_width + item_spacing_x + maximum(visible) do scored
+        dev = scored[2]
+        ig.CalcTextSize(dev.name).x + item_spacing_x + ig.CalcTextSize("($(dev.topic))").x
+    end
+
+    max_rows_shown = 12
+    rows = clamp(max(length(visible), length(channels) + 1), 1, max_rows_shown)
+
+    # The channel column is a bordered child, so it carries its own padding, plus
+    # a scrollbar once its channels don't all fit.
+    channel_width = 0f0
+    channel_height = 0f0
+    if !isempty(channels)
+        widest = max(ig.CalcTextSize("fast data").x,
+                     maximum(ch -> ig.CalcTextSize(":$(ch)").x, channels))
+        scrollbar = length(channels) + 1 > max_rows_shown ? unsafe_load(style.ScrollbarSize) : 0f0
+        channel_width = item_spacing_x + widest + 2 * window_padding.x + scrollbar
+        channel_height = 2 * window_padding.y
+    end
+
     input_min, input_max = editor_item_rect()
     row_height = ig.GetTextLineHeightWithSpacing()
-    popup_width = 600
-    rows = clamp(field_state.popup_rows, 1, 12)
-    popup_height = rows * row_height + 2 * unsafe_load(ig.GetStyle().WindowPadding.y)
+    popup_width = 2 * window_padding.x + device_width + channel_width
+    popup_height = rows * row_height + 2 * window_padding.y + channel_height
     ig.SetNextWindowPos(ImVec2(input_min.x, input_max.y))
     ig.SetNextWindowSize(ImVec2(popup_width, popup_height))
 
@@ -1073,92 +1134,90 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
         # Bring the popup to the front of that order (without taking keyboard
         # focus) so its rows hover/click normally.
         ig.BringWindowToDisplayFront(ig.GetCurrentWindow())
-        hovered = ig.IsWindowHovered() || ig.IsWindowFocused()
-
-        if ig.IsKeyPressed(ig.ImGuiKey_DownArrow)
-            field_state.selected_idx += 1
-        elseif ig.IsKeyPressed(ig.ImGuiKey_UpArrow)
-            field_state.selected_idx = max(field_state.selected_idx - 1, 1)
-        end
-        enter = ig.IsKeyPressed(ig.ImGuiKey_Tab) || ig.IsKeyPressed(ig.ImGuiKey_Enter)
+        hovered = ig.IsWindowHovered(ig.ImGuiHoveredFlags_ChildWindows) ||
+                  ig.IsWindowFocused(ig.ImGuiFocusedFlags_RootAndChildWindows)
 
         # Right-aligned position for the per-row spinner / fast-source marker.
-        marker_x = popup_width - 2 * unsafe_load(ig.GetStyle().WindowPadding.x) - 20
+        marker_x = device_width - marker_width
 
-        idx = 0
-        rendered_rows = 0
-        for (di, (_, dev)) in enumerate(visible)
-            key = (dev.topic, dev.name)
-            in_flight = haskey(client.device_schema_requests, key)
-            props = get(client.source_properties, key, nothing)
-            # Trigger a lazy schema fetch once the query has settled.
-            if debounced && isnothing(props) && !in_flight
-                get_source_properties(client, dev.topic, dev.name)
-            end
-            channels = isnothing(props) ? String[] : sort!(collect(keys(props.fast)))
-            has_channels = !isempty(channels)
-            base = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
-
-            # The device's own selectable row (when slow sources are allowed)
-            # takes the next index. `selected_idx` is the single notion of the
-            # current row, written by both keyboard navigation and mouse hover
-            # (below), so its channels expand however the selection was made.
-            # When slow sources aren't allowed the channels are the only choice,
-            # so show them unconditionally.
-            device_idx = idx + 1
-            expanded = has_channels && (!allow_slow || device_idx == field_state.selected_idx || length(visible) == 1)
-
-            # Device row: a slow source when allowed, else a non-selectable header.
-            if allow_slow
-                idx += 1
-                selected = idx == field_state.selected_idx
-                if ig.Selectable("$(dev.name)##dev-$idx", selected)
-                    result = base
+        if ig.BeginChild("##devices-$(popup_id)", ImVec2(device_width, 0))
+            for (idx, (_, dev)) in enumerate(visible)
+                key = (dev.topic, dev.name)
+                in_flight = haskey(client.device_schema_requests, key)
+                props = get(client.source_properties, key, nothing)
+                # Trigger a lazy schema fetch once the query has settled.
+                if debounced && isnothing(props) && !in_flight
+                    get_source_properties(client, dev.topic, dev.name)
                 end
+                has_channels = !isnothing(props) && !isempty(props.fast)
+
+                # A device row is a slow source when those are allowed; otherwise
+                # picking it just steps into its channels, which are the only
+                # valid choice.
+                current = idx == field_state.selected_idx && field_state.channel_idx == 0
+                picked = ig.Selectable("$(dev.name)##dev-$idx", current)
                 if ig.IsItemHovered()
                     field_state.selected_idx = idx
+                    field_state.channel_idx = 0
+                end
+                if current && enter
+                    picked = true
+                end
+                if picked
+                    if allow_slow
+                        result = source_base(dev)
+                    elseif has_channels
+                        field_state.channel_idx = 1
+                    end
                 end
                 ig.SameLine()
                 ig.TextDisabled("($(dev.topic))")
-                if selected && enter
-                    result = base
-                end
-            else
-                ig.TextDisabled("$(dev.name)  ($(dev.topic))")
-            end
-            # Right-aligned marker: a spinner while the schema loads, then a '+'
-            # for devices that turned out to have fast sources.
-            if in_flight
-                ig.SameLine(marker_x)
-                Spinner()
-            elseif has_channels && allow_slow
-                ig.SameLine(marker_x)
-                ig.TextDisabled("+")
-            end
-            rendered_rows += 1
 
-            # Channel children (only when expanded). A channel is only visible
-            # while its device is the current row, so hovering one keeps that
-            # device selected rather than collapsing the list under the mouse.
-            if expanded
-                for ch in channels
-                    idx += 1
-                    selected = idx == field_state.selected_idx
-                    fast_source = "$(base):$(ch)"
-                    ig.Indent()
-                    if ig.Selectable(":$(ch)##ch-$idx", selected)
-                        result = fast_source
-                    end
-                    if ig.IsItemHovered()
-                        field_state.selected_idx = device_idx
-                    end
-                    ig.Unindent()
+                # Right-aligned marker: a spinner while the schema loads, then a
+                # '>' for devices that turned out to have fast sources.
+                if in_flight
+                    ig.SameLine(marker_x)
+                    Spinner()
+                elseif has_channels
+                    ig.SameLine(marker_x)
+                    ig.TextDisabled(">")
                 end
-                rendered_rows += length(channels)
             end
         end
-        field_state.selected_idx = clamp(field_state.selected_idx, 1, max(idx, 1))
-        field_state.popup_rows = rendered_rows
+        ig.EndChild()
+
+        # The channel column of the selected device, drawn only when it has any.
+        # A lighter background and a rounded border set it apart from the device
+        # list as its own menu.
+        if !isempty(channels)
+            ig.SameLine()
+            ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.GetColorU32(ig.ImGuiCol_MenuBarBg))
+            ig.PushStyleVar(ig.ImGuiStyleVar_ChildRounding, unsafe_load(style.PopupRounding))
+            if ig.BeginChild("##channels-$(popup_id)", ImVec2(0, 0), ig.ImGuiChildFlags_Borders)
+                ig.TextDisabled("fast data")
+                for (ci, ch) in enumerate(channels)
+                    current = ci == field_state.channel_idx
+                    picked = ig.Selectable(":$(ch)##ch-$ci", current)
+                    if current && enter
+                        picked = true
+                    end
+                    if picked
+                        result = "$(source_base(selected_dev)):$(ch)"
+                    end
+                    if ig.IsItemHovered()
+                        field_state.channel_idx = ci
+                    end
+                    # Keep the keyboard selection in view when the channel list
+                    # is long enough to scroll.
+                    if current && (down || up)
+                        ig.SetScrollHereY()
+                    end
+                end
+            end
+            ig.EndChild()
+            ig.PopStyleVar()
+            ig.PopStyleColor()
+        end
     end
     ig.End()
 
@@ -1197,6 +1256,7 @@ function karabo_property_field(dep_state::KaraboDepTextState, client::ClientStat
     ig.SetNextItemWidth(-1)
     _, new_text = SafeInputText("##$(popup_id)"; current_text=dep_state.property)
     dep_state.property = new_text
+    input_min, input_max = editor_item_rect()
     if ig.IsItemActive()
         field_state.edit = ElidedEditState_Edit
     end
@@ -1204,7 +1264,8 @@ function karabo_property_field(dep_state::KaraboDepTextState, client::ClientStat
     if field_state.edit != ElidedEditState_NoEdit && !isempty(names)
         ac = CompletionResult(names, identity, property_completion_renderer, new_text,
                               "karabo-prop:$(dep_state.source)")
-        result, hovered = draw_autocomplete_popup(popup_id, field_state, ac)
+        result, hovered = draw_autocomplete_popup(popup_id, field_state, ac,
+                                                  input_min, input_max)
         dep_state.ac_hovered |= hovered
         dep_state.ac_active = true
         if !ig.IsItemActive() && !hovered

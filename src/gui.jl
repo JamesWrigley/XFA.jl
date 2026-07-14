@@ -1155,6 +1155,20 @@ function draw_dag()
             popup.label = nothing
         end
     end
+
+    # The autocomplete popup of the ElidedText being edited, if any. The request is
+    # re-recorded every frame the widget is edited, so consuming it here also stops
+    # the popup once editing ends.
+    completions = client.completion_popup
+    if !isnothing(completions.label)
+        result, hovered = draw_autocomplete_popup(completions.label, completions.state,
+                                                  completions.completions,
+                                                  completions.input_min, completions.input_max)
+        completions.drawn_label = completions.label
+        completions.result = result
+        completions.hovered = hovered
+        completions.label = nothing
+    end
     ne.Resume()
 
     channel_stats = context.channel_stats

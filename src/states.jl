@@ -117,6 +117,58 @@ end
     result_index::Cint = 0
 end
 
+@enum ElidedEditState begin
+    ElidedEditState_NoEdit
+    ElidedEditState_WantEdit
+    ElidedEditState_Edit
+end
+
+struct CompletionResult
+    items::Any
+    formatter::Function
+    renderer::Function
+    query::String
+    source::String
+end
+
+@kwdef mutable struct ElidedTextState
+    edit::ElidedEditState = ElidedEditState_NoEdit
+    selected_idx::Int = 1
+    cached_query::String = ""
+    cached_source::String = ""
+    cached_scored::Vector{Tuple{Int, Any}} = Tuple{Int, Any}[]
+    # Source autocomplete only: the row in the channel column of the currently
+    # selected device, or 0 when the device row itself is the current row.
+    channel_idx::Int = 0
+    # Debounce for lazy channel discovery in the source autocomplete: device
+    # schemas are only fetched once the query has been stable for a short while.
+    last_query::String = ""
+    last_change_time::Float64 = 0.0
+end
+
+# An autocomplete popup deferred out of the node canvas, like CopyableComboPopup.
+# While the canvas is drawing it rewrites the ImGui viewport into canvas-local
+# coordinates, and Begin() clips every window against that viewport, so a popup
+# positioned in screen space is clipped away to nothing (it is still begun, just
+# invisible). Widgets inside the canvas record the request here instead, and
+# draw_dag draws it after EndNode under Suspend/Resume.
+@kwdef mutable struct CompletionPopup
+    # The active request; label is nothing when no widget is completing. It is
+    # re-recorded every frame the widget is being edited, and consumed by the
+    # deferred draw.
+    label::Maybe{String} = nothing
+    state::Maybe{ElidedTextState} = nothing
+    completions::Maybe{CompletionResult} = nothing
+    # Screen-space rect of the input, to hang the popup under.
+    input_min::ImVec2 = ImVec2(0, 0)
+    input_max::ImVec2 = ImVec2(0, 0)
+    # The deferred draw's outcome, keyed by the label it was drawn for and held
+    # until that widget picks it up next frame.
+    drawn_label::Maybe{String} = nothing
+    result::Maybe{String} = nothing
+    hovered::Bool = false
+end
+
 abstract type AbstractParameterState end
 
 mutable struct OptionalDimsState <: AbstractParameterState
@@ -428,6 +480,7 @@ end
     karabo_editor::Maybe{KaraboDepTextState} = nothing
     # CopyableCombo dropdown deferred out of the node canvas. Only one is open at a time.
     combo_popup::CopyableComboPopup = CopyableComboPopup()
+    completion_popup::CompletionPopup = CompletionPopup()
     # Variable names available for autocompletion (including subvariable outputs)
     variable_names::Vector{String} = String[]
     source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
