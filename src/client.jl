@@ -860,6 +860,21 @@ function find_parameter_owner(client, param_name::String)
     return nothing
 end
 
+# Flatten the sources of all the inputs into a single sorted list for
+# autocompletion, marking the sources whose name is served by more than one
+# topic as ambiguous so that they're completed topic-qualified.
+function build_source_list(sources)
+    topics = Dict{String, Set{String}}()
+    for source in sources
+        push!(get!(Set{String}, topics, source.name), source.topic)
+    end
+
+    source_list = [SourceInfo(source.topic, source.name, source.class_id,
+                              length(topics[source.name]) > 1)
+                   for source in unique(sources)]
+    return sort!(source_list; by=source -> source.name)
+end
+
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
     client = state.client
 
@@ -869,39 +884,21 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
 
-    elseif msg isa Devices
-        if msg.device_names isa ExceptionMessage
-            @error "Error from server with DEVICES" exception=msg.device_names.text
-            log_engine_error(state, "Failed to get devices", msg.device_names.text)
-            client.webproxy_status = RequestStatus_Error
+    elseif msg isa InputSources
+        if msg.input_sources isa ExceptionMessage
+            @error "Error from server with INPUTSOURCES" exception=msg.input_sources.text
+            log_engine_error(state, "Failed to get the input sources", msg.input_sources.text)
         else
-            client.karabo_devices = msg.device_names
-            client.device_tree = sort(
-                [(topic, sort([(name, sort(collect(info); by=first))
-                               for (name, info) in devices]; by=first))
-                 for (topic, devices) in msg.device_names]; by=first)
-            all_names = [name for (_, devices) in client.device_tree for (name, _) in devices]
-            seen = Set{String}()
-            ambiguous = Set{String}()
-            for name in all_names
-                if name in seen
-                    push!(ambiguous, name)
-                else
-                    push!(seen, name)
-                end
-            end
-            client.source_list = [SourceInfo((topic, name, name in ambiguous))
-                                  for (topic, devices) in client.device_tree
-                                  for (name, _) in devices]
+            client.source_list = build_source_list(Iterators.flatten(values(msg.input_sources)))
+
             sources_by_topic = Dict{String, Vector{SourceInfo}}()
-            for s in client.source_list
-                if !haskey(sources_by_topic, s.topic)
-                    sources_by_topic[s.topic] = SourceInfo[]
+            for source in client.source_list
+                if !haskey(sources_by_topic, source.topic)
+                    sources_by_topic[source.topic] = SourceInfo[]
                 end
-                push!(sources_by_topic[s.topic], s)
+                push!(sources_by_topic[source.topic], source)
             end
             client.sources_by_topic = sources_by_topic
-            client.webproxy_status = RequestStatus_Idle
         end
 
     elseif msg isa EngineDir
@@ -921,6 +918,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             trainmatchers[topic] = names
         end
         client.trainmatchers = trainmatchers
+        client.trainmatcher_sources = build_source_list(
+            [SourceInfo(topic, name, "TrainMatcher")
+             for (topic, names) in trainmatchers for name in names])
         client.whitelisted_trainmatchers = whitelisted
         client.trainmatchers_request_status = RequestStatus_Idle
 
@@ -944,6 +944,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.source = msg.source
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
+            # The new context has its own inputs, so the sources we complete
+            # against have changed.
+            get_input_sources(client)
         else
             @error "Context failed to load"
             log_engine_error(state, "Context failed to load", msg.info.text)
@@ -985,6 +988,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                     end
                 end
             end
+        end
+
+        # An input's trainmatcher moved, so it's serving a different set of
+        # sources now.
+        if param.value isa KaraboDevice
+            get_input_sources(client)
         end
 
         if client.pending_parameter_change == param.name
@@ -1057,7 +1066,7 @@ function handle_server(state)
 
                 client.status = RemoteStatus_Connected
                 send(client, GetEngineDir())
-                get_devices(client)
+                get_input_sources(client)
                 get_trainmatchers(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
@@ -1129,8 +1138,8 @@ function handle_server(state)
     end
 end
 
-function get_devices(client)
-    client.devices_request = send(client, GetDevices())
+function get_input_sources(client)
+    send(client, GetInputSources())
 end
 
 function get_trainmatchers(client)
@@ -1144,25 +1153,20 @@ function get_routing_rules(client)
 end
 
 # Returns (topic, device, classId) for the device referenced by `source`, or
-# ("", device, "") if the device isn't in the loaded topology.
+# ("", device, "") if the device isn't reported by any input.
 function source_device_info(client::ClientState, source::String)
     sep = find_separator(source)
     head = isnothing(sep) ? source : source[1:sep-1]
     topic_hint, device = split_topic(head)
-    if !isempty(topic_hint)
-        devices = get(client.karabo_devices, topic_hint, nothing)
-        if !isnothing(devices) && haskey(devices, device)
-            return topic_hint, device, get(devices[device], "classId", "")
-        else
-            return topic_hint, device, ""
-        end
+
+    idx = findfirst(client.source_list) do known
+        known.name == device && (isempty(topic_hint) || known.topic == topic_hint)
+    end
+    if isnothing(idx)
+        return topic_hint, device, ""
     else
-        for (topic, devices) in client.karabo_devices
-            if haskey(devices, device)
-                return topic, device, get(devices[device], "classId", "")
-            end
-        end
-        return "", device, ""
+        known = client.source_list[idx]
+        return known.topic, device, known.class_id
     end
 end
 

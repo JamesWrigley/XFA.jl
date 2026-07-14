@@ -154,12 +154,9 @@ end
             Protocol.client_send(ws, Protocol.Ping())
             @test Protocol.receive(ws).msg isa Protocol.Pong
 
-            # Test GetDevices
-            webproxy_port = XfaEngine.getavailableport(8484)
-            mock_webproxy(webproxy_port) do
-                Protocol.client_send(ws, Protocol.GetDevices())
-                @test Protocol.receive(ws).msg isa Protocol.Devices
-            end
+            # Test GetInputSources
+            Protocol.client_send(ws, Protocol.GetInputSources())
+            @test Protocol.receive(ws).msg isa Protocol.InputSources
 
             # Test LoadContext
             mktemp() do path, io
@@ -527,7 +524,7 @@ end
 
         ctx = Context.load_from_string("""
         bridge = KaraboInput(; trainmatcher=KaraboDevice("localhost//MATCHER"))
-        bridge._mock_sources = String[]
+        bridge._mock_sources = SourceInfo[]
 
         @Variable foo -> karabo"foo.x"
         """; prelude=KARABO_PRELUDE)
@@ -590,10 +587,10 @@ end
             # karabo"foo.bar" the source is "foo", not "foo.bar").
             ctx_src = """
             bridge_a = KaraboInput(; trainmatcher=KaraboDevice("T1//DEV_A"))
-            bridge_a._mock_sources = String[]
+            bridge_a._mock_sources = SourceInfo[]
 
             bridge_b = KaraboInput(; trainmatcher=KaraboDevice("T2//DEV_B"))
-            bridge_b._mock_sources = String[]
+            bridge_b._mock_sources = SourceInfo[]
 
             @Variable foo -> karabo"foo.bar"
             @Variable special -> karabo"T1//special.src"
@@ -628,10 +625,10 @@ end
             # topics have devices with the same name.
             same_name_src = raw"""
             bridge_a = KaraboInput(; trainmatcher=KaraboDevice("T1//DEV"))
-            bridge_a._mock_sources = String[]
+            bridge_a._mock_sources = SourceInfo[]
 
             bridge_b = KaraboInput(; trainmatcher=KaraboDevice("T2//DEV"))
-            bridge_b._mock_sources = String[]
+            bridge_b._mock_sources = SourceInfo[]
 
             @Variable foo -> karabo"foo.bar"
             """
@@ -655,7 +652,7 @@ end
 
         ctx = Context.load_from_string("""
         bridge = KaraboInput(; trainmatcher=KaraboDevice("MATCHER"), sources=["foo.x"])
-        bridge._mock_sources = String[]
+        bridge._mock_sources = SourceInfo[]
         bridge.manual_configuration[] = true
         bridge.address[] = "$(address)"
 
@@ -780,7 +777,7 @@ end
         using Main.PostprocessorLibrary: TestWindow
 
         bridge = KaraboInput(; trainmatcher=KaraboDevice(""))
-        bridge._mock_sources = String[]
+        bridge._mock_sources = SourceInfo[]
 
         period = Parameter(2π)
         roi = Parameter(Context.RectROI())

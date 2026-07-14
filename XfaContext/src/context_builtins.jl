@@ -7,6 +7,18 @@ struct KaraboDevice
     name::String
 end
 
+# A source reported by an input (see get_sources()). `ambiguous` is a GUI-only
+# field set by the client when the same source name is available in more than
+# one topic.
+struct SourceInfo
+    topic::String
+    name::String
+    class_id::String
+    ambiguous::Bool
+end
+
+SourceInfo(topic, name, class_id) = SourceInfo(topic, name, class_id, false)
+
 # Parse a KaraboDevice from a string, which may contain a topic prefix
 # (e.g. "TOPIC//device_name").
 function KaraboDevice(str::AbstractString)

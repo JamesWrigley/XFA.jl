@@ -11,7 +11,7 @@ import ImGuiNodeEditor as ne
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
-using XfaContext: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
+using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
     ArrayMetadata, RectROI, PlotSpec, LayerSpec,
     Scalar1dScan, positions
 include("plotting.jl")
@@ -346,13 +346,13 @@ function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     device = param.value
     text = "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     client.source_list, client; device_only=true)
+                                     client.trainmatcher_sources, client; device_only=true)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
-            idx = findfirst(s -> s.name == new_device.name, client.source_list)
+            idx = findfirst(s -> s.name == new_device.name, client.trainmatcher_sources)
             if !isnothing(idx)
-                new_device = KaraboDevice(client.source_list[idx].topic, new_device.name)
+                new_device = KaraboDevice(client.trainmatcher_sources[idx].topic, new_device.name)
             end
         end
         return true, new_device
@@ -471,37 +471,6 @@ function clear_variables()
 
     for plot in client.plots
         clear_plot(plot)
-    end
-end
-
-function draw_device_tree(device_tree)
-    if isempty(device_tree)
-        ig.TextDisabled("No devices loaded")
-        return
-    end
-
-    n_devices = sum(length(devs) for (_, devs) in device_tree)
-    n_topics = length(device_tree)
-    if ig.TreeNode("Devices ($n_devices across $n_topics topics)##device-tree")
-        for (topic, devices) in device_tree
-            if ig.TreeNode("$topic ($(length(devices)))##topic-$topic")
-                for (name, info_pairs) in devices
-                    class_id_pair = findfirst(p -> p.first == "classId", info_pairs)
-                    class_id = isnothing(class_id_pair) ? "" : info_pairs[class_id_pair].second
-                    if ig.TreeNode("$name##dev-$name")
-                        for (key, value) in info_pairs
-                            ig.Text("$key: $value")
-                        end
-                        ig.TreePop()
-                    else
-                        ig.SameLine()
-                        ig.TextDisabled(class_id)
-                    end
-                end
-                ig.TreePop()
-            end
-        end
-        ig.TreePop()
     end
 end
 
@@ -1651,16 +1620,6 @@ function draw_gui()
                 ig.Dummy(0, 10)
 
                 draw_routing_rules()
-
-                ig.Dummy(0, 10)
-
-                @Disabled is_pending(client, client.devices_request) begin
-                    if ig.Button("Get devices")
-                        get_devices(client)
-                    end
-
-                    draw_device_tree(client.device_tree)
-                end
             end
         end
 

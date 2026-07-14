@@ -21,7 +21,7 @@
 
     # Internal field for testing: when set, get_sources() returns this
     # instead of querying the WebProxy.
-    _mock_sources::Union{Vector{String}, Nothing} = nothing
+    _mock_sources::Union{Vector{SourceInfo}, Nothing} = nothing
 end
 
 Context.input_topic(bridge::KaraboInput) = let t = bridge.trainmatcher[].topic; isempty(t) ? nothing : t end
@@ -36,16 +36,17 @@ function Context.get_sources(bridge::KaraboInput)
 
     if isnothing(current_engine_state)
         @warn "Engine is not initialized, skipping source discovery for KaraboInput"
-        return String[]
+        return SourceInfo[]
     end
 
+    topic = bridge.trainmatcher[].topic
     try
         wp = get_webproxy(bridge.trainmatcher[])
         devices = get_devices(wp)
-        return collect(keys(devices))
+        return [SourceInfo(topic, name, info["classId"]) for (name, info) in devices]
     catch ex
         @error "Failed to get sources from KaraboInput" exception=(ex, catch_backtrace())
-        return String[]
+        return SourceInfo[]
     end
 end
 

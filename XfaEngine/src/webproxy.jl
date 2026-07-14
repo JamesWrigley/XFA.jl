@@ -126,19 +126,6 @@ function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     return devices
 end
 
-function get_all_devices(webproxies; classId=nothing)
-    devices = Dict{String, Dict{String, Any}}()
-    for (topic, wp) in webproxies
-        try
-            devices[topic] = get_devices(wp; classId)
-        catch ex
-            @error "Error when getting devices for $(topic)" exception=(ex, catch_backtrace())
-        end
-    end
-
-    return devices
-end
-
 # This takes in a dict from topic to webproxy
 function get_all_trainmatchers(webproxies::Dict)
     trainmatchers = Dict{String, Vector{Tuple{String, Bool}}}()

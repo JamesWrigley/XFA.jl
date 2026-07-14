@@ -1,6 +1,6 @@
 module XfaContext
 
-export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice,
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
     RectROI, Context
@@ -73,8 +73,8 @@ input_topic(::Any) = nothing
 # rules against the input), or nothing if the input isn't device-backed.
 input_device(::Any) = nothing
 
-# Returns the sources available from an input group
-get_sources(::Any) = String[]
+# Returns the sources available from an input group, as SourceInfo's
+get_sources(::Any) = SourceInfo[]
 # For variable references (@Variable name -> MyLib.func), returns the
 # original function. Used to exclude origin functions from the context
 # when they are already represented by a reference wrapper.
@@ -138,7 +138,7 @@ end
     prelude::Vector{Expr} = Expr[]
     input_channels::Dict{String, Channel} = Dict()
     input_tasks::Dict{String, Task} = Dict()
-    available_sources::Base.Lockable{Dict{String, Vector{String}}, ReentrantLock} = Base.Lockable(Dict{String, Vector{String}}())
+    available_sources::Base.Lockable{Dict{String, Vector{SourceInfo}}, ReentrantLock} = Base.Lockable(Dict{String, Vector{SourceInfo}}())
 
     dep_to_input::Dict{String, String} = Dict()
 
@@ -257,7 +257,7 @@ function build_dep_routing(ctx::ContextState, dep_router=Returns(nothing))
         end
 
         for source in get_sources(group)
-            source_map[source] = input_name
+            source_map[source.name] = input_name
         end
     end
 
