@@ -14,7 +14,7 @@ using ImGuiTestEngine
 import ImGuiTestEngine as te
 import CImGui as ig
 using XFA.XfaEngine.Context: Dependency, DepKind_Karabo, DepKind_Variable, DepKind_Subvariable,
-    karabo_dependency, @karabo_str
+    karabo_dependency, @karabo_str, SourceInfo
 
 # Set up the backend for CImGui
 import GLFW
@@ -455,28 +455,28 @@ end
 end
 
 @testset "Dependency completions" begin
-    SI = XFA.SourceInfo
-    source_list = SI[SI(("MID", "MID_DET/CAM/1", true)),
-                     SI(("MID", "MID_EXP/MOTOR/1", false)),
-                     SI(("SA2", "SA2_XTD1_XGM/XGM/DOOCS", false)),
-                     SI(("SA2", "MID_DET/CAM/1", true))]
+    SI(topic, name, ambiguous) = SourceInfo(topic, name, "", ambiguous)
+    source_list = [SI("MID", "MID_DET/CAM/1", true),
+                   SI("MID", "MID_EXP/MOTOR/1", false),
+                   SI("SA2", "SA2_XTD1_XGM/XGM/DOOCS", false),
+                   SI("SA2", "MID_DET/CAM/1", true)]
     empty_props = XFA.DeviceProperties()
 
     # Without topic prefix, unique names are bare
     items, fmt, query = XFA.dep_completions("MID_EXP", -1, source_list, empty_props)
     @test items === source_list
     @test query == "MID_EXP"
-    @test fmt(SI(("MID", "MID_EXP/MOTOR/1", false))) == "MID_EXP/MOTOR/1"
+    @test fmt(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
 
     # Without topic prefix, ambiguous names get TOPIC// prefix
-    @test fmt(SI(("MID", "MID_DET/CAM/1", true))) == "MID//MID_DET/CAM/1"
-    @test fmt(SI(("SA2", "MID_DET/CAM/1", true))) == "SA2//MID_DET/CAM/1"
+    @test fmt(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
+    @test fmt(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
 
     # With topic prefix, only devices in that topic are returned
     items, fmt, query = XFA.dep_completions("MID//DET", -1, source_list, empty_props)
     @test all(s -> s.topic == "MID", items)
     @test query == "DET"
-    @test fmt(SI(("MID", "MID_DET/CAM/1", true))) == "MID//MID_DET/CAM/1"
+    @test fmt(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
 
     # Slow property completion
     slow = XFA.PropertyList(["pos", "velocity"], String[], String[], String[])
@@ -489,9 +489,8 @@ end
 
 @testset "remap_source" begin
     client = XFA.ClientState()
-    client.karabo_devices = Dict{String, Dict{String, Any}}(
-        "MID" => Dict{String, Any}("camera" => Dict("classId" => "AravisBaslerCamera"),
-                                   "motor"  => Dict("classId" => "Motor")))
+    client.source_list = [SourceInfo("MID", "camera", "AravisBaslerCamera"),
+                          SourceInfo("MID", "motor", "Motor")]
 
     camera_rule = XFA.RemapRule(XFA.RemapKind_Simple,
                                 raw"^(.*):output\[data\.image\.pixels\]$",

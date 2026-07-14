@@ -28,8 +28,6 @@ end
     PipelineStatus_Stopped
 end
 
-const SourceInfo = @NamedTuple{topic::String, name::String, ambiguous::Bool}
-
 struct PropertyList
     names::Vector{String}
     displayed_names::Vector{String}
@@ -349,7 +347,6 @@ end
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
 
-    webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
@@ -368,6 +365,9 @@ end
 
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
+    # The trainmatchers as a source list, which is what Parameter{KaraboDevice}
+    # (i.e. an input's trainmatcher) is completed against.
+    trainmatcher_sources::Vector{SourceInfo} = SourceInfo[]
     whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     routing_rules::Vector{RoutingRule} = RoutingRule[]
@@ -379,13 +379,9 @@ end
     remap_rules::Vector{RemapRule} = RemapRule[]
     # Per-row source-autocomplete state for the rules table, keyed by row index.
     routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
-    karabo_devices::Dict{String, Dict{String, Any}} = Dict()
-    devices_request::Maybe{Int} = nothing
-    # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
-    device_tree::Vector{Tuple{String, Vector{Tuple{String, Vector{Pair{String, Any}}}}}} = []
-    # Flat list of sources for autocompletion. Sources include both devices and
-    # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
-    # indicates that the source name appears in more than one topic.
+    # The sources reported by the inputs of the loaded context, sorted by name
+    # and flattened across the inputs. This is the only source list the GUI
+    # completes Karabo dependencies against.
     source_list::Vector{SourceInfo} = SourceInfo[]
     # source_list grouped by topic. Rebuilt alongside source_list so the routing
     # rules table can look up its per-topic source list without rescanning.

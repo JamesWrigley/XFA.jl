@@ -333,18 +333,20 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             end
         end
 
-    elseif msg isa GetDevices
+    elseif msg isa GetInputSources
         try
-            devices = if isnothing(msg.topic)
-                get_all_devices(state.webproxies)
-            else
-                Dict(msg.topic => get_devices(state.webproxies[msg.topic]))
+            input_sources = Dict{String, Vector{SourceInfo}}()
+            for input_name in keys(state.ctx.inputs)
+                group = Context.get_input_group(state.ctx, input_name)
+                if !isnothing(group)
+                    input_sources[input_name] = Context.get_sources(group)
+                end
             end
-            Protocol.server_send(ws, Devices(devices); reply_to)
-            @info "Responded to 'GetDevices' from $(id)"
+            Protocol.server_send(ws, InputSources(input_sources); reply_to)
+            @info "Responded to 'GetInputSources' from $(id)"
         catch ex
-            @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Devices(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+            @error "Error in 'GetInputSources', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, InputSources(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
 
     elseif msg isa GetDeviceSchema

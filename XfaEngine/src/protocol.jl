@@ -1,7 +1,7 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
+    GetTrainmatchers, GetInputSources, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
@@ -11,7 +11,7 @@ export AbstractMessage, Ping, Shutdown,
     ChangeParameter, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
-    Started, Stopped, Devices,
+    Started, Stopped, InputSources,
     ContextInfo, ParameterChanged, TrainData, RemoteReplState,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
@@ -20,7 +20,7 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import XfaContext
-using XfaContext: ContextState, VariableData, Parameter
+using XfaContext: ContextState, VariableData, Parameter, SourceInfo
 using ..XfaEngine: RoutingRule, RemapRule
 
 
@@ -42,11 +42,6 @@ ExceptionMessage(ex::Exception) = ExceptionMessage(sprint(showerror, ex))
 # Messages that a client can send
 struct Ping <: AbstractMessage end
 struct Shutdown <: AbstractMessage end
-
-struct GetDevices <: AbstractMessage
-    topic::Union{String, Nothing}
-end
-GetDevices() = GetDevices(nothing)
 
 struct GetDeviceSchema <: AbstractMessage
     topic::String
@@ -100,6 +95,8 @@ end
 
 struct GetTrainmatchers <: AbstractMessage end
 
+struct GetInputSources <: AbstractMessage end
+
 struct GetEngineDir <: AbstractMessage end
 
 # Messages that the server can send
@@ -124,8 +121,9 @@ end
 struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
 
-struct Devices <: AbstractMessage
-    device_names::Union{Dict{String, Dict{String, Any}}, ExceptionMessage}
+# The sources reported by each input of the loaded context, keyed by input name.
+struct InputSources <: AbstractMessage
+    input_sources::Union{Dict{String, Vector{SourceInfo}}, ExceptionMessage}
 end
 
 struct DeviceSchema <: AbstractMessage
