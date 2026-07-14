@@ -295,6 +295,11 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
                 ig.ImGuiWindowFlags_NoSavedSettings | ig.ImGuiWindowFlags_Tooltip
 
         if ig.Begin(popup_label, C_NULL, flags)
+            # The editor window is focused, so it sits ahead of this never-focused
+            # popup in the hit-test order and would steal hover where they overlap.
+            # Bring the popup to the front of that order (without taking keyboard
+            # focus) so its rows hover/click normally.
+            ig.BringWindowToDisplayFront(ig.GetCurrentWindow())
             popup_hovered = ig.IsWindowHovered() || ig.IsWindowFocused()
 
             # Keyboard navigation
