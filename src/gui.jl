@@ -92,14 +92,11 @@ function create_node_editor!(client)
     end
 end
 
-# Draw a filled circle the size of a text line. The node editor has no built-in
-# pin shapes, so we draw the marker imnodes used to draw automatically.
-function draw_pin_icon()
-    sz = ig.GetTextLineHeight()
-    p = ig.GetCursorScreenPos()
-    ig.AddCircleFilled(ig.GetWindowDrawList(), (p.x + sz * 0.5f0, p.y + sz * 0.5f0),
-                       sz * 0.35f0, IM_COL32(204, 204, 204, 255))
-    ig.Dummy(sz, sz)
+# The graph can only be edited while the pipeline is idle or fully running,
+# anything else means the engine is busy and would reject an edit.
+function graph_editable(client)
+    return client.context.pipeline_status in (PipelineStatus_Stopped, PipelineStatus_Started) &&
+           isnothing(client.pending_parameter_change)
 end
 
 # Draw a pin marker. The pivot anchors the link to the left edge of input rows and
@@ -108,7 +105,15 @@ function draw_pin(client, id, kind)
     pivot = kind == ne.PinKind_Input ? ImVec2(0f0, 0.5f0) : ImVec2(1f0, 0.5f0)
     ne.PushStyleVar(ne.StyleVar_PivotAlignment, pivot)
     ne.BeginPin(pin_handle(client, id), kind)
-    draw_pin_icon()
+
+    # Get the alpha from the current style so we respect the current disabled state
+    alpha = graph_editable(client) ? 1f0 : unsafe_load(ig.GetStyle().DisabledAlpha)
+    sz = ig.GetTextLineHeight()
+    p = ig.GetCursorScreenPos()
+    ig.AddCircleFilled(ig.GetWindowDrawList(), (p.x + sz * 0.5f0, p.y + sz * 0.5f0),
+                       sz * 0.35f0, IM_COL32(204, 204, 204, round(Int, 255 * alpha)))
+    ig.Dummy(sz, sz)
+
     ne.EndPin()
     ne.PopStyleVar()
 end
@@ -547,9 +552,7 @@ function draw_variable(name, var_data)
     content_measured = Float32(min_node_width)
     content_width = get(client.ne_node_content_widths, var_data["id"], Float32(min_node_width))
 
-    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started) ||
-                   !isnothing(client.pending_parameter_change)
-    @Disabled disable_node begin
+    @Disabled !graph_editable(client) begin
         # Draw the titlebar at a fixed 1.5x canvas size (1.5*current_scale() keeps
         # the local size constant across zoom) so it doesn't grow the node's
         # canvas-space width when zoomed out and strand the right-aligned pins.
@@ -1165,8 +1168,8 @@ function draw_dag()
         end
     end
 
-    ne.End()
     handle_link_creation(client)
+    ne.End()
 
     ig.SetFontRasterizerDensity(1f0)
     ne.SetCurrentEditor(C_NULL)
