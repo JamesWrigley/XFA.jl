@@ -1242,7 +1242,7 @@ function karabo_property_field(dep_state::KaraboDepTextState, client::ClientStat
     # focus the field so a replacement can be typed. Deferred until the schema
     # arrives so a property that is still valid is kept.
     if dep_state.revalidate_property && source_schema_loaded(client, dep_state.source)
-        if dep_state.property ∉ names
+        if !karabo_property_valid(client, dep_state.source, dep_state.property, names)
             dep_state.property = ""
             dep_state.property_focus = true
         end

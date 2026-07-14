@@ -1257,6 +1257,37 @@ function remap_source(client::ClientState, source::String, property_ref::Ref{Any
     return source, nothing
 end
 
+# Whether `property` is usable with `source`, given the device's schema property
+# `names`. A property is valid if it's in the schema, or if it's what a schema
+# property becomes once the remap rules run: committed sources store the
+# remapped form (a camera's `data.image.pixels` is saved as `data.image.data`),
+# which never appears in the schema itself.
+function karabo_property_valid(client::ClientState, source::AbstractString, property::AbstractString, names)
+    if property in names
+        return true
+    end
+
+    topic, device, device_class = source_device_info(client, source)
+    rules = filter(rule -> rule.kind == RemapKind_Simple, client.remap_rules)
+    target = karabo_dep_string(nothing, source, property)
+
+    for name in names
+        remapped = karabo_dep_string(nothing, source, name)
+        for rule in rules
+            result, _ = apply_remap_rule(client, rule, remapped, topic, device, device_class,
+                                         Ref{Any}(nothing))
+            if !isnothing(result)
+                remapped = result
+            end
+        end
+        if remapped == target
+            return true
+        end
+    end
+
+    return false
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))
