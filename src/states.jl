@@ -125,7 +125,6 @@ end
 
 struct CompletionResult
     items::Any
-    formatter::Function
     renderer::Function
     query::String
     source::String
