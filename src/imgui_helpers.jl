@@ -246,15 +246,6 @@ function fuzzy_match(query::AbstractString, completions::AbstractVector, complet
 end
 
 """
-Default completion renderer: just renders the text of the completion as a
-Selectable.
-"""
-function default_completion_renderer(completion, idx, is_selected)
-    ig.Selectable(completion, is_selected)
-end
-
-
-"""
     draw_autocomplete_popup(label, state, ac, input_min, input_max)
         -> (selected::Maybe{String}, hovered::Bool)
 
@@ -275,7 +266,7 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
     else
         state.cached_query = ac.query
         state.cached_source = ac.source
-        state.cached_scored = fuzzy_match(ac.query, ac.items, ac.formatter)
+        state.cached_scored = fuzzy_match(ac.query, ac.items, identity)
     end
 
     result = nothing
@@ -311,15 +302,14 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
 
             for (i, (_, item)) in enumerate(scored)
                 is_selected = (i == state.selected_idx)
-                formatted = ac.formatter(item)
                 ig.PushID(i)
                 ig.SetNextItemAllowOverlap()
                 if ac.renderer(item, i, is_selected)
-                    result = formatted
+                    result = item
                 end
-                RowCopyButton("ac-$i", formatted, popup_width)
+                RowCopyButton("ac-$i", item, popup_width)
                 if is_selected && (ig.IsKeyPressed(ig.ImGuiKey_Tab) || ig.IsKeyPressed(ig.ImGuiKey_Enter))
-                    result = formatted
+                    result = item
                 end
                 ig.PopID()
             end
@@ -336,8 +326,6 @@ function ElidedText(label::AbstractString, text::AbstractString;
                     max_chars::Int=30, editable::Bool=false,
                     focus::Bool=false,
                     completions=nothing,
-                    completion_text::Function=string,
-                    completion_renderer::Function=default_completion_renderer,
                     callback=C_NULL, user_data=C_NULL,
                     validator=nothing)
     field_state = get!(ElidedTextState, elided_text_states, ig.GetID(label))
@@ -363,12 +351,9 @@ function ElidedText(label::AbstractString, text::AbstractString;
         # Draw autocomplete popup if completions are provided
         ac_result = nothing
         ac_hovered = false
+        ac_showing = false
         if !isnothing(completions)
-            ac = if completions isa Base.Callable
-                completions(new_text)
-            else
-                CompletionResult(completions, completion_text, completion_renderer, new_text, "")
-            end
+            ac = completions(new_text)
 
             if ne.GetCurrentEditor() == C_NULL
                 ac_result, ac_hovered = draw_autocomplete_popup(label, field_state, ac,
@@ -390,12 +375,20 @@ function ElidedText(label::AbstractString, text::AbstractString;
                 popup.completions = ac
                 popup.input_min = input_min
                 popup.input_max = input_max
+
+                # The deferred popup handles Enter a frame late, so the input's own
+                # Enter-commit is held while it has rows, else the raw text commits first.
+                ac_showing = !isempty(field_state.cached_scored)
             end
         end
 
         if !isnothing(ac_result)
             field_state.edit = ElidedEditState_NoEdit
             return true, ac_result
+        elseif edited && ac_showing
+            # Enter went to the deferred popup, which also deactivates the input; keep
+            # the edit alive so next frame picks up the popup's selection (mirrors how
+            # ac_hovered holds it open for a row click).
         elseif edited
             field_state.edit = ElidedEditState_NoEdit
             if new_text != text && !isempty(new_text)
@@ -613,8 +606,8 @@ function draw_combo_popup(popup_id, items, min_width)
     return result
 end
 
-function property_completion_renderer(item, i, selected)
-    clicked = ig.Selectable("##prop-$i", selected)
+function completion_renderer(item, i, selected)
+    clicked = ig.Selectable("##completion", selected)
     ig.SameLine(0, 0)
     ig.Text(item)
     return clicked
@@ -704,6 +697,21 @@ function compose_karabo_source(dep_state::KaraboDepTextState)
     return karabo_dep_string(nothing, dep_state.source, dep_state.property, proxy)
 end
 
+# Run the remap for a composed source `raw`; returns the resolved source, or
+# nothing if it parked an async device-property lookup (recorded on dep_state)
+# for a later frame to pick up.
+function resolve_remap!(dep_state::KaraboDepTextState, client::ClientState, raw)
+    new_source, pending = remap_source(client, raw, dep_state.proxy_property)
+    if isnothing(pending)
+        dep_state.proxy_property[] = nothing
+        new_source
+    else
+        dep_state.pending_remap_id = pending
+        dep_state.pending_remap_source = raw
+        nothing
+    end
+end
+
 """
     KaraboDepText(label, text, dep_state, source_list, client)
         -> (edited::Bool, new_text::String)
@@ -728,18 +736,13 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
     # show a disabled spinner placeholder until the request lands.
     if !isnothing(dep_state.pending_remap_id)
         if !is_pending(client, dep_state.pending_remap_id)
-            pending_source = dep_state.pending_remap_source
+            raw = dep_state.pending_remap_source
             dep_state.pending_remap_id = nothing
             dep_state.pending_remap_source = nothing
-            new_source, pending = remap_source(client, pending_source, dep_state.proxy_property)
-
-            if isnothing(pending)
-                dep_state.proxy_property[] = nothing
-                return true, new_source
+            resolved = resolve_remap!(dep_state, client, raw)
+            if !isnothing(resolved)
+                return true, resolved
             end
-
-            dep_state.pending_remap_id = pending
-            dep_state.pending_remap_source = pending_source
         end
         @Disabled true ig.Text(@something(dep_state.pending_remap_source, ""))
         ig.SameLine()
@@ -754,14 +757,12 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
         if device_only
             return true, raw
         end
-        new_source, pending = remap_source(client, raw, dep_state.proxy_property)
-        if !isnothing(pending)
-            dep_state.pending_remap_id = pending
-            dep_state.pending_remap_source = raw
+        resolved = resolve_remap!(dep_state, client, raw)
+        if isnothing(resolved)
             return false, text
+        else
+            return true, resolved
         end
-        dep_state.proxy_property[] = nothing
-        return true, new_source
     end
 
     # Read-only, clickable display of the current value.
@@ -1267,7 +1268,7 @@ function karabo_property_field(dep_state::KaraboDepTextState, client::ClientStat
     end
 
     if field_state.edit != ElidedEditState_NoEdit && !isempty(names)
-        ac = CompletionResult(names, identity, property_completion_renderer, new_text,
+        ac = CompletionResult(names, completion_renderer, new_text,
                               "karabo-prop:$(dep_state.source)")
         result, hovered = draw_autocomplete_popup(popup_id, field_state, ac,
                                                   input_min, input_max)
@@ -1333,13 +1334,6 @@ function karabo_proxy_field(dep_state::KaraboDepTextState, client::ClientState)
     end
 end
 
-function variable_completion_renderer(item, i, selected)
-    clicked = ig.Selectable("##var-$i", selected)
-    ig.SameLine(0, 0)
-    ig.Text(item)
-    return clicked
-end
-
 # Draw a dependency editor widget with a type selector (Karabo/Variable) and
 # autocomplete text field. Returns (edited::Bool, new_dep::Dependency) where
 # new_dep is the updated dependency if edited.
@@ -1383,7 +1377,7 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
             completions=input -> begin
                 prefix = variable_name * "."
                 filtered = filter(v -> v != variable_name && !startswith(v, prefix), variable_names)
-                CompletionResult(filtered, identity, variable_completion_renderer, input, "variable")
+                CompletionResult(filtered, completion_renderer, input, "variable")
             end)
         if edited && !isempty(new_text)
             return true, Dependency(new_text)
