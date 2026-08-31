@@ -64,6 +64,19 @@ end
     (w::TestWindow)(data) = data[1:min(end, w.size[])]
 end
 
+# A registered @Input group for the available_variables test.
+module InputLibrary
+    using XfaContext
+
+    @Group struct TestSource
+        rate::Parameter{Int} = 10
+    end
+
+    @Input function test_stream(::TestSource, output)
+        return nothing
+    end
+end
+
 @testset "CircularChannel" begin
     # Basic FIFO behaviour when within capacity
     c = CircularChannel{Int}(3)
@@ -336,6 +349,35 @@ end
         """)
         @test Set(keys(ctx.functions)) == Set(["my_norm", "foo"])
     end
+end
+
+@testset "available_variables" begin
+    by_name = Dict(s.name => s for s in Context.available_variables())
+
+    # A registered @Variable, with its arg dependency and subvariables.
+    normalize = by_name["normalize"]
+    @test normalize.kind == Context.VariableKind_Variable
+    @test normalize.origin == "Main.VariableLibrary.normalize"
+    @test normalize.dependencies["data"].kind == DepKind_Karabo
+    @test by_name["with_subvar"].subvariables == ["with_subvar.half"]
+
+    # A builtin @Group, with its Parameter fields and their defaults captured
+    # (non-Parameter fields like `histogram` are excluded).
+    correlation = by_name["Correlation"]
+    @test correlation.kind == Context.VariableKind_Group
+    @test correlation.group_parameters[:x] isa Parameter{Dependency}
+    @test correlation.group_parameters[:buffer_size].value == 10_000
+    @test !haskey(correlation.group_parameters, :histogram)
+    # Handlers are stripped for wire safety.
+    @test isnothing(correlation.group_parameters[:buffer_size].update_handler)
+
+    # A @Group backing an @Input is reported as an input, not a plain group.
+    testsource = by_name["TestSource"]
+    @test testsource.kind == Context.VariableKind_Input
+    @test haskey(testsource.group_parameters, :rate)
+
+    # Group members (variables and inputs) aren't listed on their own.
+    @test !haskey(by_name, "correlate") && !haskey(by_name, "test_stream")
 end
 
 @testset "@postprocess" begin

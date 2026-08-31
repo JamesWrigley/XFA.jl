@@ -32,13 +32,12 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
+ImGuiNodeEditor = {path = "/home/james/.julia/dev/ImGuiNodeEditor"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
-ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
-ImGuiNodeEditor = {rev = "master", url = "https://github.com/JuliaImGui/ImGuiNodeEditor.jl.git"}
 
 [compat]
-CImGui = "8"
+CImGui = "9"
 CRC32c = "1"
 CurveFit = "1.9.1"
 DataStructures = "0.19"
@@ -57,4 +56,5 @@ Revise = "3"
 SpecialFunctions = "2.7.2"
 Statistics = "1.11.1"
 TOML = "1"
+ZfpCompression = "0.2.5"
 julia = "1.11"

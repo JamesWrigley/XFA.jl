@@ -381,6 +381,7 @@ function build_context_state(state, ctx_info)
     empty!(state.client.dep_text_states)
     empty!(state.client.ne_dep_pins)
     empty!(state.client.ne_output_pins)
+    empty!(state.client.pending_nodes)
     empty!(safe_input_text_cache)
 
     group_names = Set(ctx_info["groups"])
@@ -920,6 +921,14 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa EngineDir
         client.remote_engine_dir = msg.path
 
+    elseif msg isa AvailableVariables
+        if msg.variables isa ExceptionMessage
+            @error "Error from server with AvailableVariables" exception=msg.variables.text
+            log_engine_error(state, "Failed to get the available variables", msg.variables.text)
+        else
+            client.available_variables = msg.variables
+        end
+
     elseif msg isa AvailableTrainmatchers
         trainmatchers = Dict{String, Vector{String}}()
         whitelisted = Set{KaraboDevice}()
@@ -963,6 +972,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             # The new context has its own inputs, so the sources we complete
             # against have changed.
             get_input_sources(client)
+            # A newly loaded context may pull in packages that register more
+            # variables, so refresh the add-variable palette.
+            get_available_variables(client)
         else
             @error "Context failed to load"
             log_engine_error(state, "Context failed to load", msg.info.text)
@@ -1083,6 +1095,7 @@ function handle_server(state)
                 client.status = RemoteStatus_Connected
                 send(client, GetEngineDir())
                 get_input_sources(client)
+                get_available_variables(client)
                 get_trainmatchers(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
@@ -1156,6 +1169,10 @@ end
 
 function get_input_sources(client)
     send(client, GetInputSources())
+end
+
+function get_available_variables(client)
+    send(client, GetVariables())
 end
 
 function get_trainmatchers(client)

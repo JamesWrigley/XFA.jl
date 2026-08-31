@@ -179,8 +179,17 @@ end
 # slots that don't take arguments, which reply with null).
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)
     url = wp.address * "/devices/$(device)/slot/$(slot).json"
-    body = params isa Dict ? JSON.json(params) : params
-    res = HTTP.put(url, nothing, body; connect_timeout=timeout, read_idle_timeout=timeout,
+    # The webproxy rejects the arguments with a 422 unless they're explicitly
+    # marked as JSON.
+    local body, headers
+    if params isa Dict
+        body = JSON.json(params)
+        headers = ["Content-Type" => "application/json"]
+    else
+        body = params
+        headers = nothing
+    end
+    res = HTTP.put(url, headers, body; connect_timeout=timeout, read_idle_timeout=timeout,
                    retry_non_idempotent=true, retry_bucket=false)
     response = JSON.parse(res.body, Dict{String, Any})
     if !response["success"]

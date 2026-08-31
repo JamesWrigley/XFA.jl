@@ -397,6 +397,24 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
     active::Bool = true
 end
 
+# A not-yet-committed node being assembled in the add-variable flow. It's drawn
+# as a real node in the main dag-editor (via the shared draw_variable machinery)
+# but held here rather than in the context's ctx_state, so its edits stay local
+# until the user commits and the source is written. `id` is a synthetic node id
+# (unique per pending node, unrelated to any real variable) that all its derived
+# pin/attr ids key off. `dep_values` maps each of the spec's dependency args to
+# the dependency the user has wired it to.
+@kwdef mutable struct PendingNode
+    id::UInt
+    spec::VariableSpec
+    name::String
+    dep_values::OrderedDict{String, Dependency} = OrderedDict{String, Dependency}()
+    param_values::OrderedDict{Symbol, Parameter} = OrderedDict{Symbol, Parameter}()
+    # The var_data dict built for this node this frame (see spec_to_var_data),
+    # rebuilt each frame from the fields above.
+    var_data::Dict{String, Any} = Dict{String, Any}()
+end
+
 @kwdef mutable struct ClientState
     client_id::String = ""
     worker_info::Dict = Dict()
@@ -425,6 +443,12 @@ end
     context_path_valid::Bool = true
     context::ContextState = ContextState()
 
+    available_variables::Vector{VariableSpec} = VariableSpec[]
+    # Nodes being assembled in the add-variable flow, not yet written to source.
+    pending_nodes::Vector{PendingNode} = PendingNode[]
+    # Monotonic counter for minting unique pending-node ids.
+    pending_node_counter::UInt = 0
+
     ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     ne_editor_path::String = ""
     ne_node_handles::Dict{UInt, Ptr{ne.NodeId}} = Dict{UInt, Ptr{ne.NodeId}}()
@@ -438,6 +462,10 @@ end
     # recovered from the pin) are absent from both.
     ne_dep_pins::Dict{UInt, DepPinInfo} = Dict{UInt, DepPinInfo}()
     ne_output_pins::Dict{UInt, OutputPinInfo} = Dict{UInt, OutputPinInfo}()
+    # Dep pins belonging to pending nodes, keyed by pin id -> (node id, arg name).
+    # A link accepted onto one of these updates the pending node's dep locally
+    # instead of rewriting source. Rebuilt each frame from the pending nodes.
+    pending_dep_pins::Dict{UInt, Tuple{UInt, String}} = Dict{UInt, Tuple{UInt, String}}()
     # Scratch handles that QueryNewLink() writes the dragged pin ids into.
     ne_new_link_start::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
     ne_new_link_end::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
