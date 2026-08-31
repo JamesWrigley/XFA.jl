@@ -15,6 +15,7 @@ import ImGuiTestEngine as te
 import CImGui as ig
 using XFA.XfaEngine.Context: Dependency, DepKind_Karabo, DepKind_Variable, DepKind_Subvariable,
     karabo_dependency, @karabo_str, SourceInfo
+using XfaContext: XfaContext as Context
 
 # Set up the backend for CImGui
 import GLFW
@@ -319,6 +320,26 @@ end
         @Variable baz -> karabo"A/B.prop"
         @Variable bar -> karabo"C/D.prop"
         """
+
+        # A group/input is defined by assignment, not a @Variable, and its
+        # references inside variables are renamed along with it
+        source = """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+        @Variable function bar(y -> my_group.thing)
+            return y
+        end
+        """
+        @test XFA.replace_variable_name(source, "my_group", "baz") == """
+        baz = MyGroup(; x=karabo"A/B.prop")
+        @Variable function bar(y -> baz.thing)
+            return y
+        end
+        """
+
+        # Unknown names still warn and change nothing
+        @test_logs (:warn, r"No occurrences") begin
+            @test XFA.replace_variable_name(source, "nonexistent", "baz") == source
+        end
     end
 
     @testset "Set bridge address" begin
@@ -452,6 +473,149 @@ end
         my_group = MyGroup(; label="with \\"quotes\\" and \\\\ slash")
         """
     end
+
+    @testset "Add variable" begin
+        variable_spec(origin) = Context.VariableSpec("scan", Context.VariableKind_Variable, origin,
+                                                     Context.OrderedDict{String, Dependency}(),
+                                                     String[], String[],
+                                                     Context.OrderedDict{Symbol, Context.Parameter}())
+        group_spec(origin, params) = Context.VariableSpec("MyGroup", Context.VariableKind_Group,
+                                                          origin,
+                                                          Context.OrderedDict{String, Dependency}(),
+                                                          String[], String[], params)
+        # Adds to whatever `source` currently holds
+        add(spec, name; deps=Context.OrderedDict{String, Dependency}(),
+            params=Context.OrderedDict{Symbol, Context.Parameter}()) =
+            XFA.add_variable_source(source, spec, name, deps, params)
+
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        """
+
+        # A variable's wired deps become overrides on the origin reference; Karabo,
+        # variable and subvariable deps each get their own source form.
+        deps = Context.OrderedDict("x" => karabo"C/D.prop",
+                                   "y" => Dependency("foo"),
+                                   "z" => Context.subvariable_dependency("foo", "mean"))
+        @test add(variable_spec("XfaContext.scan"), "my_scan"; deps) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan(x -> karabo"C/D.prop", y -> foo, z -> foo.mean)
+        """
+
+        # Unwired and group deps are left off, so a bare reference is emitted
+        deps = Context.OrderedDict("x" => Dependency(""),
+                                   "group" => Context.group_dependency(Context.RectROI))
+        @test add(variable_spec("XfaContext.scan"), "my_scan"; deps) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan
+        """
+
+        # An origin from a module that isn't in scope gets an import, inserted
+        # after the last existing one. XfaContext is always in scope, so it doesn't.
+        source = """
+        using XfaContext: Dependency
+        import Foo
+
+        @Variable foo -> karabo"A/B.prop"
+        """
+        @test add(variable_spec("XfaEngine.scan"), "my_scan") == """
+        using XfaContext: Dependency
+        import Foo
+        using XfaEngine: XfaEngine
+
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaEngine.scan
+        """
+        @test add(variable_spec("XfaContext.scan"), "my_scan") == """
+        using XfaContext: Dependency
+        import Foo
+
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan
+        """
+
+        # `using X: X`, `import X` and `using X` bind X, `using X: name` doesn't
+        for stmt in ("using Foo: Foo", "import Foo", "using Foo")
+            @test XFA.ensure_import("$(stmt)\n", "Foo.bar") == "$(stmt)\n"
+        end
+        @test XFA.ensure_import("using Foo: bar\n", "Foo.bar") == "using Foo: bar\nusing Foo: Foo\n"
+        @test XFA.ensure_import("x = 1\n", "Foo.bar") == "using Foo: Foo\n\nx = 1\n"
+
+        # Groups become a constructor call; only wired deps and parameters edited
+        # away from the spec's default are passed as kwargs.
+        params = Context.OrderedDict(:threshold => Context.Parameter(800.0),
+                                     :label => Context.Parameter("old"))
+        spec = group_spec("MyLib.MyGroup", params)
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        """
+        @test add(spec, "my_group";
+                  deps=Context.OrderedDict("x" => karabo"C/D.prop", "y" => Dependency("foo")),
+                  params=Context.OrderedDict(:threshold => Context.Parameter(900.0),
+                                             :label => Context.Parameter("old"))) == """
+        using MyLib: MyLib
+
+        @Variable foo -> karabo"A/B.prop"
+
+        my_group = MyLib.MyGroup(; x=karabo"C/D.prop", y=Dependency("foo"), threshold=900.0)
+        """
+
+        # A group with nothing wired or edited falls back to the constructor defaults
+        @test add(spec, "my_group"; params=deepcopy(params)) == """
+        using MyLib: MyLib
+
+        @Variable foo -> karabo"A/B.prop"
+
+        my_group = MyLib.MyGroup()
+        """
+
+        # An edited parameter whose value has no source representation is an error
+        unwritable = Context.OrderedDict(:threshold => Context.Parameter(800.0),
+                                         :label => Context.Parameter(Context.KaraboDevice("MID", "A/B/C")))
+        @test_throws "Cannot represent parameter 'label'" add(spec, "my_group"; params=unwritable)
+    end
+
+    @testset "Remove variable" begin
+        # Every definition form is removed whole, and the surviving neighbours
+        # keep a blank line between them
+        source = """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "foo") == """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "my_group") == """
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "bar") == """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+        """
+
+        # Removing the only declaration empties the file
+        @test XFA.remove_variable_source("@Variable bar -> karabo\"C/D.prop\"\n", "bar") == ""
+
+        @test_throws "Could not find a definition for 'nonexistent'" XFA.remove_variable_source(source, "nonexistent")
+    end
 end
 
 @testset "Dependency completions" begin
@@ -460,31 +624,46 @@ end
                    SI("MID", "MID_EXP/MOTOR/1", false),
                    SI("SA2", "SA2_XTD1_XGM/XGM/DOOCS", false),
                    SI("SA2", "MID_DET/CAM/1", true)]
-    empty_props = XFA.DeviceProperties()
 
-    # Without topic prefix, unique names are bare
-    items, fmt, query = XFA.dep_completions("MID_EXP", -1, source_list, empty_props)
-    @test items === source_list
-    @test query == "MID_EXP"
-    @test fmt(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
+    # A device is inserted bare when its name is unique, and topic-qualified
+    # when the same name exists under more than one topic.
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
+    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
 
-    # Without topic prefix, ambiguous names get TOPIC// prefix
-    @test fmt(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
-    @test fmt(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
+    # A "TOPIC//" prefix splits off as the fixed topic, leaving the fuzzy query
+    @test XFA.split_topic("MID//DET") == ("MID", "DET")
+    @test XFA.split_topic("MID_EXP") == ("", "MID_EXP")
 
-    # With topic prefix, only devices in that topic are returned
-    items, fmt, query = XFA.dep_completions("MID//DET", -1, source_list, empty_props)
+    # The topic prefix restricts the device list to that topic
+    topic_fixed, query = XFA.split_topic("MID//DET")
+    items = filter(s -> s.topic == topic_fixed, source_list)
     @test all(s -> s.topic == "MID", items)
-    @test query == "DET"
-    @test fmt(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
+    # The substring match outranks the (fuzzy) MID_EXP/MOTOR/1 d-e-t match
+    @test first(XFA.fuzzy_match(query, items, s -> s.name))[2].name == "MID_DET/CAM/1"
 
-    # Slow property completion
-    slow = XFA.PropertyList(["pos", "velocity"], String[], String[], String[])
-    props = XFA.DeviceProperties(slow, Dict{String, XFA.PropertyList}())
-    items, fmt, query = XFA.dep_completions("MID_EXP/MOTOR/1.vel", 100, source_list, props)
-    @test items == ["pos", "velocity"]
-    @test query == "vel"
-    @test fmt("pos") == "MID_EXP/MOTOR/1.pos"
+    # A channel suffix isn't part of the device being completed
+    @test XFA.strip_channel("MID_DET/CAM/1:daqOutput") == "MID_DET/CAM/1"
+    @test XFA.source_channel("MID_DET/CAM/1:daqOutput") == "daqOutput"
+    @test XFA.strip_channel("MID_EXP/MOTOR/1") == "MID_EXP/MOTOR/1"
+    @test XFA.source_channel("MID_EXP/MOTOR/1") == ""
+
+    # Property completions come from the cached device schema
+    props(names) = XFA.PropertyList(names, String[], String[], String[])
+    client = XFA.ClientState()
+    client.source_list = source_list
+    client.source_properties[("MID", "MID_EXP/MOTOR/1")] =
+        XFA.DeviceProperties(props(["pos", "velocity"]), Dict("daqOutput" => props(["data.image"])))
+
+    # A bare device completes against its slow properties, but only where slow
+    # sources are allowed; a device:channel completes against its fast data paths
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1", true) == ["pos", "velocity"]
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1", false) == String[]
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1:daqOutput", false) == ["data.image"]
+
+    # Unknown devices and channels complete to nothing
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1:nope", true) == String[]
+    @test XFA.property_completions(client, "GHOST/DEV/1", true) == String[]
 end
 
 @testset "remap_source" begin

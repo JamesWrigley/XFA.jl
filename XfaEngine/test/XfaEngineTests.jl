@@ -25,7 +25,7 @@ using XfaEngine: XfaEngine as engine
 using XfaContext: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    XfaContextException, Parameter, FunctionArgument, KaraboDevice, CircularChannel, drop_count,
+    XfaContextException, Parameter, KaraboDevice, CircularChannel, drop_count,
     PlotSpec, LayerSpec
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
@@ -157,6 +157,15 @@ end
             # Test GetInputSources
             Protocol.client_send(ws, Protocol.GetInputSources())
             @test Protocol.receive(ws).msg isa Protocol.InputSources
+
+            # Test GetVariables: the engine reports its registered @Variable's,
+            # @Group's, and @Input's, including the KaraboInput input group.
+            Protocol.client_send(ws, Protocol.GetVariables())
+            vars_msg = Protocol.receive(ws).msg
+            @test vars_msg isa Protocol.AvailableVariables
+            by_name = Dict(s.name => s for s in vars_msg.variables)
+            @test by_name["KaraboInput"].kind == Context.VariableKind_Input
+            @test by_name["Correlation"].kind == Context.VariableKind_Group
 
             # Test LoadContext
             mktemp() do path, io

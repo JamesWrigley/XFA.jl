@@ -30,7 +30,6 @@ ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
 XfaContext = {path = "../XfaContext"}
-ZfpCompression = {rev = "promotion", url = "https://github.com/JamesWrigley/ZfpCompression.jl"}
 
 [compat]
 Accessors = "0.1.44"

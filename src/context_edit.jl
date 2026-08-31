@@ -22,8 +22,10 @@ end
     replace_variable_name(source, old_name, new_name) -> String
 
 Rename a variable in the context source code. Replaces the variable's definition
-name and all references to it in other @Variable definitions. Returns the
-modified source, or the original source unchanged if the variable was not found.
+name and all references to it in other @Variable definitions. A group/input,
+whose definition is a `name = Constructor(...)` assignment rather than a
+@Variable, is renamed by its assignment name. Returns the modified source, or
+the original source unchanged if the variable was not found.
 """
 function replace_variable_name(source::String, old_name::String, new_name::String)
     tree = parseall(SyntaxNode, source; ignore_errors=true)
@@ -40,6 +42,13 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
         append!(targets, find_nodes(vm) do node
             is_leaf(node) && kind(node) == K"Identifier" && node.val == Symbol(old_name)
         end)
+    end
+
+    # Groups and inputs are defined by assignment, so they have no @Variable to
+    # rename; the references above still cover uses inside other variables.
+    assign_node = find_assignment_call(tree, old_name)
+    if !isnothing(assign_node)
+        push!(targets, children(assign_node)[1])
     end
 
     if isempty(targets)
@@ -385,6 +394,152 @@ function replace_group_dep(source::String, group_name::String,
                            kwarg_name::String, new_dep::Dependency)
     replace_constructor_kwarg(source, group_name, kwarg_name,
                               parameter_dep_to_source(new_dep))
+end
+
+# Whether a `using`/`import` statement brings the name `mod` itself into scope.
+# `using Mod`, `import Mod` and `using X: Mod` do, `using Mod: name` doesn't.
+function binds_module(node::SyntaxNode, mod::String)
+    sym = Symbol(mod)
+
+    # The name bound by an importpath is its last component (`using A.B` binds B).
+    binds(n) = if kind(n) == K"importpath"
+        cs = children(n)
+        !isnothing(cs) && !isempty(cs) && last(cs).val == sym
+    elseif kind(n) == K"as"
+        cs = children(n)
+        is_leaf(cs[2]) && cs[2].val == sym
+    else
+        false
+    end
+
+    for c in children(node)
+        if kind(c) == K":"
+            # `using X: a, b` — only the imported names are bound, not X itself
+            if any(binds, children(c)[2:end])
+                return true
+            end
+        elseif binds(c)
+            return true
+        end
+    end
+
+    return false
+end
+
+# Inject a `using <Module>: <Module>` for the top-level module of a
+# module-qualified `origin` (e.g. "XfaEngine.KaraboInput") unless the source
+# already brings that module into scope. Bare origins need no import, and every
+# context module already imports XfaContext (see load_from_string).
+function ensure_import(source::String, origin::String)
+    parts = split(origin, ".")
+    if length(parts) < 2 || parts[1] == "XfaContext"
+        return source
+    end
+    mod = String(parts[1])
+
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    imports = find_nodes(n -> kind(n) in (K"using", K"import"), tree)
+    if any(n -> binds_module(n, mod), imports)
+        return source
+    end
+
+    stmt = "using $(mod): $(mod)"
+    if isempty(imports)
+        return stmt * "\n\n" * source
+    else
+        # find_nodes walks in document order, so the last match is the last import.
+        pos = last(byte_range(last(imports)))
+        return source[1:pos] * "\n" * stmt * source[pos+1:end]
+    end
+end
+
+# Source for a new variable: a @Variable reference to the origin function, with
+# each wired dependency passed as an override. Group deps are skipped since the
+# origin's own definition supplies them.
+function variable_source(spec::VariableSpec, name::String, dep_values)
+    overrides = ["$(arg) -> $(dep_to_source(dep))" for (arg, dep) in dep_values
+                 if dep.kind != DepKind_Group && !isempty(dep.name)]
+
+    if isempty(overrides)
+        "@Variable $(name) -> $(spec.origin)"
+    else
+        "@Variable $(name) -> $(spec.origin)($(join(overrides, ", ")))"
+    end
+end
+
+# Source for a new group/input: a constructor call assigned to `name`. Only
+# wired dependencies and parameters edited away from the spec's defaults are
+# passed as kwargs, the rest are left to the constructor's own defaults.
+function group_source(spec::VariableSpec, name::String, dep_values, param_values)
+    kwargs = String[]
+
+    for (field, dep) in dep_values
+        if !isempty(dep.name)
+            push!(kwargs, "$(field)=$(parameter_dep_to_source(dep))")
+        end
+    end
+
+    for (field, param) in param_values
+        if isequal(param.value, spec.group_parameters[field].value)
+            continue
+        end
+
+        value = format_param_value(param.value)
+        if isnothing(value)
+            throw(ArgumentError("Cannot represent parameter '$(field)' of '$(name)' " *
+                                "(a $(typeof(param.value))) in the context file"))
+        end
+        push!(kwargs, "$(field)=$(value)")
+    end
+
+    if isempty(kwargs)
+        "$(name) = $(spec.origin)()"
+    else
+        "$(name) = $(spec.origin)(; $(join(kwargs, ", ")))"
+    end
+end
+
+# Append a definition for a new variable/group/input built from `spec` to the
+# context source, injecting an import for its origin module if needed.
+function add_variable_source(source::String, spec::VariableSpec, name::String,
+                             dep_values, param_values)
+    decl = if spec.kind == VariableKind_Variable
+        variable_source(spec, name, dep_values)
+    else
+        group_source(spec, name, dep_values, param_values)
+    end
+
+    return rstrip(ensure_import(source, spec.origin)) * "\n\n" * decl * "\n"
+end
+
+# Delete a variable's definition from the context source: the @Variable
+# macrocall, or the `name = Constructor(...)` assignment of a group/input. The
+# whole line(s) go, leaving the neighbouring declarations separated by a blank
+# line. References to the variable elsewhere are left alone.
+function remove_variable_source(source::String, name::String)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+
+    node = find_variable_node(tree, name)
+    if isnothing(node)
+        node = find_assignment_call(tree, name)
+    end
+    if isnothing(node)
+        throw(ArgumentError("Could not find a definition for '$(name)' in the context file"))
+    end
+
+    br = byte_range(node)
+    line_start = something(findprev('\n', source, first(br)), 0) + 1
+    line_end = something(findnext('\n', source, last(br)), lastindex(source))
+
+    before = rstrip(source[1:line_start-1], '\n')
+    after = lstrip(source[line_end+1:end], '\n')
+    if isempty(before)
+        return after
+    elseif isempty(after)
+        return before * "\n"
+    else
+        return before * "\n\n" * after
+    end
 end
 
 set_group_param(state, var_name::String, kwarg_name::String, new_value::String; reload::Bool=true) =

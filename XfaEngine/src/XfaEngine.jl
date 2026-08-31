@@ -367,6 +367,16 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
     elseif msg isa GetEngineDir
         Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
 
+    elseif msg isa GetVariables
+        try
+            variables = Context.available_variables()
+            Protocol.server_send(ws, AvailableVariables(variables); reply_to)
+            @info "Responded to 'GetVariables' from $(id)" n=length(variables)
+        catch ex
+            @error "Error in 'GetVariables', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, AvailableVariables(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
+
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
         Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)

@@ -51,7 +51,7 @@ Base.string(dep::Dependency) = dep.name
 Dependency(name::String) = Dependency(kind=DepKind_Variable, name=name)
 
 # Subvariable dependency
-subvariable_dependency(parent::String, name::String) = Dependency(kind=DepKind_Subvariable, name="$parent.$name", parent=parent)
+subvariable_dependency(parent::AbstractString, name::AbstractString) = Dependency(kind=DepKind_Subvariable, name="$parent.$name", parent=parent)
 
 # Group dependency
 group_dependency(type::DataType) = Dependency(kind=DepKind_Group, name="", group_type=type)
@@ -67,6 +67,77 @@ function group_parameter_dependency(group_type::AbstractString, parameter::Abstr
                name="$group_type.$parameter",
                group_type_name=group_type,
                parameter=parameter)
+end
+
+@kwdef mutable struct Parameter{T}
+    name::String = ""
+    value::Union{T, Nothing} = nothing
+    set_by_user::Bool = false
+
+    update_handler::Union{Function, Nothing} = nothing
+    initializer::Union{Function, Nothing} = nothing
+end
+
+@enum VariableKind VariableKind_Variable VariableKind_Group VariableKind_Input
+
+# Wire-safe description of an available @Variable/@Group/@Input for the GUI's
+# add-variable dialog (see `available_variables`). `dependencies` are the args to
+# wire (empty for groups/inputs); `group_parameters` holds the default Parameter
+# object for each Parameter-typed group field (handlers stripped for wire safety).
+struct VariableSpec
+    name::String
+    kind::VariableKind
+    origin::String                              # module-qualified ref, e.g. "XfaContext.scan"
+    dependencies::OrderedDict{String, Dependency}
+    subvariables::Vector{String}
+    postprocessors::Vector{String}
+    group_parameters::OrderedDict{Symbol, Parameter}
+end
+
+# Build a spec from a registered @Variable function.
+function VariableSpec(func::Function)
+    dependencies = OrderedDict{String, Dependency}()
+    for (arg_name, dep) in variable_dependencies(func)
+        if isnothing(arg_name) || !(dep isa Dependency)
+            continue
+        end
+        # Strip group_type: it may name a module the client hasn't loaded.
+        dependencies[arg_name] = isnothing(dep.group_type) ? dep : @set dep.group_type = nothing
+    end
+
+    VariableSpec(string(nameof(func)), VariableKind_Variable, origin_path(func),
+                 dependencies, variable_subvariables(func),
+                 [pp[1] for pp in variable_postprocessors(func)], OrderedDict{Symbol, Parameter}())
+end
+
+# Whether a @Group type backs an @Input, making it an input source not a plain group.
+function is_input_group(T::DataType)
+    for m in methods(input_dependencies)
+        F = m.sig.parameters[2]
+        if !isdefined(F, :instance)
+            continue
+        end
+        deps = input_dependencies(F.instance)
+        if !isempty(deps) && deps[1][2] isa Dependency && deps[1][2].group_type === T
+            return true
+        end
+    end
+    return false
+end
+
+# Build a spec from a registered @Group type, deriving its kind (Group/Input).
+function VariableSpec(T::DataType)
+    kind = is_input_group(T) ? VariableKind_Input : VariableKind_Group
+    # Strip the update handlers/initializers so the spec stays wire-safe (they
+    # may be closures or functions the client doesn't have). The defaults are
+    # freshly built each call, so mutating them is safe.
+    params = group_default_parameters(T)
+    for p in values(params)
+        p.update_handler = nothing
+        p.initializer = nothing
+    end
+    VariableSpec(string(nameof(T)), kind, origin_path(T),
+                 OrderedDict{String, Dependency}(), String[], String[], params)
 end
 
 abstract type AbstractPostprocessor end
@@ -112,11 +183,6 @@ struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
 end
 OptionalDims() = OptionalDims(Int[])
-
-struct FunctionArgument
-    name::String
-    type::Union{Nothing, Type}
-end
 
 const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
 const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
@@ -232,17 +298,17 @@ function _parse_function_args(args; is_input=false)
                         return arg_name
 
                     elseif @capture(arg_expr, (::T_) | (arg_name_::T_))
-                        arg_name_expr = isnothing(arg_name) ? :(nothing) : :($("$arg_name"))
-
                         if !is_input || (is_input && i == 1 && length(args) == 2)
                             # If the first argument has a type and no explicit
                             # dependency, then we assume it belongs to a group.
+                            # A @Variable's typed args always land here.
+                            arg_name_expr = isnothing(arg_name) ? :(nothing) : :($("$arg_name"))
                             group_type_name = "$T"
                             push!(dependencies, :(($arg_name_expr, Context.group_dependency($T))))
-                        else
-                            # Otherwise it's just a regular function argument
-                            push!(dependencies, :(($arg_name_expr, Context.FunctionArgument($arg_name_expr, $T))))
                         end
+                        # Otherwise (only reachable for an @Input) it's a plain
+                        # positional argument such as the output channel, supplied
+                        # at call time and not tracked as a dependency.
 
                         return arg_expr
                     else
@@ -501,15 +567,6 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-@kwdef mutable struct Parameter{T}
-    name::String = ""
-    value::Union{T, Nothing} = nothing
-    set_by_user::Bool = false
-
-    update_handler::Union{Function, Nothing} = nothing
-    initializer::Union{Function, Nothing} = nothing
-end
-
 function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
@@ -670,7 +727,19 @@ function _kwdef_group(name, struct_expr, fields)
         end)
     end
 
-    return struct_def, ctor
+    # Default Parameter objects for the Parameter-typed fields, keyed by field
+    # name. Fields with a default reuse it (via _wrap_param); fields without one
+    # get an empty Parameter of the declared type. Used to build a VariableSpec.
+    param_pairs = [:($(QuoteNode(f.name)) => let p = $(isnothing(f.default) ?
+                         :($(f.typed_field.args[2])()) :
+                         :(Context._wrap_param($(f.default))))
+                         p.name = $(string(f.name))
+                         p
+                     end)
+                   for f in parsed if f.is_param]
+    param_defaults = :(Context.OrderedDict{Symbol, Context.Parameter}($(param_pairs...)))
+
+    return struct_def, ctor, param_defaults
 end
 
 function _group(ctx_module, expr, side_effects)
@@ -683,7 +752,7 @@ function _group(ctx_module, expr, side_effects)
     end
 
     if @capture(expr, struct name_ fields__ end) || @capture(expr, mutable struct name_ fields__ end)
-        struct_def, ctor = _kwdef_group(name, expr, fields)
+        struct_def, ctor, param_defaults = _kwdef_group(name, expr, fields)
 
         new_expr = quote
             $struct_def
@@ -691,6 +760,7 @@ function _group(ctx_module, expr, side_effects)
 
             if $side_effects
                 Context.group_fields(::Type{$name}) = []
+                Context.group_default_parameters(::Type{$name}) = $param_defaults
             end
 
             $name

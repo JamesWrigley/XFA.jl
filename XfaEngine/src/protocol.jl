@@ -5,6 +5,7 @@ export AbstractMessage, Ping, Shutdown,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
     GetEngineDir, EngineDir,
+    GetVariables, AvailableVariables,
     GetRoutingRules, SetRoutingRules, RoutingRules,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
@@ -20,7 +21,7 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import XfaContext
-using XfaContext: ContextState, VariableData, Parameter, SourceInfo
+using XfaContext: ContextState, VariableData, Parameter, SourceInfo, VariableSpec
 using ..XfaEngine: RoutingRule, RemapRule
 
 
@@ -99,6 +100,8 @@ struct GetInputSources <: AbstractMessage end
 
 struct GetEngineDir <: AbstractMessage end
 
+struct GetVariables <: AbstractMessage end
+
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
@@ -116,6 +119,10 @@ end
 
 struct EngineDir <: AbstractMessage
     path::String
+end
+
+struct AvailableVariables <: AbstractMessage
+    variables::Union{Vector{VariableSpec}, ExceptionMessage}
 end
 
 struct Started <: AbstractMessage end

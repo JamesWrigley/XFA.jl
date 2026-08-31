@@ -174,6 +174,22 @@ macro Disabled(cond, expr)
     end
 end
 
+# Runs `expr` safely inside a node editor session
+macro NodeEditor(editor, name, expr)
+    quote
+        ne.SetCurrentEditor($(esc(editor)))
+        ne.Begin($(esc(name)))
+
+        try
+            $(esc(expr))
+        finally
+            ne.End()
+            ig.SetFontRasterizerDensity(1f0)
+            ne.SetCurrentEditor(C_NULL)
+        end
+    end
+end
+
 # Stolen from: https://github.com/ocornut/imgui/pull/4675
 function IsItemDisabled()
     imgui_ctx = unsafe_load(ig.GetCurrentContext())
@@ -1230,19 +1246,25 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
     return result, hovered
 end
 
+# The property names completable for a source: a device's slow properties, or a
+# device:channel's fast data paths.
+function property_completions(client::ClientState, source::AbstractString, allow_slow::Bool)
+    props = source_device_props(client, source)
+    channel = source_channel(source)
+    if isempty(channel)
+        allow_slow ? props.slow.names : String[]
+    else
+        get(props.fast, channel, PropertyList()).names
+    end
+end
+
 # Property input, completing slow properties (bare device source) or the fast
 # data paths of the selected channel (device:channel source).
 function karabo_property_field(dep_state::KaraboDepTextState, client::ClientState)
     popup_id = "karabo-prop-$(dep_state.label)"
     field_state = get!(ElidedTextState, elided_text_states, ig.GetID("##$(popup_id)-state"))
 
-    props = source_device_props(client, dep_state.source)
-    channel = source_channel(dep_state.source)
-    names = if isempty(channel)
-        dep_state.allow_slow ? props.slow.names : String[]
-    else
-        get(props.fast, channel, PropertyList()).names
-    end
+    names = property_completions(client, dep_state.source, dep_state.allow_slow)
 
     # After a new source is picked, drop a property that doesn't belong to it and
     # focus the field so a replacement can be typed. Deferred until the schema
@@ -1390,11 +1412,13 @@ end
 function variable_name_validator(new_name, current_name)
     client = state[].client
 
+    taken = haskey(client.context.context_state, new_name) ||
+        any(p.name == new_name for p in client.pending_nodes)
     if isempty(new_name)
         "Name cannot be empty"
     elseif !Meta.isidentifier(new_name)
         "'$(new_name)' is not a valid Julia identifier"
-    elseif new_name ∈ client.variable_names && new_name != current_name
+    elseif taken && new_name != current_name
         "A variable named '$(new_name)' already exists"
     else
         nothing

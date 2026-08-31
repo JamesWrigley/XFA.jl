@@ -62,6 +62,9 @@ end
 function variable_dependencies end
 function input_dependencies end
 function group_fields end
+# The Parameter-typed fields of a @Group type, with their declared defaults.
+# Registered per group by @Group; used to build a VariableSpec for the GUI.
+function group_default_parameters end
 variable_subvariables(_) = String[]
 variable_postprocessors(_) = VariablePostprocessor[]
 variable_displays(_) = String[]
@@ -430,6 +433,40 @@ function to_dict(ctx::ContextState)
                 "dep_to_input" => ctx.dep_to_input,
                 "group_parameter_args" => group_parameter_args,
                 "path" => ctx.path)
+end
+
+# Enumerate the @Variable's, @Group's, and @Input's currently registered
+# (builtins plus any loaded package) as wire-safe VariableSpec's for the GUI's
+# add-variable dialog. Group-member variables are folded into their group rather
+# than listed on their own, and context-file definitions are excluded.
+function available_variables()
+    specs = VariableSpec[]
+
+    for m in methods(variable_dependencies)
+        if _is_context_method(m)
+            continue
+        end
+        F = m.sig.parameters[2]
+        if !isdefined(F, :instance)
+            continue
+        end
+        func = F.instance
+        deps = variable_dependencies(func)
+        # Group members arrive with their group.
+        if !isempty(deps) && deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group
+            continue
+        end
+        push!(specs, VariableSpec(func))
+    end
+
+    for m in methods(group_fields)
+        if _is_context_method(m)
+            continue
+        end
+        push!(specs, VariableSpec(m.sig.parameters[2].parameters[1]))
+    end
+
+    return specs
 end
 
 """
