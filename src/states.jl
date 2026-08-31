@@ -410,6 +410,7 @@ end
     name::String
     dep_values::OrderedDict{String, Dependency} = OrderedDict{String, Dependency}()
     param_values::OrderedDict{Symbol, Parameter} = OrderedDict{Symbol, Parameter}()
+    centered::Bool = false
     # The var_data dict built for this node this frame (see spec_to_var_data),
     # rebuilt each frame from the fields above.
     var_data::Dict{String, Any} = Dict{String, Any}()
@@ -451,9 +452,6 @@ end
 
     ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     ne_editor_path::String = ""
-    ne_node_handles::Dict{UInt, Ptr{ne.NodeId}} = Dict{UInt, Ptr{ne.NodeId}}()
-    ne_pin_handles::Dict{UInt, Ptr{ne.PinId}} = Dict{UInt, Ptr{ne.PinId}}()
-    ne_link_handles::Dict{UInt, Ptr{ne.LinkId}} = Dict{UInt, Ptr{ne.LinkId}}()
     ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
     ne_settings::String = ""
 
@@ -466,9 +464,11 @@ end
     # A link accepted onto one of these updates the pending node's dep locally
     # instead of rewriting source. Rebuilt each frame from the pending nodes.
     pending_dep_pins::Dict{UInt, Tuple{UInt, String}} = Dict{UInt, Tuple{UInt, String}}()
-    # Scratch handles that QueryNewLink() writes the dragged pin ids into.
-    ne_new_link_start::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
-    ne_new_link_end::Ptr{ne.PinId} = Ptr{ne.PinId}(C_NULL)
+    # Scratch slots that QueryNewLink() writes the dragged pin ids into.
+    ne_new_link_start::Base.RefValue{ne.PinId} = Ref(ne.PinId(0))
+    ne_new_link_end::Base.RefValue{ne.PinId} = Ref(ne.PinId(0))
+    # Scratch slot that QueryDeletedLink() writes the deleted link id into.
+    ne_deleted_link::Base.RefValue{ne.LinkId} = Ref(ne.LinkId(0))
 
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()

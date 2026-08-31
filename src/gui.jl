@@ -45,10 +45,6 @@ import Revise
 
 const state = ScopedValue{GuiState}()
 
-node_handle(client, id) = get!(() -> ne.NodeId(id), client.ne_node_handles, id)
-pin_handle(client, id) = get!(() -> ne.PinId(id), client.ne_pin_handles, id)
-link_handle(client, id) = get!(() -> ne.LinkId(id), client.ne_link_handles, id)
-
 # The node editor persists its own state (node positions, pan, zoom) through
 # these callbacks. It hands us a JSON string to stash and reads it back on load;
 # save_settings writes ne_settings out to settings.toml.
@@ -85,12 +81,6 @@ function create_node_editor!(client)
     client.ne_editor = ne.CreateEditor(config)
     ne.Destroy(config)
     client.ne_editor_path = client.context_path
-
-    # Scratch handles for QueryNewLink(), reused across drags and editors.
-    if client.ne_new_link_start == C_NULL
-        client.ne_new_link_start = ne.PinId(0)
-        client.ne_new_link_end = ne.PinId(0)
-    end
 end
 
 # The graph can only be edited while the pipeline is idle or fully running,
@@ -105,7 +95,7 @@ end
 function draw_pin(client, id, kind)
     pivot = kind == ne.PinKind_Input ? ImVec2(0f0, 0.5f0) : ImVec2(1f0, 0.5f0)
     ne.PushStyleVar(ne.StyleVar_PivotAlignment, pivot)
-    ne.BeginPin(pin_handle(client, id), kind)
+    ne.BeginPin(ne.PinId(id), kind)
 
     # Get the alpha from the current style so we respect the current disabled state
     alpha = graph_editable(client) ? 1f0 : unsafe_load(ig.GetStyle().DisabledAlpha)
@@ -164,19 +154,11 @@ end
 # overlapping widgets: ImGui gives the first-submitted overlapping item the click,
 # and the editor keeps the active/selected node last in its order. New nodes the
 # editor hasn't seen yet are appended.
-function node_draw_order(client, ctx_state)
-    n = Int(ne.GetNodeCount())
-    if n == 0
-        return collect(keys(ctx_state))
-    end
-
-    buf = Vector{UInt}(undef, n)
-    GC.@preserve buf ne.GetOrderedNodeIds(Ptr{ne.NodeId}(pointer(buf)), n)
-
+function node_draw_order(ctx_state)
     id_to_name = Dict{UInt, String}(UInt(var_data["id"]) => name for (name, var_data) in ctx_state)
     ordered = String[]
-    for id in Iterators.reverse(buf)
-        name = get(id_to_name, id, nothing)
+    for id in Iterators.reverse(ne.GetOrderedNodeIds())
+        name = get(id_to_name, id.value, nothing)
         if !isnothing(name)
             push!(ordered, name)
         end
@@ -668,7 +650,7 @@ function draw_variable(name, var_data)
     if !isnothing(pending)
         ne.PushStyleColor(ne.StyleColor_NodeBg, pending_color(0.9f0))
     end
-    handle = node_handle(client, var_data["id"])
+    handle = ne.NodeId(var_data["id"])
     ne.BeginNode(handle)
 
     # Right-align the output/postprocessor pins to the widest left-anchored row.
@@ -970,8 +952,8 @@ end
 function handle_link_creation(client)
     if ne.BeginCreate()
         if ne.QueryNewLink(client.ne_new_link_start, client.ne_new_link_end)
-            start_id = ne.value(client.ne_new_link_start)
-            end_id = ne.value(client.ne_new_link_end)
+            start_id = client.ne_new_link_start[].value
+            end_id = client.ne_new_link_end[].value
 
             # Both ids are only set once the drag hovers a second pin.
             if start_id != 0 && end_id != 0
@@ -1018,6 +1000,35 @@ function handle_link_creation(client)
         end
     end
     ne.EndCreate()
+end
+
+# Deletes a selected link with the Del key. Only links into pending nodes can be
+# deleted, by clearing the dependency; committed links come from the source, so
+# they're rejected. Deleted nodes aren't queried, so Del ignores nodes.
+function handle_link_deletion(client)
+    if ne.BeginDelete()
+        while ne.QueryDeletedLink(client.ne_deleted_link)
+            link_id = client.ne_deleted_link[].value
+            attr_id = nothing
+            for id in keys(client.pending_dep_pins)
+                if hash("pending-link-$(id)") == link_id
+                    attr_id = id
+                    break
+                end
+            end
+
+            if isnothing(attr_id)
+                ne.RejectDeletedItem()
+            elseif ne.AcceptDeletedItem()
+                node_id, arg = client.pending_dep_pins[attr_id]
+                target = pending_node_for(client, node_id)
+                if !isnothing(target)
+                    target.dep_values[arg] = Dependency("")
+                end
+            end
+        end
+    end
+    ne.EndDelete()
 end
 
 # Link color for a channel-fill ratio (load ∈ [0, 1]). Ramps from muted green
@@ -1282,7 +1293,7 @@ function draw_dag()
         magnification = ne.current_scale()
         ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
 
-        for name in node_draw_order(client, ctx_state)
+        for name in node_draw_order(ctx_state)
             var_data = ctx_state[name]
             ig.PushID(name)
 
@@ -1292,7 +1303,7 @@ function draw_dag()
             # (new nodes sit at the origin); restored nodes keep their saved spot.
             pos = context.node_positions[name]
             if pos != Point2d(-1, -1)
-                handle = node_handle(client, var_data["id"])
+                handle = ne.NodeId(var_data["id"])
                 editor_pos = ne.GetNodePosition(handle)
                 if editor_pos.x == 0 && editor_pos.y == 0
                     ne.SetNodePosition(handle, (pos.x, pos.y))
@@ -1316,6 +1327,11 @@ function draw_dag()
             ig.PushID("pending-$(pending.id)")
             draw_variable(pending.name, pending.var_data)
             ig.PopID()
+
+            if !pending.centered
+                ne.CenterNodeOnScreen(ne.NodeId(pending.id))
+                pending.centered = true
+            end
         end
 
         # The dep-kind and CopyableCombo dropdowns are drawn here, after all nodes,
@@ -1385,8 +1401,8 @@ function draw_dag()
                 stat = get(channel_stats, link.channel_key, nothing)
                 colored = !isnothing(stat) && stat.capacity > 0
                 color = colored ? link_load_color(stat.size / stat.capacity) : ImVec4(1, 1, 1, 1)
-                ne.Link(link_handle(client, link.id), pin_handle(client, link.start_id),
-                        pin_handle(client, link.end_id), color)
+                ne.Link(ne.LinkId(link.id), ne.PinId(link.start_id),
+                        ne.PinId(link.end_id), color)
             end
         end
 
@@ -1400,12 +1416,13 @@ function draw_dag()
                 owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
                 start_id = hash("$(owner).outputs.$(pin_suffix)")
                 link_id = hash("pending-link-$(attr_id)")
-                ne.Link(link_handle(client, link_id), pin_handle(client, start_id),
-                        pin_handle(client, attr_id), ImVec4(1f0, 0.8f0, 0.8f0, 0.5f0))
+                ne.Link(ne.LinkId(link_id), ne.PinId(start_id),
+                        ne.PinId(attr_id), ImVec4(1f0, 0.8f0, 0.8f0, 0.5f0))
             end
         end
 
         handle_link_creation(client)
+        handle_link_deletion(client)
     end
 
     # Timer to save the current settings periodically. Mostly useful for the
