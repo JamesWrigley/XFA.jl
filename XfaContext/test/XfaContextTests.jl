@@ -773,13 +773,13 @@ end
     """)
     @test ctx.dag["foo_group.foo"]["data"] == subvariable_dependency("bar", "sub")
 
-    # An unassigned Parameter{Dependency} is an optional dependency: it's kept in
-    # the DAG (so the variable's positional args line up) as the Parameter
-    # itself, but dropped from the serialized DAG edges. The parameter is still
-    # registered so the client can draw it.
+    # An unset optional Parameter{Dependency} is an optional dependency: it's
+    # kept in the DAG (so the variable's positional args line up) as the
+    # Parameter itself, but dropped from the serialized DAG edges. The parameter
+    # is still registered (with its `optional` flag) so the client can draw it.
     ctx = Context.load_from_string(raw"""
     @Group mutable struct Foo
-        source::Parameter{Dependency} = Parameter{Dependency}()
+        source::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
     end
 
     @Variable function foo(group::Foo, data -> Foo.source)
@@ -792,7 +792,36 @@ end
     @test ctx.dag["foo_group.foo"]["data"] === ctx.groups["foo_group"].source
     serialized = Context.to_dict(ctx)
     @test !haskey(serialized["dag"]["foo_group.foo"], "data")
-    @test haskey(serialized["parameters"], "foo_group.source")
+    @test serialized["parameters"]["foo_group.source"].optional
+
+    # Wiring an optional dependency makes it a regular edge, and a raw value
+    # passed to the constructor keeps the flag.
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo(; source=karabo"motor1.pos")
+    """)
+    @test ctx.dag["foo_group.foo"]["data"] == karabo"motor1.pos"
+    @test ctx.parameters["foo_group.source"].optional
+
+    # A required dependency left unset is an error, not an implicit optional.
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        source::Parameter{Dependency} = Parameter{Dependency}()
+    end
+
+    @Variable function foo(group::Foo, data -> Foo.source)
+        data
+    end
+
+    foo_group = Foo()
+    """)
 
     # Test that referencing a non-existent parameter throws
     @test_throws XfaContextException Context.load_from_string(raw"""

@@ -76,6 +76,7 @@ end
 
     update_handler::Union{Function, Nothing} = nothing
     initializer::Union{Function, Nothing} = nothing
+    optional::Bool = false
 end
 
 @enum VariableKind VariableKind_Variable VariableKind_Group VariableKind_Input
@@ -571,8 +572,8 @@ function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
 
-Parameter(name::String, value) = Parameter(; name, value)
-Parameter(value) = Parameter(; name="", value)
+Parameter(name::String, value; optional=false) = Parameter(; name, value, optional)
+Parameter(value; optional=false) = Parameter(; name="", value, optional)
 
 # Used by @Group to allow passing raw values for Parameter fields
 _wrap_param(val::Parameter) = val
@@ -580,14 +581,15 @@ _wrap_param(val) = Parameter(val)
 # Merge a raw value into a default Parameter, preserving handlers
 _wrap_param(val::Parameter, ::Parameter) = val
 _wrap_param(val, default::Parameter) = Parameter(default.name, val, default.set_by_user,
-                                                  default.update_handler, default.initializer)
+                                                  default.update_handler, default.initializer,
+                                                  default.optional)
 
-function Parameter(f::Base.Callable, value)
+function Parameter(f::Base.Callable, value; optional=false)
     if !isnothing(f) && !any(m -> m.nargs in (2, 3), methods(f))
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
-    Parameter("", value, false, f, f)
+    Parameter("", value, false, f, f, optional)
 end
 
 function tryset(param::Parameter, value; force=false)

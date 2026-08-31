@@ -377,7 +377,8 @@ function to_dict(ctx::ContextState)
     for (name, param) in ctx.parameters
         # Preserve the concrete type so an unassigned (nothing-valued) parameter
         # keeps its element type instead of failing to infer it.
-        parameters[name] = typeof(param)(; name=param.name, value=param.value, set_by_user=param.set_by_user)
+        parameters[name] = typeof(param)(; name=param.name, value=param.value,
+                                         set_by_user=param.set_by_user, optional=param.optional)
     end
 
     # group_type holds a DataType that may live in the context's anonymous
@@ -1338,6 +1339,9 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                         end
                         param = getproperty(object, head_sym)
                         if !isassigned(param)
+                            if !param.optional
+                                throw(XfaContextException("Parameter '$head' of group '$(group_name)' is required but wasn't set"))
+                            end
                             # Unset optional dependency: kept in the DAG so the
                             # variable's positional args still line up, but the
                             # scheduler ignores it (no channel, no trainmatching)

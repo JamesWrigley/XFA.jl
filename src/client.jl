@@ -462,6 +462,7 @@ function build_context_state(state, ctx_info)
         # name (not the @Variable's arg_name) when rewriting the constructor
         # kwarg in source.
         ctx_state[name]["dep_field_names"] = Dict{UInt, String}()
+        ctx_state[name]["optional_deps"] = Set{UInt}()
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
@@ -489,6 +490,9 @@ function build_context_state(state, ctx_info)
                 push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
                 ctx_state[name]["dep_field_names"][attr_id] = field_name
                 push!(dep_param_names, field_name)
+                if ctx_info["parameters"]["$(name).$(field_name)"].optional
+                    push!(ctx_state[name]["optional_deps"], attr_id)
+                end
                 # The group's kwarg is what gets rewritten, not the member
                 # variable's argument.
                 if dep isa Dependency
@@ -525,10 +529,35 @@ function build_context_state(state, ctx_info)
         end
 
         for (param_name, param) in ctx_info["parameters"]
-            if group_filter(param_name)
-                stripped_name = chopprefix(param_name, "$(name).")
-                # Skip parameters that are already shown as dependency inputs
-                stripped_name in dep_param_names && continue
+            if !group_filter(param_name)
+                continue
+            end
+
+            stripped_name = chopprefix(param_name, "$(name).")
+            if stripped_name in dep_param_names
+                # Already shown as a dependency input
+                continue
+            end
+
+            if param isa Parameter{Dependency} && param.optional
+                # An unwired optional dependency is absent from the DAG, but it
+                # still gets a pin so a link can be dragged onto it.
+                attr_id = hash("$(name).dependencies.$(stripped_name)")
+                dep = Dependency("")
+                # The member variable consuming the field, for the cycle check
+                # when a link is dropped on the pin.
+                owner = name
+                for (var_name, mapping) in group_param_args
+                    if group_filter(var_name) && stripped_name in values(mapping)
+                        owner = var_name
+                        break
+                    end
+                end
+                push!(ctx_state[name]["dependencies"], (attr_id, stripped_name => dep))
+                ctx_state[name]["dep_field_names"][attr_id] = stripped_name
+                push!(ctx_state[name]["optional_deps"], attr_id)
+                state.client.ne_dep_pins[attr_id] = DepPinInfo(name, stripped_name, owner, dep)
+            else
                 ctx_state[name]["parameters"][stripped_name] = param
             end
         end
