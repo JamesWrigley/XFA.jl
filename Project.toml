@@ -32,7 +32,6 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
-ImGuiNodeEditor = {path = "/home/james/.julia/dev/ImGuiNodeEditor"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
 
