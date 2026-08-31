@@ -542,6 +542,13 @@ function pending_node_for(client, id)
     return isnothing(idx) ? nothing : client.pending_nodes[idx]
 end
 
+# Whether a pending node's dependency arg is backed by an optional group
+# parameter, and so may be left unwired.
+function optional_dep(pending::PendingNode, arg::AbstractString)
+    param = get(pending.spec.group_parameters, Symbol(arg), nothing)
+    return !isnothing(param) && param.optional
+end
+
 # A default node name for a freshly-added spec that doesn't collide with an
 # existing variable or another pending node, suffixing a counter if needed.
 function unique_pending_name(client, base)
@@ -604,6 +611,7 @@ function spec_to_var_data(pending::PendingNode)
         "dependencies" => [],
         "outputs" => OutputPin[OutputPin(hash("$(base).outputs."), "")],
         "postprocessors" => [],
+        "optional_deps" => Set{UInt}(),
     )
 
     if is_var
@@ -620,6 +628,9 @@ function spec_to_var_data(pending::PendingNode)
     for (arg_name, dep) in pending.dep_values
         attr_id = hash("$(base).dependencies.$(arg_name)")
         push!(var_data["dependencies"], (attr_id, arg_name => dep))
+        if optional_dep(pending, arg_name)
+            push!(var_data["optional_deps"], attr_id)
+        end
         if !is_var
             var_data["dep_field_names"][attr_id] = arg_name
         end
@@ -745,7 +756,14 @@ function draw_variable(name, var_data)
             ig.BeginGroup()
             if var_data["type"] == :group
                 label = get(var_data["dep_field_names"], dep_id, arg_name)
-                ig.Text(label * ":")
+                if dep_id in var_data["optional_deps"]
+                    ig.TextDisabled(label * ":")
+                    if ig.IsItemHovered()
+                        node_tooltip("This dependency is optional, it may be left unwired")
+                    end
+                else
+                    ig.Text(label * ":")
+                end
                 ig.SameLine()
             end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
@@ -905,7 +923,8 @@ function draw_variable(name, var_data)
     if !isnothing(pending)
         ig.Dummy(min_node_width, 8)
         valid = isnothing(variable_name_validator(name, name)) &&
-                all(!isempty(dep.name) for dep in values(pending.dep_values))
+                all(!isempty(dep.name) for (arg, dep) in pending.dep_values
+                    if !optional_dep(pending, arg))
         @Disabled !valid begin
             if ig.Button("Add###commit-$(var_data["id"])")
                 @guiasync commit_pending_node(state[], pending)

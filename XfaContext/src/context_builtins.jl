@@ -208,7 +208,8 @@ function Histogram1D(; buffer_size::Integer=10, nbins::Integer=100,
     explicit = edges[1] < edges[2]
     initial = explicit ? range(edges[1], edges[2]; length=Int(nbins) + 1) :
                          range(-1.0, 1.0; length=Int(nbins) + 1)
-    edge_param = Parameter("", edges, explicit, invalidate_edges, invalidate_edges)
+    edge_param = Parameter(; value=edges, set_by_user=explicit,
+                           update_handler=invalidate_edges, initializer=invalidate_edges)
     Histogram1D(Parameter(invalidate_edges, Int(nbins)),
                 edge_param,
                 Parameter(normalize),
@@ -449,7 +450,7 @@ end
     history_budget::Parameter{Int} = Parameter(64 * 1024 * 1024)
     value::Parameter{Dependency}
     position1::Parameter{Dependency}
-    position2::Parameter{Dependency} = Parameter{Dependency}()
+    position2::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
 
     binner::Union{Nothing, ScanBinner} = nothing
 end
