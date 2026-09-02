@@ -89,6 +89,8 @@ end
     remoterepl_task::Union{Task, Nothing} = nothing
 
     ctx::ContextState = ContextState()
+    # Keeps the pipeline running across rewires, see start_pipeline(::EngineState).
+    pipeline_task::Union{Task, Nothing} = nothing
 
     # One zfp workspace per qualified variable name. Sized to the variable's
     # data on first use and reused across trains; switching k on the
@@ -222,13 +224,53 @@ end
 # engine-initiated parameter change to every connected client so their GUIs
 # stay in sync. Runs on proc 1 (where set_parameter calls the hook).
 function broadcast_parameter_changed(state::EngineState, name, value)
-    msg = Protocol.ParameterChanged(Context.Parameter(name, value))
+    param = state.ctx.parameters[name]
+    msg = Protocol.ParameterChanged(typeof(param)(; name, value))
     for (id, client) in state.clients
         try
             Protocol.server_send(client.websocket, msg)
         catch ex
             @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
         end
+    end
+end
+
+# Resend the context to every client, e.g. after a rewire changed its edges.
+function broadcast_context_info(state::EngineState)
+    msg = ContextInfo(state.ctx, read(state.ctx.path, String))
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast ContextInfo to client '$(id)'" exception=ex
+        end
+    end
+end
+
+# Start the pipeline, and the task that restarts it whenever a group rewires
+# its dependencies (see Context.wait_pipeline). Starting synchronously lets
+# callers report a failed start; the task only ever restarts.
+function start_pipeline(state::EngineState)
+    @invokelatest Context.start_pipeline(state.ctx)
+
+    state.pipeline_task = Threads.@spawn :samepool while Context.wait_pipeline(state.ctx)
+        try
+            @invokelatest Context.start_pipeline(state.ctx)
+        catch ex
+            @error "Failed to restart the pipeline after rewiring" exception=(ex, catch_backtrace())
+            break
+        end
+        broadcast_context_info(state)
+    end
+    errormonitor(state.pipeline_task)
+end
+
+# Stop the pipeline through its task, so the restart loop ends with it.
+function stop_pipeline(state::EngineState)
+    if !isnothing(state.pipeline_task)
+        Context.request_stop(state.ctx)
+        wait(state.pipeline_task)
+        state.pipeline_task = nothing
     end
 end
 
@@ -289,6 +331,8 @@ function shutdown(state::EngineState, ws_server=nothing)
     if ws_server != nothing
         close(ws_server)
     end
+
+    stop_pipeline(state)
 
     for client in values(state.clients)
         close(client.websocket)
@@ -386,7 +430,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
 
         was_running = state.ctx.is_running[]
         if was_running
-            Context.stop_pipeline(state.ctx)
+            stop_pipeline(state)
         end
 
         new_ctx_or_ex = try
@@ -403,7 +447,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         if new_ctx_or_ex isa ContextState
             state.ctx = new_ctx_or_ex
             if was_running
-                @invokelatest Context.start_pipeline(state.ctx)
+                start_pipeline(state)
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
@@ -441,7 +485,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
     elseif msg isa Start
         @info "Starting pipeline..."
         try
-            Context.start_pipeline(state.ctx)
+            start_pipeline(state)
             Protocol.server_send(ws, Ack(); reply_to)
         catch ex
                 @error "Failed to start pipeline" exception=(ex, catch_backtrace())
@@ -450,7 +494,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Started"
     elseif msg isa Stop
         @info "Stopping pipeline..."
-        Context.stop_pipeline(state.ctx)
+        stop_pipeline(state)
         Protocol.server_send(ws, Stopped(); reply_to)
         @info "Stopped"
     elseif msg isa SetVariableSubscriptions

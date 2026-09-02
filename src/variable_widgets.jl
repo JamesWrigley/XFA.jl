@@ -17,7 +17,7 @@ function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var
     ig.Text("Parameters:")
 
     tm_param = params["trainmatcher"]
-    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
+    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param, client.trainmatcher_sources)
     if tm_modified
         tm_param[] = new_tm
         @guiasync set_group_param(state[], name, "trainmatcher",
@@ -103,6 +103,31 @@ function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var
     return gui_state
 end
 
+# The scantool is chosen among the Karabacon devices. With one assigned the
+# motor dependency and resolution are derived by the engine (see Scan in
+# context_builtins.jl), so the derived parameters are hidden and the motor's
+# pin is shown but not editable.
+function draw_variable_content(::Val{Symbol("XfaContext.Scan")}, name, var_data, gui_state)
+    var_data["draw_parameters"] = false
+    params = var_data["parameters"]
+    automatic = isassigned(params["scantool"])
+
+    ig.Text("Parameters:")
+    for (param_name, param) in params
+        if param_name == "scantool"
+            scantools = filter(s -> s.class_id == "Karabacon", state[].client.source_list)
+            draw_parameter(param_name, param, scantools)
+        elseif !(automatic && param_name in ("resolution", "position_property"))
+            draw_parameter(param_name, param)
+        end
+    end
+
+    for pin in var_data["dependencies"]
+        pin.readonly = automatic && pin.field == "position1"
+    end
+    return nothing
+end
+
 @kwdef mutable struct AttosecondState
     fits::Vector{Vector{Float64}} = Vector{Float64}[]
     xs::Vector{Float64} = Float64[]
@@ -132,9 +157,9 @@ end
 
 # Resolve the variable name connected to a group's Parameter{Dependency} field.
 function group_dep_variable(var_data, field::AbstractString)
-    for (attr_id, (_, dep)) in var_data["dependencies"]
-        if get(var_data["dep_field_names"], attr_id, nothing) == field
-            return dep.name
+    for pin in var_data["dependencies"]
+        if pin.field == field
+            return pin.dep.name
         end
     end
     return nothing

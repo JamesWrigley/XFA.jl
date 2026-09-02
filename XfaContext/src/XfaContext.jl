@@ -78,6 +78,20 @@ input_device(::Any) = nothing
 
 # Returns the sources available from an input group, as SourceInfo's
 get_sources(::Any) = SourceInfo[]
+
+# Karabo slow properties a group wants change notifications for, as full
+# Dependency's. They're routed and subscribed like the DAG's Karabo deps.
+monitored_properties(::Any) = Dependency[]
+
+# Called under the pipeline pause with the monitored properties that changed in
+# a train, a `Dict` of `property => (; value, tid)` where `tid` is the train the
+# property was last updated in upstream. Return `true` if a Dependency parameter
+# of the group was changed (see `tryset`), the pipeline is then restarted with
+# the new wiring (see `wait_pipeline`). Only report actual changes: inputs
+# replay their properties after a restart, so always returning `true` would
+# restart forever.
+on_properties_changed(::Any, changed) = false
+
 # For variable references (@Variable name -> MyLib.func), returns the
 # original function. Used to exclude origin functions from the context
 # when they are already represented by a reference wrapper.
@@ -144,6 +158,9 @@ end
     available_sources::Base.Lockable{Dict{String, Vector{SourceInfo}}, ReentrantLock} = Base.Lockable(Dict{String, Vector{SourceInfo}}())
 
     dep_to_input::Dict{String, String} = Dict()
+    # Maps (topic, source) to the input device serving it, see build_dep_routing.
+    # Kept so `rewire!` can re-route with the same rules as the initial load.
+    dep_router::Function = Returns(nothing)
 
     input_variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
     input_variables_tasks::Dict{String, Task} = Dict()
@@ -168,6 +185,11 @@ end
     # to connected clients; offline runners leave it as the no-op default.
     on_parameter_changed::Function = Returns(nothing)
 
+    # Why the running pipeline should stop, consumed by `wait_pipeline`:
+    # `:finished` (all variables done), `:stop` (`request_stop`) or `:rewire`
+    # (a group changed a dependency, see `on_properties_changed`).
+    pipeline_events::Channel{Symbol} = Channel{Symbol}(Inf)
+
     path::String = ""
 
     # Offline-replay plan, populated on a copy of a loaded context by `run`. The
@@ -186,6 +208,7 @@ end
 end
 
 worker_state::WorkerState = WorkerState()
+# The loaded context, running or not
 current_ctx::Union{ContextState, Nothing} = nothing
 
 function Base.show(io::IO, ctx::ContextState)
@@ -196,8 +219,10 @@ end
 
 """
 Finds all external dependencies (i.e. from Karabo) required by the context.
+Groups' `monitored_properties()` are included unless `monitored=false`; they
+need routing and subscribing like DAG deps but no channels of their own.
 """
-function external_dependencies(ctx::ContextState; per_variable=false)
+function external_dependencies(ctx::ContextState; per_variable=false, monitored=true)
     deps_per_variable = Dict{String, Vector{Dependency}}()
     all_deps = Dependency[]
 
@@ -211,7 +236,19 @@ function external_dependencies(ctx::ContextState; per_variable=false)
         end
     end
 
-    return per_variable ? deps_per_variable : unique(all_deps)
+    if per_variable
+        return deps_per_variable
+    end
+
+    # Overloads come from the context file, so they may be newer than the
+    # caller's world.
+    if monitored
+        for group in values(ctx.groups)
+            append!(all_deps, @invokelatest monitored_properties(group))
+        end
+    end
+
+    return unique(all_deps)
 end
 
 # Returns the group object for an input, or nothing if it has no group.
@@ -596,9 +633,9 @@ function input_wrapper(name, group, channel)
 
     try
         if isnothing(group)
-            @with Meta.name => name f(channel)
+            @with Meta.name => name @invokelatest f(channel)
         else
-            @with Meta.name => name f(group, channel)
+            @with Meta.name => name @invokelatest f(group, channel)
         end
     catch ex
         if !(ex isa InvalidStateException)
@@ -628,14 +665,64 @@ function putall!(channels, value)
     end
 end
 
-function stream_input(name, channel, downstream_neighbours, rates)
+# `monitors` holds (group name, group, deps) triples for the monitored
+# properties routed to this input. A property has changed when its
+# `<property>.timestamp.tid` stamp (the tid of its last upstream update)
+# differs from the last one seen. Groups are notified before the fan-out so
+# the DAG sees a train only after they've reacted to it, and a group reporting
+# a changed dependency asks `wait_pipeline` for a restart with the new wiring.
+function stream_input(ctx, name, channel, downstream_neighbours, rates, monitors=[])
     rate = RunningRate()
+    last_update_tids = Dict{String, Int}()
     try
         while isopen(channel) || isready(channel)
             tid, sources = take!(channel)
 
             tick!(rate)
             rates[name] = isnan(rate.value) ? 0.0 : rate.value
+
+            updates = []
+            for (group_name, group, deps) in monitors
+                changed = Dict{String, Any}()
+                for dep in deps
+                    source_data = get(sources, dep.source, nothing)
+                    tid_key = "$(dep.property).timestamp.tid"
+                    if isnothing(source_data) || !haskey(source_data, tid_key)
+                        continue
+                    end
+
+                    dep_name = string(dep)
+                    update_tid = Int(source_data[tid_key])
+                    if !haskey(last_update_tids, dep_name) || last_update_tids[dep_name] != update_tid
+                        last_update_tids[dep_name] = update_tid
+                        changed[dep.property] = (; value=source_data["$(dep.property).value"], tid=update_tid)
+                    end
+                end
+
+                if !isempty(changed)
+                    push!(updates, (group_name, group, changed))
+                end
+            end
+
+            if !isempty(updates)
+                rewire = false
+                pause_pipeline() do
+                    for (group_name, group, changed) in updates
+                        try
+                            deps_changed = @with Meta.name => group_name @invokelatest on_properties_changed(group, changed)
+                            if deps_changed == true
+                                rewire = true
+                            end
+                        catch ex
+                            @error "Error notifying '$(group_name)' of changed properties" exception=(ex, catch_backtrace())
+                        end
+                    end
+                end
+
+                if rewire
+                    request_rewire(ctx)
+                end
+            end
 
             putall!(values(downstream_neighbours), VariableData(; tid=Int(tid), data=sources))
             @debug "Pushed input data from '$(name)' to: $(keys(downstream_neighbours))"
@@ -844,6 +931,7 @@ function watch_context(ctx::ContextState)
     while true
         if all(istaskdone.(values(ctx.variable_tasks)))
             close(ctx.stream_output)
+            put!(ctx.pipeline_events, :finished)
             return
         end
 
@@ -891,6 +979,23 @@ end
 include("offline.jl")
 
 function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_size::Int=50)
+    # The DAG may have been rewired since the last run, so drop the stale
+    # channels and tasks rather than overwriting them key by key.
+    for dict in (ctx.input_channels, ctx.input_tasks, ctx.input_variable_channels,
+                 ctx.input_variables_tasks, ctx.external_dependency_channels,
+                 ctx.external_dependency_tasks, ctx.variable_tasks, ctx.variable_channels)
+        empty!(dict)
+    end
+    # Events from the previous run (e.g. a stop requested after it finished)
+    # don't apply to this one.
+    while isready(ctx.pipeline_events)
+        take!(ctx.pipeline_events)
+    end
+
+    # Group Dependency parameters may have changed since the last run, either
+    # edited while stopped or by a group asking for a rewire.
+    rewire!(ctx)
+
     ctx.stream_output = variable_channel(offline)
     ctx.events_channel = RemoteChannel(() -> Channel(100))
     ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
@@ -948,11 +1053,24 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         ctx.input_rates[name] = 0.0
     end
 
+    # Monitored properties are checked by the input serving them, so gather
+    # each group's deps per input.
+    monitors = Dict{String, Vector{Tuple{String, Any, Vector{Dependency}}}}()
+    for (group_name, group) in ctx.groups
+        deps_per_input = Dict{String, Vector{Dependency}}()
+        for dep in @invokelatest monitored_properties(group)
+            push!(get!(deps_per_input, ctx.dep_to_input[string(dep)], Dependency[]), dep)
+        end
+        for (input_name, deps) in deps_per_input
+            push!(get!(monitors, input_name, Tuple{String, Any, Vector{Dependency}}[]), (group_name, group, deps))
+        end
+    end
+
     # Start the input variables, each with downstream channels only for
     # the external deps routed to that input.
     for name in keys(ctx.inputs)
         downstream_neighbours = Dict{String, Union{RemoteChannel, Channel}}()
-        for dep in external_dependencies(ctx)
+        for dep in external_dependencies(ctx; monitored=false)
             dep_name = string(dep)
             if get(ctx.dep_to_input, dep_name, nothing) == name
                 downstream_neighbours[dep_name] = variable_channel(offline)
@@ -960,12 +1078,12 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates)
+        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(ctx, name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates, get(monitors, name, []))
         errormonitor(ctx.input_variables_tasks[name])
     end
 
     # Start the external dependency variables
-    unique_external_deps = external_dependencies(ctx)
+    unique_external_deps = external_dependencies(ctx; monitored=false)
     for dep in unique_external_deps
         dep_name = string(dep)
         input_name = ctx.dep_to_input[dep_name]
@@ -1100,10 +1218,70 @@ function stop_pipeline(ctx::ContextState; timeout=5)
         wait(ctx.output_forwarder_task)
     end
 
-    global current_ctx = nothing
-
     @debug "Pipeline fully stopped"
 
+    return nothing
+end
+
+# Ask `wait_pipeline` to stop the running pipeline, or to restart it with
+# `rewire!`d group dependencies.
+request_stop(ctx::ContextState) = put!(ctx.pipeline_events, :stop)
+request_rewire(ctx::ContextState) = put!(ctx.pipeline_events, :rewire)
+
+# Block until the running pipeline finishes, `request_stop` is called or a
+# group requests a rewire, then stop it. Returns whether the pipeline should be
+# started again, which is only the case after a rewire (`start_pipeline` then
+# picks up the new dependencies), so callers loop `while run_pipeline(ctx) end`.
+function wait_pipeline(ctx::ContextState)
+    reasons = Set([take!(ctx.pipeline_events)])
+    stop_pipeline(ctx)
+    # Stopping makes the watcher report `:finished`, and more requests may have
+    # arrived meanwhile.
+    while isready(ctx.pipeline_events)
+        push!(reasons, take!(ctx.pipeline_events))
+    end
+
+    return :rewire in reasons && :stop ∉ reasons
+end
+
+function run_pipeline(ctx::ContextState; kwargs...)
+    start_pipeline(ctx; kwargs...)
+    return wait_pipeline(ctx)
+end
+
+# Re-resolve the GroupParameter dependencies of every group variable from the
+# groups' current Parameter values and re-route the result. Called on a
+# stopped pipeline by `start_pipeline`: everything else (parameters, groups,
+# postprocessors, the worker state) is untouched, so no runtime state is lost
+# across a restart.
+function rewire!(ctx::ContextState)
+    for (name, deps) in ctx.dag
+        dot_idx = findfirst('.', name)
+        # Offline overrides have their dependencies cut on purpose
+        if isnothing(dot_idx) || haskey(ctx.variable_overrides, name)
+            continue
+        end
+
+        group_name = name[1:dot_idx-1]
+        object = ctx.groups[group_name]
+        group_type = typeof(object)
+        group_vars = ctx.group_types[group_type].variables
+        for (arg_name, dep) in @invokelatest variable_dependencies(ctx.functions[name])
+            if dep isa Dependency && dep.kind == DepKind_GroupParameter
+                resolved = resolve_group_parameter(dep, group_name, object, group_type, group_vars)
+                # A `Dependency("other.var")` value resolves to a subvariable
+                # reference, which load_from_module promotes to the group
+                # variable once all groups are known; here they already are.
+                if resolved isa Dependency && resolved.kind == DepKind_Subvariable &&
+                   haskey(ctx.dag, "$(resolved.parent).$(resolved.name)")
+                    resolved = Dependency("$(resolved.parent).$(resolved.name)")
+                end
+                deps[arg_name] = resolved
+            end
+        end
+    end
+
+    ctx.dep_to_input = build_dep_routing(ctx, ctx.dep_router)
     return nothing
 end
 
@@ -1323,53 +1501,10 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                                 argument_names)
             dag_deps[argument_names[arg_idx]] = group_dependency(group_name, group_type)
 
-            # Resolve GroupParameter dependencies, which may reference either
-            # a Parameter field of the group, another @Variable in the group,
-            # or a subvariable of one.
             for (arg_name, dep) in dag_deps
                 if dep isa Dependency && dep.kind == DepKind_GroupParameter
-                    dot_idx = findfirst('.', dep.parameter)
-                    head = isnothing(dot_idx) ? dep.parameter : dep.parameter[1:dot_idx-1]
-                    tail = isnothing(dot_idx) ? "" : dep.parameter[dot_idx+1:end]
-                    head_sym = Symbol(head)
-
-                    if hasfield(group_type, head_sym) && fieldtype(group_type, head_sym) <: Parameter
-                        if !isempty(tail)
-                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' cannot be subscripted with '.$tail'"))
-                        end
-                        param = getproperty(object, head_sym)
-                        if !isassigned(param)
-                            if !param.optional
-                                throw(XfaContextException("Parameter '$head' of group '$(group_name)' is required but wasn't set"))
-                            end
-                            # Unset optional dependency: kept in the DAG so the
-                            # variable's positional args still line up, but the
-                            # scheduler ignores it (no channel, no trainmatching)
-                            # and stream_variable passes `nothing` for this arg.
-                            dag_deps[arg_name] = param
-                        elseif !(param.value isa Dependency)
-                            throw(XfaContextException("Parameter '$head' of group '$(group_name)' must hold a Dependency value"))
-                        else
-                            # A dotted name in a DepKind_Variable means a subvariable
-                            # reference (the user-facing `Dependency("foo.bar")` form
-                            # can't disambiguate). Promote it so topological_sort and
-                            # the group-variable rewrite below see the right kind.
-                            resolved = param.value
-                            if resolved.kind == DepKind_Variable
-                                d = findfirst('.', resolved.name)
-                                if !isnothing(d)
-                                    resolved = subvariable_dependency(resolved.name[1:d-1],
-                                                                      resolved.name[d+1:end])
-                                end
-                            end
-                            dag_deps[arg_name] = resolved
-                        end
-                    elseif any(nameof(f) == head_sym for f in group_types[group_type].variables)
-                        var_name = "$group_name.$head"
-                        dag_deps[arg_name] = isempty(tail) ? Dependency(var_name) : subvariable_dependency(var_name, tail)
-                    else
-                        throw(XfaContextException("'$head' is not a Parameter field or @Variable of $(nameof(group_type))"))
-                    end
+                    dag_deps[arg_name] = resolve_group_parameter(dep, group_name, object, group_type,
+                                                                 group_types[group_type].variables)
                 end
             end
 
@@ -1510,8 +1645,9 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
                      displays=ctx_displays,
-                     parameters, exprs, inputs, prelude)
+                     parameters, exprs, inputs, prelude, dep_router)
     ctx.dep_to_input = build_dep_routing(ctx, dep_router)
+    global current_ctx = ctx
     return ctx
 end
 
@@ -1523,6 +1659,54 @@ function load_from_file(ctx_path::AbstractString; dep_router=Returns(nothing), p
     ctx = load_from_string(read(ctx_path, String); dep_router, prelude)
     ctx.path = ctx_path
     return ctx
+end
+
+# Resolve a GroupParameter dependency of a variable of the instantiated group
+# `object`. It may reference a Parameter field of the group (whose current
+# Dependency value is returned), another @Variable in the group, or a
+# subvariable of one.
+function resolve_group_parameter(dep::Dependency, group_name, object, group_type, group_vars)
+    dot_idx = findfirst('.', dep.parameter)
+    head = isnothing(dot_idx) ? dep.parameter : dep.parameter[1:dot_idx-1]
+    tail = isnothing(dot_idx) ? "" : dep.parameter[dot_idx+1:end]
+    head_sym = Symbol(head)
+
+    if hasfield(group_type, head_sym) && fieldtype(group_type, head_sym) <: Parameter
+        if !isempty(tail)
+            throw(XfaContextException("Parameter '$head' of group '$(group_name)' cannot be subscripted with '.$tail'"))
+        end
+        param = getproperty(object, head_sym)
+        if !isassigned(param)
+            if !param.optional
+                throw(XfaContextException("Parameter '$head' of group '$(group_name)' is required but wasn't set"))
+            end
+            # Unset optional dependency: kept in the DAG so the variable's
+            # positional args still line up, but the scheduler ignores it (no
+            # channel, no trainmatching) and stream_variable passes `nothing`
+            # for this arg.
+            return param
+        elseif !(param.value isa Dependency)
+            throw(XfaContextException("Parameter '$head' of group '$(group_name)' must hold a Dependency value"))
+        else
+            # A dotted name in a DepKind_Variable means a subvariable reference
+            # (the user-facing `Dependency("foo.bar")` form can't disambiguate).
+            # Promote it so topological_sort and the group-variable rewrite in
+            # load_from_module see the right kind.
+            resolved = param.value
+            if resolved.kind == DepKind_Variable
+                d = findfirst('.', resolved.name)
+                if !isnothing(d)
+                    resolved = subvariable_dependency(resolved.name[1:d-1], resolved.name[d+1:end])
+                end
+            end
+            return resolved
+        end
+    elseif any(nameof(f) == head_sym for f in group_vars)
+        var_name = "$group_name.$head"
+        return isempty(tail) ? Dependency(var_name) : subvariable_dependency(var_name, tail)
+    else
+        throw(XfaContextException("'$head' is not a Parameter field or @Variable of $(nameof(group_type))"))
+    end
 end
 
 function _get_group_objects(ctx_module, group_types)

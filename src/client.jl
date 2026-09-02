@@ -407,7 +407,7 @@ function build_context_state(state, ctx_info)
 
         for (arg_name, dep) in deps
             attr_id = hash("$(name).dependencies.$(arg_name => dep)")
-            push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
+            push!(ctx_state[name]["dependencies"], DependencyPin(; id=attr_id, arg_name, dep))
             if dep isa Dependency
                 state.client.ne_dep_pins[attr_id] = DepPinInfo(name, arg_name, name, dep)
             end
@@ -457,12 +457,6 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
-        # Maps attr_id -> group struct field name, for arg_names that bind to a
-        # Parameter{Dependency} field of the group. The client uses the field
-        # name (not the @Variable's arg_name) when rewriting the constructor
-        # kwarg in source.
-        ctx_state[name]["dep_field_names"] = Dict{UInt, String}()
-        ctx_state[name]["optional_deps"] = Set{UInt}()
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
@@ -487,12 +481,10 @@ function build_context_state(state, ctx_info)
                 end
                 push!(seen_field_names, field_name)
                 attr_id = hash("$(var_name).dependencies.$(arg_name => dep)")
-                push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
-                ctx_state[name]["dep_field_names"][attr_id] = field_name
+                push!(ctx_state[name]["dependencies"],
+                      DependencyPin(; id=attr_id, arg_name, dep, field=field_name,
+                                    optional=ctx_info["parameters"]["$(name).$(field_name)"].optional))
                 push!(dep_param_names, field_name)
-                if ctx_info["parameters"]["$(name).$(field_name)"].optional
-                    push!(ctx_state[name]["optional_deps"], attr_id)
-                end
                 # The group's kwarg is what gets rewritten, not the member
                 # variable's argument.
                 if dep isa Dependency
@@ -553,9 +545,8 @@ function build_context_state(state, ctx_info)
                         break
                     end
                 end
-                push!(ctx_state[name]["dependencies"], (attr_id, stripped_name => dep))
-                ctx_state[name]["dep_field_names"][attr_id] = stripped_name
-                push!(ctx_state[name]["optional_deps"], attr_id)
+                push!(ctx_state[name]["dependencies"],
+                      DependencyPin(; id=attr_id, arg_name=stripped_name, dep, field=stripped_name, optional=true))
                 state.client.ne_dep_pins[attr_id] = DepPinInfo(name, stripped_name, owner, dep)
             else
                 ctx_state[name]["parameters"][stripped_name] = param
@@ -585,8 +576,8 @@ function build_context_state(state, ctx_info)
     # same group field collapse to one link.
     group_field_pins = Dict{Tuple{String, String}, UInt}()
     for gname in ctx_info["groups"]
-        for (aid, fname) in ctx_state[gname]["dep_field_names"]
-            group_field_pins[(gname, fname)] = aid
+        for pin in ctx_state[gname]["dependencies"]
+            group_field_pins[(gname, pin.field)] = pin.id
         end
     end
     group_param_args_all = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
@@ -818,6 +809,7 @@ function store_variable_data!(client, variable::VariableData)
     store.x_axis = variable.x_axis
     store.y_axis = variable.y_axis
     store.unit = variable.unit
+    store.bin_resolution = variable.bin_resolution
     store.fixed_aspect = variable.fixed_aspect
     store.plot_type = variable.plot_type
     store.plot_specs = variable.plot_specs

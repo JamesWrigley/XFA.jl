@@ -595,6 +595,200 @@ end
     """)
 end
 
+@testset "Property monitoring" begin
+    watched_group = raw"""
+    @Group mutable struct Watched
+        device::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true)
+        updates::Vector{Any} = []
+    end
+
+    function Context.monitored_properties(w::Watched)
+        if !isassigned(w.device)
+            return Dependency[]
+        end
+        return [karabo_dependency(w.device[].name, "foo.bar"),
+                karabo_dependency(w.device[].name, "baz")]
+    end
+
+    Context.on_properties_changed(w::Watched, changed) = push!(w.updates, changed)
+    """
+
+    ctx = Context.load_from_string("""
+    $(watched_group)
+
+    @Input function input(::Context.MockInput, output)
+        # (train, foo.bar update tid, baz update tid)
+        for (tid, bar_tid, baz_tid) in ((1, 0, 0), (2, 0, 0), (3, 2, 0), (4, 3, 3))
+            put!(output, (tid, Dict("DEV" => Dict("foo.bar.value" => bar_tid * 10,
+                                                   "foo.bar.timestamp.tid" => bar_tid,
+                                                   "baz.value" => "b\$(baz_tid)",
+                                                   "baz.timestamp.tid" => baz_tid))))
+        end
+    end
+    x = Context.MockInput()
+    w = Watched(; device=KaraboDevice("", "DEV"))
+    """)
+
+    # Monitored deps are routed like DAG deps but get no channels of their own
+    @test Set(string.(Context.external_dependencies(ctx))) == Set(["DEV.foo.bar", "DEV.baz"])
+    @test isempty(Context.external_dependencies(ctx; monitored=false))
+    @test ctx.dep_to_input == Dict("DEV.foo.bar" => "x.input", "DEV.baz" => "x.input")
+
+    # The callback fires once on first receipt, then only for properties whose
+    # update tid changed, batched per train.
+    w = ctx.groups["w"]
+    Context.run(ctx) do
+        @test timedwait(() -> length(w.updates) == 3, 5) == :ok
+    end
+    @test w.updates == [Dict("foo.bar" => (; value=0, tid=0), "baz" => (; value="b0", tid=0)),
+                        Dict("foo.bar" => (; value=20, tid=2)),
+                        Dict("foo.bar" => (; value=30, tid=3), "baz" => (; value="b3", tid=3))]
+
+    # Nothing to monitor while the device is unset
+    ctx = Context.load_from_string("""
+    $(watched_group)
+    w = Watched()
+    """)
+    @test isempty(Context.external_dependencies(ctx))
+end
+
+@testset "Rewiring" begin
+    follower = raw"""
+    @Group mutable struct Follower
+        device::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true)
+        source::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
+    end
+
+    function Context.monitored_properties(f::Follower)
+        if !isassigned(f.device)
+            return Dependency[]
+        end
+        return [karabo_dependency(f.device[].name, "target")]
+    end
+
+    # Only report a change when the derived dependency actually changed, the
+    # input replays `target` after every restart.
+    function Context.on_properties_changed(f::Follower, changed)
+        new_source = karabo_dependency(changed["target"].value, "pos")
+        dep_changed = f.source[] != new_source
+        tryset(f.source, new_source; force=true)
+        return dep_changed
+    end
+
+    @Variable function follow(::Follower, data -> Follower.source)
+        return data
+    end
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (1, Dict("CTRL" => Dict("target.value" => "motor", "target.timestamp.tid" => 1))))
+        for tid in 2:4
+            put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+        end
+    end
+    x = Context.MockInput()
+    """
+    follow_outputs(ctx) = [v.data for v in ctx.stream_output if v.name == "f.follow"]
+
+    # Manual rewire: an unset optional dependency is a Parameter placeholder in
+    # the DAG until the group assigns it and the context is rewired.
+    ctx = Context.load_from_string("""
+    $(follower)
+    f = Follower()
+    """)
+    @test ctx.dag["f.follow"]["data"] isa Parameter
+    @test isempty(ctx.dep_to_input)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+
+    Context.tryset(ctx.groups["f"].source, karabo_dependency("motor", "pos"); force=true)
+    Context.rewire!(ctx)
+    @test ctx.dag["f.follow"]["data"] == karabo_dependency("motor", "pos")
+    @test ctx.dep_to_input == Dict("motor.pos" => "x.input")
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test follow_outputs(ctx) == [2, 3, 4]
+
+    # Automatic rewire: the first train derives the dependency and asks for a
+    # restart, its replay after the restart doesn't.
+    ctx = Context.load_from_string("""
+    $(follower)
+    f = Follower(; device=KaraboDevice("", "CTRL"))
+    """)
+    @test ctx.dep_to_input == Dict("CTRL.target" => "x.input")
+    restarts = 0
+    while Context.run_pipeline(ctx)
+        restarts += 1
+    end
+    @test restarts == 1
+    @test ctx.dag["f.follow"]["data"] == karabo_dependency("motor", "pos")
+    @test ctx.dep_to_input == Dict("CTRL.target" => "x.input", "motor.pos" => "x.input")
+    @test follow_outputs(ctx) == [2, 3, 4]
+
+    # A stop request wins over a rewire request
+    Context.start_pipeline(ctx)
+    Context.request_rewire(ctx)
+    Context.request_stop(ctx)
+    @test !Context.wait_pipeline(ctx)
+end
+
+@testset "Scan automatic mode" begin
+    ctx = Context.load_from_string(raw"""
+    # The scantool's properties and the trains following them, edited by the test
+    scantool = Ref{Any}(nothing)
+    trains = Ref{Any}([])
+    @Input function input(::Context.MockInput, output)
+        put!(output, (1, Dict("SCAN" => scantool[])))
+        for (tid, data) in trains[]
+            put!(output, (tid, data))
+        end
+    end
+    x = Context.MockInput()
+    scn = Context.Scan(; value=karabo"det.intensity", scantool=KaraboDevice("", "SCAN"),
+                       motor_priority=["MOTOR_A"])
+    """)
+    scn = ctx.groups["scn"]
+    mod = Context.worker_state.current_ctx_module
+    configure(props...) = mod.scantool[] = Dict(Iterators.flatten(("$(k).value" => v, "$(k).timestamp.tid" => 1)
+                                                                  for (k, v) in props))
+    train(tid, motor, pos, intensity) = tid => Dict("det" => Dict("intensity" => intensity),
+                                                     motor => Dict("actualPosition" => pos))
+    scan_outputs() = [v for v in ctx.stream_output if v.name == "scn.scan"]
+
+    # A 1-D scan moving MOTOR_X and MOTOR_A together from a shared start point,
+    # the latter in steps of 0.1: its first train derives the preferred motor and
+    # restarts the pipeline, which then bins at half that motor's step size.
+    configure("deviceEnv.activeMotorDeviceIds" => ["MOTOR_X", "MOTOR_A"], "deviceEnv.activeMotors" => ["x", "a"],
+              "scanEnv.scanType" => "ascan", "scanEnv.startPoints" => [0.0],
+              "scanEnv.stopPoints" => [5.0, 1.0], "scanEnv.steps" => [10])
+    mod.trains[] = [train(2, "MOTOR_A", 0.0, 1.0), train(3, "MOTOR_A", 0.1, 2.0),
+                    train(4, "MOTOR_A", 0.1, 3.0), train(5, "MOTOR_A", 0.2, 4.0)]
+    @test Context.run_pipeline(ctx)
+    @test scn.position1[] == karabo_dependency("MOTOR_A", "actualPosition")
+    @test scn.resolution[] ≈ [0.05]
+    @test !Context.run_pipeline(ctx)
+    out = last(scan_outputs())
+    @test Context.DD.lookup(out.data, :position1) ≈ [0.0, 0.1, 0.2]
+    @test collect(out.data) ≈ [1.0, 2.5, 4.0]
+    @test out.xlabel == "a"
+    position = out.subvariables["scn.scan.position1"]
+    @test position.data == 0.2 && position.title == "a" && position.bin_resolution ≈ 0.05
+
+    # A scan of MOTOR_B alone rewires to it and resets the bins
+    configure("deviceEnv.activeMotorDeviceIds" => ["MOTOR_B"], "deviceEnv.activeMotors" => ["b"],
+              "scanEnv.scanType" => "dscan", "scanEnv.startPoints" => [0.0],
+              "scanEnv.stopPoints" => [2.0], "scanEnv.steps" => [4])
+    mod.trains[] = [train(2, "MOTOR_B", 0.0, 5.0)]
+    @test Context.run_pipeline(ctx)
+    @test !Context.run_pipeline(ctx)
+    @test ctx.dag["scn.scan"]["position1"] == karabo_dependency("MOTOR_B", "actualPosition")
+    @test scn.resolution[] ≈ [0.25]
+    out = only(scan_outputs())
+    @test collect(out.data) == [5.0]
+    @test out.xlabel == "b"
+end
+
 @testset "@Input" begin
     @test_throws ArgumentError Context._input(@__MODULE__, "foo", false)
     @test_throws ArgumentError Context._input(@__MODULE__, :(1 + 1), false)
@@ -1370,6 +1564,17 @@ end
         @test m(Float32[1, 2]) == Float32[1, 2]
         @test eltype(m.buffer) === Float32
         @test m.buffer !== prev
+
+        # Scalars are averaged the same way
+        m = Context.MovingAvg(; nsamples=3)
+        @test m(1) === 1.0
+        @test m(3) === 2.0
+
+        # Non-finite samples are skipped, and don't poison an unseeded entry
+        m = Context.MovingAvg(; nsamples=3)
+        @test isequal(m([1.0, NaN]), [1.0, NaN])
+        @test m([NaN, 4.0]) == [1.0, 4.0]
+        @test m([3.0, Inf]) == [2.0, 4.0]
     end
 
     @testset "center_of_mass" begin
@@ -1515,6 +1720,8 @@ end
         @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
         @test out.xlabel == "mono.energy"
         @test collect(subvars["scan.counts"].data) == [3, 1]
+        position = subvars["scan.position1"]
+        @test position.data == -0.580 && position.title == "mono.energy" && position.bin_resolution == 0.005
 
         # 2-D scalar raster: wiring position2 adds a second axis, giving a clean
         # grid with one position lookup per motor.

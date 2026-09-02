@@ -626,9 +626,7 @@ function set_parameter(name::String, value, requestor::String)
         end
     end
 
-    if !isnothing(current_ctx)
-        current_ctx.on_parameter_changed(name, value)
-    end
+    current_ctx.on_parameter_changed(name, value)
 end
 
 function _input(ctx_module, expr, side_effects)

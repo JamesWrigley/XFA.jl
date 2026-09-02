@@ -78,6 +78,7 @@ PlotSpec(name::AbstractString, vars::AbstractVector{<:AbstractString}; kwargs...
     xlabel::Union{String, Nothing} = nothing
     ylabel::Union{String, Nothing} = nothing
     unit::Union{String, Nothing} = nothing
+    bin_resolution::Float64 = 0.0
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
     plot_specs::Vector{PlotSpec} = PlotSpec[]

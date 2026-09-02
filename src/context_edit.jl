@@ -354,6 +354,7 @@ format_param_value(s::String) = "\"$(escape_string(s))\""
 format_param_value(roi::RectROI) =
     "RectROI($(roi.corner_x), $(roi.corner_y), $(roi.width), $(roi.height))"
 format_param_value(x::Union{Integer, AbstractFloat, Bool}) = repr(x)
+format_param_value(d::KaraboDevice) = "KaraboDevice(\"$(d.topic)\", \"$(d.name)\")"
 format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) =
     "[" * join((repr(x) for x in v), ", ") * "]"
 format_param_value(_) = nothing

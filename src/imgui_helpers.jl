@@ -925,7 +925,7 @@ function draw_karabo_editor(client::ClientState)
         viewport = unsafe_load(ig.igGetMainViewport())
         center = ImVec2(viewport.Pos.x + viewport.Size.x / 2, viewport.Pos.y + viewport.Size.y / 2)
         ig.SetNextWindowPos(center, ig.ImGuiCond_Appearing, ImVec2(0.5, 0.5))
-        ig.SetNextWindowSize(ImVec2(460, dep_state.device_only ? 150 : 260), ig.ImGuiCond_Appearing)
+        ig.SetNextWindowSize(ImVec2(460, dep_state.device_only ? 190 : 260), ig.ImGuiCond_Appearing)
         ig.SetNextWindowFocus()
         dep_state.trigger = false
     end
@@ -1022,7 +1022,8 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
     result = nothing
     if field_state.edit != ElidedEditState_NoEdit
         result, hovered = draw_source_completions(popup_id, field_state, dep_state.source,
-                                                  dep_state.source_list, dep_state.allow_slow, client)
+                                                  dep_state.source_list, dep_state.allow_slow, client;
+                                                  device_only=dep_state.device_only)
         dep_state.ac_hovered |= hovered
         dep_state.ac_active = true
         if !ig.IsItemActive() && !hovered
@@ -1050,10 +1051,11 @@ source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev
 # the selected device's pipeline channels in a column on the right (menu style,
 # so the device rows don't move as the selection does). Device schemas are
 # fetched lazily (only for the visible rows, and only after the query has been
-# stable for 1s) so typing doesn't flood the webproxy. Returns (selected, hovered).
+# stable for 1s) so typing doesn't flood the webproxy. `device_only` completes
+# bare devices: no channel column, no schema fetches. Returns (selected, hovered).
 function draw_source_completions(popup_id, field_state::ElidedTextState, text::AbstractString,
                                  source_list::Vector{SourceInfo}, allow_slow::Bool,
-                                 client::ClientState)
+                                 client::ClientState; device_only::Bool=false)
     topic_fixed, query = split_topic(strip_channel(text))
     sources = isempty(topic_fixed) ? source_list :
               filter(s -> s.topic == topic_fixed, source_list)
@@ -1104,8 +1106,8 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
     # is sized here, before that.
     field_state.selected_idx = clamp(field_state.selected_idx, 1, length(visible))
     selected_dev = visible[field_state.selected_idx][2]
-    selected_props = get(client.source_properties,
-                         (selected_dev.topic, selected_dev.name), nothing)
+    selected_props = device_only ? nothing :
+                     get(client.source_properties, (selected_dev.topic, selected_dev.name), nothing)
     channels = isnothing(selected_props) ? String[] : sort!(collect(keys(selected_props.fast)))
     field_state.channel_idx = clamp(field_state.channel_idx, 0, length(channels))
 
@@ -1165,10 +1167,10 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
         if ig.BeginChild("##devices-$(popup_id)", ImVec2(device_width, 0))
             for (idx, (_, dev)) in enumerate(visible)
                 key = (dev.topic, dev.name)
-                in_flight = haskey(client.device_schema_requests, key)
-                props = get(client.source_properties, key, nothing)
+                in_flight = !device_only && haskey(client.device_schema_requests, key)
+                props = device_only ? nothing : get(client.source_properties, key, nothing)
                 # Trigger a lazy schema fetch once the query has settled.
-                if debounced && isnothing(props) && !in_flight
+                if !device_only && debounced && isnothing(props) && !in_flight
                     get_source_properties(client, dev.topic, dev.name)
                 end
                 has_channels = !isnothing(props) && !isempty(props.fast)
