@@ -294,6 +294,7 @@ const SCALAR_BUFFER_CAPACITY = 10_000
     xlabel::String = ""
     ylabel::String = ""
     unit::Maybe{String} = nothing
+    bin_resolution::Float64 = 0.0
     fixed_aspect::Bool = true
     plot_type::Symbol = :series
     compress::Bool = true
@@ -313,6 +314,18 @@ struct OutputPin
     is_subvariable::Bool
 end
 OutputPin(id, label) = OutputPin(id, label, false)
+
+# An input pin of a node: a variable argument or, for groups, a
+# Parameter{Dependency} field (`field` is then the constructor kwarg rewritten
+# in source). Readonly pins are engine-managed and drawn disabled.
+@kwdef mutable struct DependencyPin
+    id::UInt
+    arg_name::String
+    dep::Any
+    field::Union{String, Nothing} = nothing
+    optional::Bool = false
+    readonly::Bool = false
+end
 
 # A dependency pin, as needed to rewrite the dependency when a link is dragged
 # onto it.

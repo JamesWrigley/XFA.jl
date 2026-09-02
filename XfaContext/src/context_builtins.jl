@@ -380,7 +380,16 @@ default_name(::MovingAvg) = "moving_avg"
 
 function update_moving_avg!(buffer::AbstractArray{T}, data, nsamples) where {T}
     alpha = T(2 / (nsamples + 1))
-    @. buffer = alpha * data + (1 - alpha) * buffer
+    for i in eachindex(buffer, data)
+        x = data[i]
+        if !isfinite(x)
+            continue
+        elseif isfinite(buffer[i])
+            buffer[i] = alpha * x + (1 - alpha) * buffer[i]
+        else
+            buffer[i] = x
+        end
+    end
     return buffer
 end
 
@@ -430,13 +439,16 @@ end
 function (m::MovingAvg)(data::AbstractArray)
     key = hash((size(data), eltype(data)))
     if key != m.buffer_key
-        m.buffer = float(eltype(data)).(data)
+        m.buffer = map(float(eltype(data)), data)
         m.buffer_key = key
         return m.buffer
     end
 
     return update_moving_avg!(m.buffer, data, m.nsamples[])
 end
+
+# Scalars go through the same buffer as a zero-dimensional array
+(m::MovingAvg)(data::Number) = m(fill(data))[]
 
 ## Scan group
 
@@ -445,14 +457,32 @@ end
 # wired `positionN`, with `position2` optional (unset => 1-D scan). All the
 # binning logic lives in the reusable `ScanBinner` (see binning.jl); this group
 # wires it to tid-matched `value`/`position1`/`position2` inputs.
+#
+# With `scantool` assigned the group mirrors a Karabacon scantool device
+# instead: the motor dependency and the bin resolution are derived from its
+# configuration (see `on_properties_changed`), so `position1` is then
+# engine-managed and `resolution` follows the scan's step size unless pinned in
+# the GUI.
 @Group mutable struct Scan
     resolution::Parameter{Vector{Float64}} = Parameter(rebin, [1e-3])
     history_budget::Parameter{Int} = Parameter(64 * 1024 * 1024)
     value::Parameter{Dependency}
-    position1::Parameter{Dependency}
+    # Optional so the pipeline can start before a scantool has assigned a motor.
+    position1::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
     position2::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
+    scantool::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; update_handler=scantool_changed, optional=true)
+    # The motors' position property. Karabacon's motor interfaces differ here
+    # (e.g. slits use actualPositionX, monochromators actualEnergy).
+    position_property::Parameter{String} = Parameter("actualPosition")
+    # For 1-D scans moving several motors together: the first of these that's
+    # active is followed, otherwise the scantool's first motor.
+    motor_priority::Vector{String} = String[]
 
     binner::Union{Nothing, ScanBinner} = nothing
+    # The scantool's alias of the followed motor, for labelling
+    motor_alias::String = ""
+    # Latest values of the monitored scantool properties
+    scantool_state::Dict{String, Any} = Dict{String, Any}()
 end
 
 # Flag a resolution change on the live binner; if none exists yet it'll be built
@@ -463,6 +493,83 @@ function rebin(scn::Scan, _)
     end
 end
 
+# A new scantool means new monitored properties, which are routed when the
+# pipeline (re)starts.
+function scantool_changed(scn::Scan, _)
+    empty!(scn.scantool_state)
+    request_rewire(current_ctx)
+end
+
+function monitored_properties(scn::Scan)
+    if !isassigned(scn.scantool)
+        return Dependency[]
+    end
+
+    dev = scn.scantool[]
+    topic = isempty(dev.topic) ? nothing : dev.topic
+    return [karabo_dependency(topic, dev.name, property)
+            for property in ("deviceEnv.activeMotorDeviceIds", "deviceEnv.activeMotors", "scanEnv.scanType",
+                             "scanEnv.startPoints", "scanEnv.stopPoints", "scanEnv.steps")]
+end
+
+# Mirror the scantool's configuration. The 1-D scan types move all active
+# motors along a single axis, so one of them is followed (see
+# `motor_priority`); mesh scans aren't supported yet. Step scans also set the
+# bin resolution from their step size, continuous and custom scans have no
+# useful one. The first notification carries every monitored property, so
+# `scantool_state` is complete from then on.
+function on_properties_changed(scn::Scan, changed)
+    for (property, update) in changed
+        scn.scantool_state[property] = update.value
+    end
+    state = scn.scantool_state
+    motors = String.(state["deviceEnv.activeMotorDeviceIds"])
+    scan_type = state["scanEnv.scanType"]
+    dev = scn.scantool[]
+
+    # Index into the scantool's motor list of the one to follow
+    motor_idx = if scan_type in ("mesh", "dmesh")
+        @warn "Scan '$(Meta.name[])': mesh scans aren't supported yet" maxlog=1
+        nothing
+    elseif scan_type == "tscan" || isempty(motors)
+        nothing
+    else
+        preferred = findfirst(in(motors), scn.motor_priority)
+        isnothing(preferred) ? 1 : findfirst(==(scn.motor_priority[preferred]), motors)
+    end
+
+    # The aliases are listed in the same order as the device ids
+    position = if isnothing(motor_idx)
+        scn.motor_alias = ""
+        nothing
+    else
+        scn.motor_alias = String(state["deviceEnv.activeMotors"][motor_idx])
+        topic = isempty(dev.topic) ? nothing : dev.topic
+        karabo_dependency(topic, motors[motor_idx], scn.position_property[])
+    end
+    dep_changed = scn.position1[] != position
+    if dep_changed
+        tryset(scn.position1, position; force=true)
+        # The old bins were over another motor
+        scn.binner = nothing
+        @info "Scan '$(Meta.name[])' follows $(isnothing(position) ? "no motor" : position.source) of scantool '$(dev.name)'"
+    end
+
+    # Half a step snaps positions onto the nearest level. Start/stop points are
+    # per motor (a single one applies to every motor), the step count is shared.
+    if scan_type in ("ascan", "dscan") && !isnothing(motor_idx)
+        starts = state["scanEnv.startPoints"]
+        stops = state["scanEnv.stopPoints"]
+        step = abs(Float64(stops[min(motor_idx, end)] - starts[min(motor_idx, end)]))
+        resolution = step / max(state["scanEnv.steps"][1], 1) / 2
+        if resolution > 0 && tryset(scn.resolution, [resolution])
+            rebin(scn, scn.resolution[])
+        end
+    end
+
+    return dep_changed
+end
+
 # Bin train-resolved `value` by its motor position(s). The trainmatcher
 # tid-aligns `value`/`position1`/`position2` before the body runs (as
 # `correlate` receives matched `x`/`y`). Returns a DimArray over the discovered
@@ -470,6 +577,10 @@ end
 # `uncertainty` subvariables over the same grid.
 @Variable function scan(scn::Scan, value -> Scan.value,
                         position1 -> Scan.position1, position2 -> Scan.position2)
+    if isnothing(position1)
+        return nothing
+    end
+
     D = isassigned(scn.position2) ? 2 : 1
     if isnothing(scn.binner)
         scn.binner = ScanBinner(D)
@@ -484,8 +595,13 @@ end
     @add_subvariable("counts", DD.rebuild(seq.count; name=:counts))
     @add_subvariable("uncertainty", DD.rebuild(seq.std; name=:uncertainty))
 
-    return VariableData(; data=DD.rebuild(seq.mean; name=:scan),
-                        xlabel=scn.position1.value.name,
+    # The position as a labelled scalar carrying the bin resolution, so a
+    # correlation against it bins and labels the same way as the scan.
+    xlabel = isempty(scn.motor_alias) ? scn.position1.value.name : scn.motor_alias
+    @add_subvariable("position1", VariableData(; data=position1, title=xlabel,
+                                               bin_resolution=seq.axes[1].resolution))
+
+    return VariableData(; data=DD.rebuild(seq.mean; name=:scan), xlabel,
                         ylabel=D == 2 ? scn.position2.value.name : nothing,
                         compress=false, fixed_aspect=false)
 end

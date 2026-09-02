@@ -288,6 +288,66 @@ end
             end
         end
     end
+
+    @testset "Rewiring" begin
+        # A group deriving a dependency from a monitored property restarts the
+        # pipeline, and the rewired context is pushed to the clients.
+        # The context file has to outlive the run, the engine re-reads it for
+        # every ContextInfo.
+        mktemp() do path, io
+            write(path, raw"""
+            @Group mutable struct Follower
+                source::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
+            end
+            Context.monitored_properties(::Follower) = [karabo_dependency("CTRL", "target")]
+            function Context.on_properties_changed(f::Follower, changed)
+                new_source = karabo_dependency(changed["target"].value, "pos")
+                dep_changed = f.source[] != new_source
+                tryset(f.source, new_source; force=true)
+                return dep_changed
+            end
+            @Variable function follow(::Follower, data -> Follower.source)
+                return data
+            end
+
+            @Input function input(::Context.MockInput, output)
+                put!(output, (1, Dict("CTRL" => Dict("target.value" => "motor", "target.timestamp.tid" => 1))))
+                for tid in 2:1_000_000
+                    put!(output, (tid, Dict("motor" => Dict("pos" => tid))))
+                    sleep(0.001)
+                end
+            end
+            x = Context.MockInput()
+            f = Follower()
+            """)
+
+            temp_engine(; log=TestLogger()) do address, stop_event, info_path
+                WebSockets.open(address) do ws
+                    WebSockets.receive(ws) # client id
+
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    # Unassigned optional dependencies aren't edges
+                    @test !haskey(msg.info["dag"]["f.follow"], "data")
+
+                    Protocol.client_send(ws, Protocol.Start())
+                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                    # The restart resends the context with the derived edge
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    @test msg.is_running
+                    @test msg.info["dag"]["f.follow"]["data"] == karabo_dependency("motor", "pos")
+                    @test msg.info["dep_to_input"]["motor.pos"] == "x.input"
+
+                    Protocol.client_send(ws, Protocol.Stop())
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.Stopped); msg = Protocol.receive(ws).msg end
+                end
+            end
+        end
+    end
 end
 
 @testset "Message tracking" begin
@@ -419,6 +479,8 @@ end
                 "scalar" => 42.314,
                 "boolean" => true,
                 "list" => ["foo", "bar", 42, 3.14],
+                # As Karabo sends VectorString properties (e.g. a scantool's motor list)
+                "strings" => ["motor_a", "motor_b"],
             ))
             for type in [Bool,
                          Float16, Float32, Float64,
@@ -436,6 +498,7 @@ end
             put!(server, dummy_data)
             data, metadata = take!(client)
             @test dummy_data == data
+            @test data["foo"]["strings"] isa Vector{String}
         end
     end
 

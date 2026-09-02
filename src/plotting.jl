@@ -1008,6 +1008,7 @@ layer_id(layer::VariableLayer) = layer.layer_id_str
     const selected::Vector{String} = ["", ""]
     const subscribed::Vector{String} = ["", ""]
     const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
+    resolution_touched::Bool = false
     const matcher::VariableTrainmatcher = VariableTrainmatcher()
     const fit::FitSettings = FitSettings()
     # Refreshed each frame from client.variable_data; used by the X/Y combos.
@@ -2054,6 +2055,7 @@ function top_controls(layer::CorrelationLayer, ::Plot)
     # Record the user's choice as the new anchor.
     if x_changed
         layer.selected[1] = layer.variable_names[layer.x_var[] + 1]
+        layer.resolution_touched = false
     end
     if y_changed
         layer.selected[2] = layer.variable_names[layer.y_var[] + 1]
@@ -2095,6 +2097,10 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
     label = "$(x_name) vs $(y_name)"
     if x.type == VariableType_Scalar
         data_updated = ingest_scalar!(m, x, y, updated_variables, x_name, y_name)
+        # Follow the X variable's hint (0 for none) until the user sets a resolution
+        if !layer.resolution_touched
+            layer.binning_resolution[] = Cfloat(x.bin_resolution)
+        end
         accu_changed = set_resolution!(m, layer.binning_resolution[])
         if data_updated || accu_changed
             if isnothing(m.accu)
@@ -2142,7 +2148,9 @@ function axis_labels(layer::CorrelationLayer)
     if n == 0
         return ("", "")
     end
-    (layer.variable_names[layer.x_var[] + 1], layer.variable_names[layer.y_var[] + 1])
+    variable_data = state[].client.variable_data
+    (variable_data[layer.variable_names[layer.x_var[] + 1]].title,
+     variable_data[layer.variable_names[layer.y_var[] + 1]].title)
 end
 
 side_panel(layer::CorrelationLayer, ::Plot) = draw_fitting_settings(layer.layer_id_str, layer.fit)
@@ -2170,11 +2178,13 @@ function bottom_controls(layer::CorrelationLayer, ::Plot)
     end
 
     ig.SameLine()
-    ig.SetNextItemWidth(120)
-    ig.DragFloat("Binning resolution##$(id)",
-                 layer.binning_resolution, 0.01f0,
-                 0.0f0, typemax(Cfloat), "%.8f",
-                 ig.ImGuiSliderFlags_AlwaysClamp)
+    ig.SetNextItemWidth(135)
+    if ig.DragFloat("Binning resolution##$(id)",
+                    layer.binning_resolution, 0.01f0,
+                    0.0f0, typemax(Cfloat), "%.12f",
+                    ig.ImGuiSliderFlags_AlwaysClamp)
+        layer.resolution_touched = true
+    end
 end
 
 # --- SpecLayer methods (struct defined above with the other layers) ---

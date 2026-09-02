@@ -332,21 +332,21 @@ function draw_parameter_widget(name, param::Parameter{OptionalDims})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{KaraboDevice})
+function draw_parameter_widget(name, param::Parameter{KaraboDevice}, sources)
     client = state[].client
     dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
 
     device = param.value
-    text = "$(device.topic)//$(device.name)"
+    text = isnothing(device) ? "" : "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     client.trainmatcher_sources, client; device_only=true)
+                                     sources, client; device_only=true)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
-            idx = findfirst(s -> s.name == new_device.name, client.trainmatcher_sources)
+            idx = findfirst(s -> s.name == new_device.name, sources)
             if !isnothing(idx)
-                new_device = KaraboDevice(client.trainmatcher_sources[idx].topic, new_device.name)
+                new_device = KaraboDevice(sources[idx].topic, new_device.name)
             end
         end
         return true, new_device
@@ -479,11 +479,11 @@ end
 
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
-function draw_parameter(name, param; min_node_width=150, pending=false)
+function draw_parameter(name, param, widget_args...; min_node_width=150, pending=false)
     ig.Text(name * ":")
     ig.SameLine()
     ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
-    modified, new_value = draw_parameter_widget(name, param)
+    modified, new_value = draw_parameter_widget(name, param, widget_args...)
     if modified
         if pending
             # A not-yet-added node: keep the edit local, don't touch the engine.
@@ -502,7 +502,11 @@ function draw_parameters(var_data; pending=false)
     if haskey(var_data, "parameters")
         ig.Text("Parameters:")
         for (param_name, param) in var_data["parameters"]
-            draw_parameter(param_name, param; pending)
+            if param isa Parameter{KaraboDevice}
+                draw_parameter(param_name, param, state[].client.source_list; pending)
+            else
+                draw_parameter(param_name, param; pending)
+            end
         end
     end
 end
@@ -611,7 +615,6 @@ function spec_to_var_data(pending::PendingNode)
         "dependencies" => [],
         "outputs" => OutputPin[OutputPin(hash("$(base).outputs."), "")],
         "postprocessors" => [],
-        "optional_deps" => Set{UInt}(),
     )
 
     if is_var
@@ -619,21 +622,15 @@ function spec_to_var_data(pending::PendingNode)
             push!(var_data["outputs"], OutputPin(hash("$(base).outputs.$(subvar)"), subvar, true))
         end
     else
-        var_data["dep_field_names"] = Dict{UInt, String}()
         var_data["parameters"] = OrderedDict{String, Any}(
             string(fname) => param for (fname, param) in pending.param_values)
     end
 
     # Dependency pins, wired from local state (variable args or group dep fields).
     for (arg_name, dep) in pending.dep_values
-        attr_id = hash("$(base).dependencies.$(arg_name)")
-        push!(var_data["dependencies"], (attr_id, arg_name => dep))
-        if optional_dep(pending, arg_name)
-            push!(var_data["optional_deps"], attr_id)
-        end
-        if !is_var
-            var_data["dep_field_names"][attr_id] = arg_name
-        end
+        push!(var_data["dependencies"],
+              DependencyPin(; id=hash("$(base).dependencies.$(arg_name)"), arg_name, dep,
+                            field=is_var ? nothing : arg_name, optional=optional_dep(pending, arg_name)))
     end
 
     return var_data
@@ -735,9 +732,8 @@ function draw_variable(name, var_data)
         ig.Dummy(min_node_width, 20)
 
         # Draw dependencies
-        deps = var_data["dependencies"]
-        for (dep_id, dep_pair) in deps
-            arg_name, dep = dep_pair
+        for pin in var_data["dependencies"]
+            dep_id, arg_name, dep = pin.id, pin.arg_name, pin.dep
             # Don't draw pins for parameters
             if dep isa Parameter
                 continue
@@ -755,19 +751,29 @@ function draw_variable(name, var_data)
             # icon to its left is a fixed advance (icon + SameLine spacing).
             ig.BeginGroup()
             if var_data["type"] == :group
-                label = get(var_data["dep_field_names"], dep_id, arg_name)
-                if dep_id in var_data["optional_deps"]
+                label = something(pin.field, arg_name)
+                if pin.readonly || pin.optional
                     ig.TextDisabled(label * ":")
-                    if ig.IsItemHovered()
-                        node_tooltip("This dependency is optional, it may be left unwired")
-                    end
                 else
                     ig.Text(label * ":")
                 end
+                if pin.optional && !pin.readonly && ig.IsItemHovered()
+                    node_tooltip("This dependency is optional, it may be left unwired")
+                end
                 ig.SameLine()
             end
+            if pin.readonly
+                ig.BeginDisabled()
+            end
             edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
+            if pin.readonly
+                ig.EndDisabled()
+            end
             ig.EndGroup()
+            if pin.readonly && ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+                node_tooltip(isempty(dep.name) ? "Set by the engine, not known yet" :
+                             "Set by the engine to $(dep.name)")
+            end
             pin_advance = ig.GetTextLineHeight() + unsafe_load(ig.GetStyle().ItemSpacing.x)
             content_measured = max(content_measured, pin_advance + ig.GetItemRectSize().x)
             if edited
@@ -776,11 +782,7 @@ function draw_variable(name, var_data)
                 else
                     # For group nodes the kwarg in the constructor uses the group
                     # struct field name, not the @Variable's arg name.
-                    target_arg = arg_name
-                    if var_data["type"] == :group
-                        target_arg = get(var_data["dep_field_names"], dep_id, arg_name)
-                    end
-                    @guiasync rename_dep(state[], name, target_arg, dep, new_dep)
+                    @guiasync rename_dep(state[], name, something(pin.field, arg_name), dep, new_dep)
                 end
             end
         end
@@ -1338,10 +1340,9 @@ function draw_dag()
         for pending in copy(client.pending_nodes)
             pending.var_data = spec_to_var_data(pending)
             # Register the node's dep pins so links can be dragged onto them.
-            for (attr_id, dep_pair) in pending.var_data["dependencies"]
-                arg_name, dep = dep_pair
-                client.ne_dep_pins[attr_id] = DepPinInfo(pending.name, arg_name, pending.name, dep)
-                client.pending_dep_pins[attr_id] = (pending.id, arg_name)
+            for pin in pending.var_data["dependencies"]
+                client.ne_dep_pins[pin.id] = DepPinInfo(pending.name, pin.arg_name, pending.name, pin.dep)
+                client.pending_dep_pins[pin.id] = (pending.id, pin.arg_name)
             end
             ig.PushID("pending-$(pending.id)")
             draw_variable(pending.name, pending.var_data)
@@ -1427,16 +1428,16 @@ function draw_dag()
 
         # Links into pending nodes, drawn in the pending tint.
         for pending in client.pending_nodes
-            for (attr_id, dep_pair) in pending.var_data["dependencies"]
-                _, dep = dep_pair
+            for pin in pending.var_data["dependencies"]
+                dep = pin.dep
                 if dep.kind ∉ (DepKind_Variable, DepKind_Subvariable) || isempty(dep.name)
                     continue
                 end
                 owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
                 start_id = hash("$(owner).outputs.$(pin_suffix)")
-                link_id = hash("pending-link-$(attr_id)")
+                link_id = hash("pending-link-$(pin.id)")
                 ne.Link(ne.LinkId(link_id), ne.PinId(start_id),
-                        ne.PinId(attr_id), ImVec4(1f0, 0.8f0, 0.8f0, 0.5f0))
+                        ne.PinId(pin.id), ImVec4(1f0, 0.8f0, 0.8f0, 0.5f0))
             end
         end
 
