@@ -144,41 +144,67 @@ end
 abstract type AbstractPostprocessor end
 function default_name end
 
-# Rectangular region-of-interest, used as a Parameter value type. The GUI
-# overlays a `RectROI`-valued Parameter on its variable's image plot when the
-# variable declares it via `@display`.
-struct RectROI
+# Region-of-interest Parameter value types. The GUI overlays an ROI-valued
+# Parameter on its variable's plot when the variable declares it via
+# `@display`. Zero-initialized ROIs are treated as unassigned by the GUI, which
+# seeds a default extent from the data being plotted.
+abstract type AbstractROI end
+
+struct RectROI <: AbstractROI
     corner_x::Float64
     corner_y::Float64
     width::Float64
     height::Float64
 end
 
-# Zero-initialized ROI; the GUI treats all-zero as uninitialized and picks a
-# default extent based on the image being plotted.
 RectROI() = RectROI(0.0, 0.0, 0.0, 0.0)
 
 Base.isassigned(roi::RectROI) = !(roi.corner_x == 0 && roi.corner_y == 0 && roi.width == 0 && roi.height == 0)
 
-function (r::RectROI)(image::AbstractArray)
-    corner_x = round(Int, r.corner_x)
-    corner_y = round(Int, r.corner_y)
-    width = round(Int, r.width)
-    height = round(Int, r.height)
-
-    x_range = axes(image, 2)
-    y_range = axes(image, 1)
-
-    min_x = clamp(corner_x, x_range)
-    max_x = clamp(min_x + width, x_range)
-    min_y = clamp(corner_y, y_range)
-    max_y = clamp(min_y + height, y_range)
-
-    # Slice the first two dimensions with the ROI and keep all remaining
-    # dimensions in full (e.g. a 3D stack yields a stack of cropped images).
-    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
-    @view image[min_y:max_y, min_x:max_x, trailing...]
+# A range along one plot axis spanning the full extent of the other. On images
+# `:x` selects a column range (drawn as a vertical band) and `:y` a row range
+# (a horizontal band); on vectors the range is applied directly.
+struct LinearROI <: AbstractROI
+    start::Float64
+    length::Float64
+    axis::Symbol
 end
+
+function LinearROI(start=0.0, length=0.0; axis=:x)
+    if axis != :x && axis != :y
+        throw(ArgumentError("LinearROI axis must be :x or :y, got :$(axis)"))
+    end
+    LinearROI(start, length, axis)
+end
+
+Base.isassigned(roi::LinearROI) = !(roi.start == 0 && roi.length == 0)
+
+# Clamp the index range [start, start + length] onto the axis `r`.
+function roi_range(start, length, r)
+    lo = clamp(round(Int, start), r)
+    hi = clamp(lo + round(Int, length), r)
+    lo:hi
+end
+
+# Slice the first two dimensions with the ROI and keep all remaining dimensions
+# in full (e.g. a 3D stack yields a stack of cropped images).
+function (r::RectROI)(image::AbstractArray)
+    x_range = roi_range(r.corner_x, r.width, axes(image, 2))
+    y_range = roi_range(r.corner_y, r.height, axes(image, 1))
+    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
+    @view image[y_range, x_range, trailing...]
+end
+
+function (r::LinearROI)(image::AbstractArray)
+    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
+    if r.axis == :x
+        @view image[:, roi_range(r.start, r.length, axes(image, 2)), trailing...]
+    else
+        @view image[roi_range(r.start, r.length, axes(image, 1)), :, trailing...]
+    end
+end
+
+(r::LinearROI)(v::AbstractVector) = @view v[roi_range(r.start, r.length, axes(v, 1))]
 
 struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
