@@ -631,11 +631,12 @@ end
     $(watched_group)
 
     @Input function input(::Context.MockInput, output)
-        # (train, foo.bar update tid, baz update tid)
-        for (tid, bar_tid, baz_tid) in ((1, 0, 0), (2, 0, 0), (3, 2, 0), (4, 3, 3))
+        # (train, foo.bar update tid, baz value, baz update tid). The first train
+        # carries the trainmatcher's placeholder for a not-yet-valued property.
+        for (tid, bar_tid, baz, baz_tid) in ((1, 0, nothing, 0), (2, 0, "b0", 0), (3, 2, "b0", 0), (4, 3, "b3", 3))
             put!(output, (tid, Dict("DEV" => Dict("foo.bar.value" => bar_tid * 10,
                                                    "foo.bar.timestamp.tid" => bar_tid,
-                                                   "baz.value" => "b\$(baz_tid)",
+                                                   "baz.value" => baz,
                                                    "baz.timestamp.tid" => baz_tid))))
         end
     end
@@ -648,13 +649,15 @@ end
     @test isempty(Context.external_dependencies(ctx; monitored=false))
     @test ctx.dep_to_input == Dict("DEV.foo.bar" => "x.input", "DEV.baz" => "x.input")
 
-    # The callback fires once on first receipt, then only for properties whose
-    # update tid changed, batched per train.
+    # The callback fires once on first receipt (`nothing` placeholders are
+    # skipped until a value arrives), then only for properties whose update
+    # tid changed, batched per train.
     w = ctx.groups["w"]
     Context.run(ctx) do
-        @test timedwait(() -> length(w.updates) == 3, 5) == :ok
+        @test timedwait(() -> length(w.updates) == 4, 5) == :ok
     end
-    @test w.updates == [Dict("foo.bar" => (; value=0, tid=0), "baz" => (; value="b0", tid=0)),
+    @test w.updates == [Dict("foo.bar" => (; value=0, tid=0)),
+                        Dict("baz" => (; value="b0", tid=0)),
                         Dict("foo.bar" => (; value=20, tid=2)),
                         Dict("foo.bar" => (; value=30, tid=3), "baz" => (; value="b3", tid=3))]
 
@@ -769,6 +772,10 @@ end
     train(tid, motor, pos, intensity) = tid => Dict("det" => Dict("intensity" => intensity),
                                                      motor => Dict("actualPosition" => pos))
     scan_outputs() = [v for v in ctx.stream_output if v.name == "scn.scan"]
+
+    # Nothing is mirrored while the scantool's state is incomplete
+    @test !Context.on_properties_changed(scn, Dict("scanEnv.scanType" => (; value="ascan", tid=1)))
+    @test !isassigned(scn.position1)
 
     # A 1-D scan moving MOTOR_X and MOTOR_A together from a shared start point,
     # the latter in steps of 0.1: its first train derives the preferred motor and

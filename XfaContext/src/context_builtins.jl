@@ -516,13 +516,17 @@ end
 # motors along a single axis, so one of them is followed (see
 # `motor_priority`); mesh scans aren't supported yet. Step scans also set the
 # bin resolution from their step size, continuous and custom scans have no
-# useful one. The first notification carries every monitored property, so
-# `scantool_state` is complete from then on.
+# useful one. Notifications may be partial until the trainmatcher has a value
+# for every property, so nothing is mirrored before `scantool_state` is complete.
 function on_properties_changed(scn::Scan, changed)
     for (property, update) in changed
         scn.scantool_state[property] = update.value
     end
     state = scn.scantool_state
+    if any(dep -> !haskey(state, dep.property), monitored_properties(scn))
+        return false
+    end
+
     motors = String.(state["deviceEnv.activeMotorDeviceIds"])
     scan_type = state["scanEnv.scanType"]
     dev = scn.scantool[]
