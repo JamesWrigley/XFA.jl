@@ -12,7 +12,7 @@ using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, RectROI, PlotSpec, LayerSpec, VariableSpec, VariableKind_Variable,
+    ArrayMetadata, AbstractROI, RectROI, LinearROI, PlotSpec, LayerSpec, VariableSpec, VariableKind_Variable,
     Scalar1dScan, positions, upstream_closure
 include("plotting.jl")
 
@@ -378,9 +378,8 @@ function draw_parameter_widget(name, param::Parameter{Dependency})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{RectROI})
-    roi = param.value
-    text = "($(roi.corner_x), $(roi.corner_y), $(roi.width), $(roi.height))"
+function draw_parameter_widget(name, param::Parameter{<:AbstractROI})
+    text = format_param_value(param.value)
     buf = Vector{UInt8}(undef, length(text) + 1)
     Util.strcpy!(buf, text)
     ig.InputText("##$(name)", buf, length(buf), ig.ImGuiInputTextFlags_ReadOnly)

@@ -546,6 +546,20 @@ end
     @test invokelatest(Context.variable_displays, ctx.functions["renamed"]) == String[]
 end
 
+@testset "ROIs" begin
+    stack = reshape(1:40, 4, 5, 2)
+    @test !isassigned(Context.RectROI())
+    # Coordinates are rounded and clamped, trailing dimensions kept in full
+    @test Context.RectROI(1.6, -3, 1, 100)(stack) == stack[1:4, 2:3, :]
+
+    @test !isassigned(Context.LinearROI())
+    @test_throws ArgumentError Context.LinearROI(; axis=:z)
+    @test Context.LinearROI(2, 2)(stack) == stack[:, 2:4, :]
+    @test Context.LinearROI(2, 1; axis=:y)(stack) == stack[2:3, :, :]
+    # The axis is irrelevant for vectors
+    @test Context.LinearROI(2.4, 1; axis=:y)(1:5) == 2:3
+end
+
 @testset "Parameter" begin
     # Smoke tests for constructors
     @test Parameter(0) isa Parameter

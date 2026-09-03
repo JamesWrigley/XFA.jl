@@ -404,6 +404,8 @@ end
         @test_logs (:warn, r"Could not find Parameter assignment.*") begin
             @test XFA.replace_parameter_value(source, "roi", "RectROI(1.0, 2.0, 3.0, 4.0)") == source
         end
+
+        @test XFA.format_param_value(Context.LinearROI(1.5, 10.0; axis=:y)) == "LinearROI(1.5, 10.0; axis=:y)"
     end
 
     @testset "Edit Int parameter" begin

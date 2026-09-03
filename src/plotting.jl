@@ -889,10 +889,6 @@ end
     const log_scale::Ref{Bool} = Ref(false)
     const colorbar::ColorbarState = ColorbarState()
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
-    # ROI parameter values updated locally during a drag, keyed by parameter
-    # name. Flushed to the engine when the user releases the mouse so we don't
-    # flood it with per-frame updates.
-    const pending_roi_updates::Dict{String, RectROI} = Dict{String, RectROI}()
 end
 
 # Pairs samples from two VariableData stores on matching train IDs. Owns the
@@ -995,6 +991,10 @@ end
     const k::Ref{Cfloat} = Ref(Cfloat(-1))
     const fit::FitSettings = FitSettings()
     image::Maybe{ImageState} = nothing
+    # ROI parameter values updated locally during a drag, keyed by parameter
+    # name. Flushed to the engine when the user releases the mouse so we don't
+    # flood it with per-frame updates.
+    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
 end
 
 layer_id(layer::VariableLayer) = layer.layer_id_str
@@ -1032,6 +1032,7 @@ layer_id(layer::CorrelationLayer) = layer.layer_id_str
     const subscribed::Set{String} = Set{String}()
     image::Maybe{ImageState} = nothing
     last_spec::Maybe{PlotSpec} = nothing
+    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
 end
 
 layer_id(layer::SpecLayer) = layer.layer_id_str
@@ -1383,49 +1384,145 @@ const ROI_COLORS = ImVec4[
     ImVec4(0.20, 0.20, 0.20, 1.0),  # near-black
 ]
 
-# Treat an all-zero RectROI as uninitialized and seed a centered default
-# covering 1/4 of the visible area.
-function default_roi(x_min, x_max, y_min, y_max, idx=1)
-    w = (x_max - x_min) / 2
-    h = (y_max - y_min) / 2
-    cx = (x_min + x_max) / 2
-    cy = (y_min + y_max) / 2
-    # Stagger successive ROIs diagonally so they don't fully overlap.
-    step = (idx - 1) * 0.05
-    dx = (x_max - x_min) * step
-    dy = (y_max - y_min) * step
-    RectROI(cx - w / 2 + dx, cy - h / 2 + dy, w, h)
+# Default extent for an unassigned ROI along one axis: the middle half of
+# [lo, hi], shifted by `idx` so successive ROIs don't fully overlap.
+function default_roi_span(lo, hi, idx)
+    span = hi - lo
+    (lo + span / 4 + span * 0.05 * (idx - 1), span / 2)
 end
 
-# Draw any RectROI parameters associated with `layer.name` via @display as
-# draggable rectangles on top of the image, with the parameter name labelled
-# above the top-left corner. Sends a ChangeParameter when the user drags.
-function draw_roi_overlays(layer::VariableLayer, x_min, x_max, y_min, y_max)
+function default_roi(::RectROI, x_min, x_max, y_min, y_max, idx)
+    x, w = default_roi_span(x_min, x_max, idx)
+    y, h = default_roi_span(y_min, y_max, idx)
+    RectROI(x, y, w, h)
+end
+
+function default_roi(roi::LinearROI, x_min, x_max, y_min, y_max, idx)
+    lo, hi = roi.axis == :x ? (x_min, x_max) : (y_min, y_max)
+    LinearROI(default_roi_span(lo, hi, idx)...; axis=roi.axis)
+end
+
+# Corners (x1, y1, x2, y2) of the DragRect drawn for an ROI. A LinearROI is
+# pinned to the current plot limits along its other axis.
+roi_corners(roi::RectROI) = (roi.corner_x, roi.corner_y, roi.corner_x + roi.width, roi.corner_y + roi.height)
+function roi_corners(roi::LinearROI)
+    limits = ImPlot.GetPlotLimits()
+    if roi.axis == :x
+        (roi.start, limits.Y.Min, roi.start + roi.length, limits.Y.Max)
+    else
+        (limits.X.Min, roi.start, limits.X.Max, roi.start + roi.length)
+    end
+end
+
+# Draw the drag handles for an ROI in colour `col`, setting `held` while any of
+# them is being dragged. Returns the updated ROI, or nothing if it didn't move.
+function drag_roi(roi::RectROI, layer_id, param_name, col, held)
+    x1, y1, x2, y2 = map(v -> Ref(Cdouble(v)), roi_corners(roi))
+    id = int32_hash(layer_id, param_name)
+    if ImPlot.DragRect(id, x1, y1, x2, y2, col, 0, C_NULL, C_NULL, held)
+        xlo, xhi = minmax(x1[], x2[])
+        ylo, yhi = minmax(y1[], y2[])
+        RectROI(xlo, ylo, xhi - xlo, yhi - ylo)
+    else
+        nothing
+    end
+end
+
+# Like matplotlib's axvspan/axhspan: a shaded band spanning the plot with a
+# draggable line on each edge and a point in the centre that moves the whole
+# band. NoFit keeps the handles from stretching an auto-fitted axis.
+function drag_roi(roi::LinearROI, layer_id, param_name, col, held)
+    x1, y1, x2, y2 = roi_corners(roi)
+    p1 = ImPlot.PlotToPixels(x1, y1)
+    p2 = ImPlot.PlotToPixels(x2, y2)
+    fill_col = ig.GetColorU32(ImVec4(col.x, col.y, col.z, col.w / 4))
+    ImPlot.PushPlotClipRect()
+    ig.AddRectFilled(ImPlot.GetPlotDrawList(),
+                     ImVec2(min(p1.x, p2.x), min(p1.y, p2.y)),
+                     ImVec2(max(p1.x, p2.x), max(p1.y, p2.y)), fill_col)
+    ImPlot.PopPlotClipRect()
+
+    drag_line = roi.axis == :x ? ImPlot.DragLineX : ImPlot.DragLineY
+    lo = Ref(Cdouble(roi.start))
+    hi = Ref(Cdouble(roi.start + roi.length))
+    held_hi = Ref(false)
+    flags = ImPlot.ImPlotDragToolFlags_NoFit
+    moved_lo = drag_line(int32_hash(layer_id, param_name), lo, col, 1, flags, C_NULL, C_NULL, held)
+    moved_hi = drag_line(int32_hash(layer_id, param_name * ".hi"), hi, col, 1, flags, C_NULL, C_NULL, held_hi)
+
+    # Centre handle, like ImPlot's DragPoint but following the mouse only along
+    # the ROI's axis so the band can't be dragged sideways.
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    center = ImPlot.PlotToPixels(cx, cy)
+    grab = 4
+    center_id = ig.GetID(int32_hash(layer_id, param_name * ".center"))
+    ig.igKeepAliveID(center_id)
+    bb = ig.ImRect(ImVec2(center.x - grab, center.y - grab), ImVec2(center.x + grab, center.y + grab))
+    hovered_center = Ref(false)
+    held_center = Ref(false)
+    ig.igButtonBehavior(bb, center_id, hovered_center, held_center, 0)
+    if hovered_center[] || held_center[]
+        ig.SetMouseCursor(ig.ImGuiMouseCursor_Hand)
+    end
+    moved_center = held_center[] && ig.IsMouseDragging(ig.ImGuiMouseButton_Left)
+    if moved_center
+        mouse = ImPlot.GetPlotMousePos()
+        shift = roi.axis == :x ? mouse.x - cx : mouse.y - cy
+        lo[] += shift
+        hi[] += shift
+        center = roi.axis == :x ? ImPlot.PlotToPixels(mouse.x, cy) : ImPlot.PlotToPixels(cx, mouse.y)
+    end
+    ImPlot.PushPlotClipRect()
+    ig.AddCircleFilled(ImPlot.GetPlotDrawList(), center, grab, ig.GetColorU32(col))
+    ImPlot.PopPlotClipRect()
+
+    if held_hi[] || held_center[]
+        held[] = true
+    end
+    if moved_lo || moved_hi || moved_center
+        a, b = minmax(lo[], hi[])
+        LinearROI(a, b - a; axis=roi.axis)
+    else
+        nothing
+    end
+end
+
+# Data extent used to seed unassigned ROIs.
+roi_bounds(frame::Image) = image_bounds(frame)[3:end]
+function roi_bounds(::PlotType)
+    limits = ImPlot.GetPlotLimits()
+    (limits.X.Min, limits.X.Max, limits.Y.Min, limits.Y.Max)
+end
+
+# Draw the @display ROIs of a layer's variable (for a SpecLayer, the variable
+# advertising the spec) once per layer, after its frames.
+draw_roi_overlays(::Layer, frames) = nothing
+function draw_roi_overlays(layer::Union{VariableLayer, SpecLayer}, frames)
+    i = findfirst(f -> !(f isa Empty), frames)
+    if isnothing(i)
+        return
+    end
+    x_min, x_max, y_min, y_max = roi_bounds(frames[i])
+    var_name = layer isa VariableLayer ? layer.name : layer.source_var
     client = state[].client
-    displays = get(client.context.displays, layer.name, String[])
-    pending = layer.image.pending_roi_updates
+    displays = get(client.context.displays, var_name, String[])
+    pending = layer.pending_roi_updates
     for (idx, param_name) in enumerate(displays)
         param = get(client.context.parameters, param_name, nothing)
-        if isnothing(param) || !(param.value isa RectROI)
+        if isnothing(param) || !(param.value isa AbstractROI)
             continue
         end
         roi = param.value
         if !isassigned(roi)
-            roi = default_roi(x_min, x_max, y_min, y_max, idx)
+            roi = default_roi(roi, x_min, x_max, y_min, y_max, idx)
         end
-        x1 = Ref(Cdouble(roi.corner_x))
-        y1 = Ref(Cdouble(roi.corner_y))
-        x2 = Ref(Cdouble(roi.corner_x + roi.width))
-        y2 = Ref(Cdouble(roi.corner_y + roi.height))
         col = ROI_COLORS[mod1(idx, length(ROI_COLORS))]
-        rect_col = ImVec4(col.x, col.y, col.z, 0.75)
-        id = int32_hash(layer.layer_id_str, param_name)
         held = Ref(false)
-
-        if ImPlot.DragRect(id, x1, y1, x2, y2, rect_col, 0, C_NULL, C_NULL, held)
-            xlo, xhi = minmax(x1[], x2[])
-            ylo, yhi = minmax(y1[], y2[])
-            new_roi = RectROI(xlo, ylo, xhi - xlo, yhi - ylo)
+        new_roi = drag_roi(roi, layer.layer_id_str, param_name,
+                           ImVec4(col.x, col.y, col.z, 0.75), held)
+        if !isnothing(new_roi)
+            roi = new_roi
             if new_roi != param.value
                 param.value = new_roi
                 pending[param_name] = new_roi
@@ -1438,19 +1535,25 @@ function draw_roi_overlays(layer::VariableLayer, x_min, x_max, y_min, y_max)
             delete!(pending, param_name)
         end
 
-        # Label above the top-left corner. Image plots invert the Y axis so
-        # y_min is the top, meaning the ROI top edge is at min(y1, y2).
-        # PlotText centers on (x, y), so shift right by half the text width to
-        # left-align at xlo, and up by half a line so the text sits above the
-        # rect.
-        xlo = min(x1[], x2[])
-        ytop = min(y1[], y2[])
+        # Label at the top-left corner in screen space (the Y axis may be
+        # inverted, so find it in pixels): above the ROI when there's room,
+        # otherwise just inside it, e.g. for a band pinned to the plot's top
+        # edge. PlotText centers on its anchor, so offset by half the text size.
         base_size = unsafe_load(ig.GetStyle()).FontSizeBase
         ig.PushFont(C_NULL, base_size * 2)
         text_size = ig.CalcTextSize(param_name)
+        x1, y1, x2, y2 = roi_corners(roi)
+        p1 = ImPlot.PlotToPixels(x1, y1)
+        p2 = ImPlot.PlotToPixels(x2, y2)
+        top_left = ImVec2(min(p1.x, p2.x), min(p1.y, p2.y))
+        dy = if top_left.y - text_size.y - 2 < ImPlot.GetPlotPos().y
+            text_size.y / 2 + 2
+        else
+            -text_size.y / 2 - 2
+        end
+        anchor = ImPlot.PixelsToPlot(top_left)
         ImPlot.PushStyleColor(ImPlot.ImPlotCol_InlayText, col)
-        ImPlot.PlotText(param_name, Cdouble(xlo), Cdouble(ytop),
-                        ImVec2(text_size.x / 2, -text_size.y / 2 - 2))
+        ImPlot.PlotText(param_name, anchor.x, anchor.y, ImVec2(text_size.x / 2, dy))
         ImPlot.PopStyleColor()
         ig.PopFont()
     end
@@ -1712,20 +1815,13 @@ end
 
 plot_frame!(layer::Union{VariableLayer, SpecLayer}, frame::Image) = draw_image_frame(layer.image.gpu_heatmap, frame)
 
-function draw_overlay(layer::VariableLayer, ::Plot, ::Line)
-    draw_fit_overlay(layer.fit)
-    draw_variable_overlays(layer.name)
-end
-
-function draw_overlay(layer::VariableLayer, ::Plot, ::Bars)
+function draw_overlay(layer::VariableLayer, ::Plot, ::Union{Line, Bars})
     draw_fit_overlay(layer.fit)
     draw_variable_overlays(layer.name)
 end
 
 function draw_overlay(layer::VariableLayer, ::Plot, frame::Image)
     rows, cols, x_min, x_max, y_min, y_max = image_bounds(frame)
-    draw_roi_overlays(layer, x_min, x_max, y_min, y_max)
-
     if ImPlot.IsPlotHovered()
         mouse = ImPlot.GetPlotMousePos()
         j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
@@ -1921,6 +2017,7 @@ function draw_plot(plot::Plot, updated_variables)
                             draw_overlay(L, plot, f)
                         end
                     end
+                    draw_roi_overlays(L, fs)
                 end
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()

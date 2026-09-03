@@ -3,7 +3,7 @@ module XfaContext
 export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    RectROI, Context
+    RectROI, LinearROI, Context
 
 # Macro-generated code and context files refer to this module as `Context`. It's
 # exported so `using XfaContext` binds it the way `using XfaEngine.Context` used
@@ -691,11 +691,19 @@ function stream_input(ctx, name, channel, downstream_neighbours, rates, monitors
                         continue
                     end
 
+                    # The trainmatcher serves a `nothing` placeholder for a
+                    # property it has no value for yet, don't record its tid so
+                    # the real value is delivered when it arrives.
+                    value = source_data["$(dep.property).value"]
+                    if isnothing(value)
+                        continue
+                    end
+
                     dep_name = string(dep)
                     update_tid = Int(source_data[tid_key])
                     if !haskey(last_update_tids, dep_name) || last_update_tids[dep_name] != update_tid
                         last_update_tids[dep_name] = update_tid
-                        changed[dep.property] = (; value=source_data["$(dep.property).value"], tid=update_tid)
+                        changed[dep.property] = (; value, tid=update_tid)
                     end
                 end
 
