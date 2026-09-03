@@ -197,11 +197,7 @@ end
 
 function (r::LinearROI)(image::AbstractArray)
     trailing = ntuple(_ -> Colon(), ndims(image) - 2)
-    if r.axis == :x
-        @view image[:, roi_range(r.start, r.length, axes(image, 2)), trailing...]
-    else
-        @view image[roi_range(r.start, r.length, axes(image, 1)), :, trailing...]
-    end
+    @view image[roi_range(r.start, r.length, axes(image, 1)), :, trailing...]
 end
 
 (r::LinearROI)(v::AbstractVector) = @view v[roi_range(r.start, r.length, axes(v, 1))]
