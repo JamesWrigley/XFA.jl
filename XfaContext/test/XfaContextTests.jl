@@ -19,7 +19,7 @@ ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
 
 using Statistics: mean
 using Test: with_logger, TestLogger
-using ReTest: @testset, @test, @test_throws
+using ReTest: @testset, @test, @test_throws, @test_logs
 
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity, isfull
@@ -1771,6 +1771,17 @@ end
         out, _ = runscan(scn, 5.0, 0.02, nothing)
         @test length(scn.binner.seq) == 1
         @test collect(out.data) ≈ [mean([1.0, 3.0, 5.0])]
+
+        # A value of a different shape resets the bins and the recompute buffer
+        # instead of failing to fold into the old ones.
+        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"a.pos")
+        scn.resolution[] = [0.005]
+        runscan(scn, [1.0, 2.0, 3.0, 4.0, 5.0], 0.0, nothing)
+        @test_logs (:warn, r"shape changed") runscan(scn, Float64[], 0.01, nothing)
+        out, subvars = @test_logs (:warn, r"shape changed") runscan(scn, [1.0, 2.0], 0.02, nothing)
+        @test size(out.data) == (1, 2) && collect(out.data) == [1.0 2.0]
+        @test collect(subvars["scan.counts"].data) == [1]
+        @test length(scn.binner.history) == 1
     end
 
     @testset "Correlation" begin
