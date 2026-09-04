@@ -25,13 +25,9 @@ BinAxis(resolution::Real) = BinAxis(Float64(resolution), Float64[], Float64[], I
 
 nlevels(ax::BinAxis) = length(ax.anchors)
 
-# Snap `x` to an existing level whose anchor is within `resolution`, folding `x`
-# into that level's running mean; otherwise open a new level anchored at `x`.
-# Returns (position, inserted): the level's sorted position and whether a new
-# level was opened there. Anchors never drift, so revisits merge rather than
-# spawning duplicates.
-function snap!(ax::BinAxis, x::Real)
-    x = Float64(x)
+# Sorted position of the level within `resolution` of `x`, or 0 if `x` would
+# open a new one.
+function find_level(ax::BinAxis, x::Float64)
     p = searchsortedfirst(ax.anchors, x)
     best = 0
     best_dist = Inf
@@ -44,12 +40,24 @@ function snap!(ax::BinAxis, x::Real)
             end
         end
     end
-    if best != 0 && best_dist < ax.resolution
+    return best_dist < ax.resolution ? best : 0
+end
+
+# Snap `x` to an existing level whose anchor is within `resolution`, folding `x`
+# into that level's running mean; otherwise open a new level anchored at `x`.
+# Returns (position, inserted): the level's sorted position and whether a new
+# level was opened there. Anchors never drift, so revisits merge rather than
+# spawning duplicates.
+function snap!(ax::BinAxis, x::Real)
+    x = Float64(x)
+    best = find_level(ax, x)
+    if best != 0
         ax.counts[best] += 1
         ax.means[best] += (x - ax.means[best]) / ax.counts[best]
         return (best, false)
     end
 
+    p = searchsortedfirst(ax.anchors, x)
     insert!(ax.anchors, p, x)
     insert!(ax.means, p, x)
     insert!(ax.counts, p, 1)
@@ -177,6 +185,22 @@ function regrid!(seq::BinnedSequence{N, D}, ins::NTuple{D, Int}) where {N, D}
 end
 
 function Base.append!(seq::BinnedSequence{N, D}, coords::NTuple{D, Real}, value) where {N, D}
+    if !all(isfinite, coords) || (value isa Number && !isfinite(value))
+        return seq
+    end
+
+    # Test the cap before snap! mutates the axes, so a rejected append doesn't
+    # leave an empty level behind on the position axis.
+    existing = ntuple(d -> find_level(seq.axes[d], Float64(coords[d])), D)
+    fresh_bin = if any(==(0), existing)
+        true
+    else
+        seq.count[existing...] == 0
+    end
+    if fresh_bin && seq.nbins >= seq.max_bins
+        return seq
+    end
+
     snapped = ntuple(d -> snap!(seq.axes[d], coords[d]), D)
     key = ntuple(d -> snapped[d][1], D)
     if N > 0 && all(==(0), seq.value_size)
@@ -190,9 +214,6 @@ function Base.append!(seq::BinnedSequence{N, D}, coords::NTuple{D, Real}, value)
     end
 
     if seq.count[key...] == 0
-        if seq.nbins >= seq.max_bins
-            return seq
-        end
         seq.nbins += 1
     end
     push!(seq, key, value)
@@ -465,12 +486,12 @@ function Base.push!(sb::ScanBinner, value, positions...;
         sb.needs_rebin = false
     end
 
-    if varr isa Number && isnan(varr)
+    coords = ntuple(d -> sb.last_coords[d], D)
+    if (varr isa Number && !isfinite(varr)) || !all(isfinite, coords)
         return nothing
     end
 
     # Fold this train into the bins and (optionally) the recompute buffer.
-    coords = ntuple(d -> sb.last_coords[d], D)
     if sb.keep_history
         push!(sb.history, varr isa AbstractArray ? vec(Float64.(varr)) : (Float64(varr),))
         for d in 1:D

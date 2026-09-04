@@ -946,10 +946,8 @@ function ingest_scalar!(m::VariableTrainmatcher, x_store, y_store,
     if !haskey(updated_variables, x_name) && !haskey(updated_variables, y_name)
         return false
     end
-    new_tids = get(updated_variables, x_name, Set{Int}())
-    if haskey(updated_variables, y_name)
-        union!(new_tids, updated_variables[y_name])
-    end
+    new_tids = union(get(updated_variables, x_name, Set{Int}()),
+                     get(updated_variables, y_name, Set{Int}()))
 
     appended = false
     for tid in new_tids
@@ -958,6 +956,9 @@ function ingest_scalar!(m::VariableTrainmatcher, x_store, y_store,
         if !isnothing(xi) && !isnothing(yi)
             xv = x_store.data[xi]
             yv = y_store.data[yi]
+            if !isfinite(xv) || !isfinite(yv)
+                continue
+            end
             push!(m.x_data, xv)
             push!(m.y_data, yv)
             if !isnothing(m.accu)
