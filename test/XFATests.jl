@@ -861,6 +861,19 @@ end
         @test XFA.fit_line(fill(NaN, 10)) == (nothing, :NoFiniteSamples)
         @test XFA.fit_line([1.0]) == (nothing, :InsufficientData)
     end
+
+    @testset "Restrict X" begin
+        # Only samples inside the ROI are fitted (X needn't be sorted, as for
+        # scatter data) and the model curve spans it.
+        x = collect(0.0:0.1:10.0)[[1:2:101; 2:2:100]]
+        y = [2.0 <= xi <= 4.0 ? 3.0 * xi + 1.0 : 100.0 for xi in x]
+        fit = XFA.FitSettings(; fit_type=Ref(Cint(findfirst(==("Line"), XFA.FIT_TYPES) - 1)),
+                              restrict_x=true, x_roi=XFA.LinearROI(2.0, 2.0))
+        XFA.reset_fit_params!(fit)
+        XFA.compute_fit!(fit, y, x)
+        @test fit.popt ≈ [3.0, 1.0] atol=1e-10
+        @test extrema(fit.model_x) == (2.0, 4.0)
+    end
 end
 
 @testset "GUI" begin

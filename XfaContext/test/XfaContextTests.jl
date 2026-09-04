@@ -554,9 +554,9 @@ end
 
     @test !isassigned(Context.LinearROI())
     @test_throws ArgumentError Context.LinearROI(; axis=:z)
-    @test Context.LinearROI(2, 2)(stack) == stack[:, 2:4, :]
+    # The axis only affects how the ROI is drawn, it always slices the first dimension
+    @test Context.LinearROI(2, 2)(stack) == stack[2:4, :, :]
     @test Context.LinearROI(2, 1; axis=:y)(stack) == stack[2:3, :, :]
-    # The axis is irrelevant for vectors
     @test Context.LinearROI(2.4, 1; axis=:y)(1:5) == 2:3
 end
 
