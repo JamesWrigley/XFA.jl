@@ -2,7 +2,6 @@ import Dates
 import Logging
 import InteractiveUtils: versioninfo
 
-import LoggingFormats: LogFmt
 import LoggingExtras: TransformerLogger, DatetimeRotatingFileLogger, MinLevelLogger
 
 
@@ -50,16 +49,32 @@ function rotation_callback(old_log)
     end
 end
 
-const formatter = LogFmt()
+# The default ConsoleLogger metadata format with a timestamp prepended
+function timestamped_metafmt(level, _module, group, id, file, line)
+    color, prefix, suffix = Logging.default_metafmt(level, _module, group, id, file, line)
+    ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    return color, "$(ts) $(prefix)", suffix
+end
 
 # Create a customized global logger
 function initialize_logger(min_level=Logging.Info)
-    # Create a logger that rotates the log files every month and uses the logfmt
-    # format.
-    logger = DatetimeRotatingFileLogger(pwd(), raw"\x\f\a-\e\n\g\i\n\e-yyyy-mm.\l\o\g"; rotation_callback) do io, log
-        ts = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-        print(io, "time=", ts, " ")
-        formatter(io, log)
+    # Create a logger that rotates the log files every month and writes in the
+    # default ConsoleLogger format.
+    file_logger = DatetimeRotatingFileLogger(pwd(), raw"\x\f\a-\e\n\g\i\n\e-yyyy-mm.\l\o\g"; rotation_callback) do io, log
+        console = Logging.ConsoleLogger(io, Logging.BelowMinLevel; meta_formatter=timestamped_metafmt)
+        Logging.handle_message(console, log.level, log.message, log._module, log.group,
+                               log.id, log.file, log.line; log.kwargs...)
+    end
+    # Start the file over once it grows past 100MB. The seek is needed because
+    # truncate() doesn't reset the stream position.
+    logger = TransformerLogger(file_logger) do log
+        stream = file_logger.logger.stream
+        if position(stream) > 100_000_000
+            truncate(stream, 0)
+            seekstart(stream)
+        end
+
+        log
     end
     # Filter by logging level
     logger = MinLevelLogger(logger, min_level)
