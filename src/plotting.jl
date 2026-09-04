@@ -646,6 +646,10 @@ end
 # so the side-panel fitting UI can be driven from a single struct.
 @kwdef mutable struct FitSettings
     fit_type::Ref{Cint} = Ref(Cint(0))
+    live::Bool = true
+    requested::Bool = false
+    restrict_x::Bool = false
+    x_roi::LinearROI = LinearROI()
     popt::Maybe{Vector{Float64}} = nothing
     retcode::Maybe{Symbol} = nothing
     # Wall time of the most recent fit, in seconds.
@@ -691,11 +695,27 @@ function fixed_vector(fit::FitSettings)
     return [p.fixed ? p.value : nothing for p in values(fit.params)]
 end
 
+function fit_wanted(fit::FitSettings, data_updated::Bool)
+    requested = fit.requested
+    fit.requested = false
+    return requested || (fit.live && data_updated)
+end
+
 # Re-run the selected fit against the plot's current X/Y samples. Called from
 # the draw_plot data-update path so the popt stays in sync with what's shown.
 function compute_fit!(fit::FitSettings, ydata::AbstractVector,
                       xdata::Maybe{AbstractVector}=nothing;
                       sigma::Maybe{AbstractVector}=nothing)
+    if fit.restrict_x && isassigned(fit.x_roi)
+        xs = isnothing(xdata) ? eachindex(ydata) : xdata
+        lo = fit.x_roi.start
+        hi = lo + fit.x_roi.length
+        idx = findall(x -> lo <= x <= hi, xs)
+        ydata = ydata[idx]
+        xdata = xs[idx]
+        sigma = isnothing(sigma) ? nothing : sigma[idx]
+    end
+
     name = FIT_TYPES[fit.fit_type[] + 1]
     fixed = fixed_vector(fit)
     t0 = time_ns()
@@ -762,11 +782,27 @@ function update_fit_curve!(fit::FitSettings, ydata::AbstractVector,
     sample_model!(fit.model_x, fit.model_y, model, xmin, xmax, 200)
 end
 
-# Overlay the fitted model curve on the current ImPlot plot, if any.
-function draw_fit_overlay(fit::FitSettings)
+# Overlay the fitted model curve on the current ImPlot plot, if any, and the
+# draggable X restriction band when enabled. Moving the band requests a refit.
+function draw_fit_overlay(layer_id, fit::FitSettings)
+    name = FIT_TYPES[fit.fit_type[] + 1]
     if !isempty(fit.model_x)
-        name = FIT_TYPES[fit.fit_type[] + 1]
         ImPlot.PlotLine("$(name) fit", fit.model_x, fit.model_y)
+    end
+
+    if name != "None" && fit.restrict_x
+        if !isassigned(fit.x_roi)
+            limits = ImPlot.GetPlotLimits()
+            fit.x_roi = default_roi(fit.x_roi, limits.X.Min, limits.X.Max, limits.Y.Min, limits.Y.Max, 1)
+            fit.requested = true
+        end
+        col = ROI_COLORS[3]
+        new_roi = drag_roi(fit.x_roi, layer_id, "fit-restrict-x",
+                           ImVec4(col.x, col.y, col.z, 0.75), Ref(false))
+        if !isnothing(new_roi) && new_roi != fit.x_roi
+            fit.x_roi = new_roi
+            fit.requested = true
+        end
     end
 end
 
@@ -1587,6 +1623,20 @@ function draw_fitting_settings(id, fit::FitSettings)
             return
         end
 
+        if @c ig.Checkbox("Live fitting##$(id)", &fit.live)
+            fit.requested = fit.live
+        end
+        ig.SameLine()
+        ig.BeginDisabled(fit.live)
+        if ig.Button("Fit##$(id)")
+            fit.requested = true
+        end
+        ig.EndDisabled()
+        if @c ig.Checkbox("Restrict X##$(id)", &fit.restrict_x)
+            fit.requested = true
+        end
+        ig.SetItemTooltip("Only fit the samples inside a draggable range of the X axis")
+
         for (i, (pname, param)) in enumerate(fit.params)
             ig.PushID("fit-param-$(id)-$(pname)")
             @c ig.Checkbox("##fix", &param.fixed)
@@ -1671,7 +1721,7 @@ function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
         else
             1:length(data), data
         end
-        if was_updated
+        if fit_wanted(layer.fit, was_updated)
             compute_fit!(layer.fit, ys, xs)
         end
         if store.plot_type === :histogram
@@ -1816,7 +1866,7 @@ end
 plot_frame!(layer::Union{VariableLayer, SpecLayer}, frame::Image) = draw_image_frame(layer.image.gpu_heatmap, frame)
 
 function draw_overlay(layer::VariableLayer, ::Plot, ::Union{Line, Bars})
-    draw_fit_overlay(layer.fit)
+    draw_fit_overlay(layer.layer_id_str, layer.fit)
     draw_variable_overlays(layer.name)
 end
 
@@ -2199,7 +2249,7 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
             layer.binning_resolution[] = Cfloat(x.bin_resolution)
         end
         accu_changed = set_resolution!(m, layer.binning_resolution[])
-        if data_updated || accu_changed
+        if fit_wanted(layer.fit, data_updated || accu_changed)
             if isnothing(m.accu)
                 compute_fit!(layer.fit, m.y_data, m.x_data)
             else
@@ -2215,7 +2265,7 @@ function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
             return Line(m.x_data, m.y_data, label, :scatter)
         end
     elseif x.type == VariableType_Vector
-        if ingest_vector!(m, x, y)
+        if fit_wanted(layer.fit, ingest_vector!(m, x, y))
             compute_fit!(layer.fit, m.y_data, m.x_data)
         end
         if length(m.x_data) != length(m.y_data)
@@ -2238,7 +2288,7 @@ function plot_frame!(::CorrelationLayer, frame::Band)
     ImPlot.PlotLine(frame.label, frame.xs, frame.line_ys)
 end
 
-draw_overlay(layer::CorrelationLayer, ::Plot, ::PlotType) = draw_fit_overlay(layer.fit)
+draw_overlay(layer::CorrelationLayer, ::Plot, ::PlotType) = draw_fit_overlay(layer.layer_id_str, layer.fit)
 
 function axis_labels(layer::CorrelationLayer)
     n = length(layer.variable_names)
