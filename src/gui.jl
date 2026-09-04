@@ -1772,6 +1772,70 @@ end
 
 default(value, default="") = something(value, default)
 
+# ImGui's GLFW backend (1.92.6+) remembers the last cursor it applied in a
+# single field shared by all viewports, so after the main window is updated
+# every secondary viewport window is skipped and never changes cursor. Apply
+# the frame's cursor to those windows ourselves. GLFW.jl's wrappers assert the
+# main thread, which the render loop isn't on, hence calling libglfw directly.
+const glfw_cursors = Dict{ig.ImGuiMouseCursor_, Ptr{Cvoid}}()
+const viewport_cursors = Dict{Ptr{Cvoid}, ig.ImGuiMouseCursor_}()
+
+function update_viewport_cursors()
+    cursor = ig.ImGuiMouseCursor_(ig.GetMouseCursor())
+    if cursor == ig.ImGuiMouseCursor_None || unsafe_load(ig.GetIO().MouseDrawCursor)
+        return
+    end
+    if !haskey(glfw_cursors, cursor)
+        shape = if cursor == ig.ImGuiMouseCursor_TextInput
+            GLFW.IBEAM_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeAll
+            GLFW.RESIZE_ALL_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNS
+            GLFW.RESIZE_NS_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeEW
+            GLFW.RESIZE_EW_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNESW
+            GLFW.RESIZE_NESW_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNWSE
+            GLFW.RESIZE_NWSE_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_Hand
+            GLFW.POINTING_HAND_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_NotAllowed
+            GLFW.NOT_ALLOWED_CURSOR
+        else
+            GLFW.ARROW_CURSOR
+        end
+        # Not every X11 cursor theme has the GLFW 3.4 shapes; like ImGui's
+        # backend, fall back to the arrow for those.
+        glfw_cursors[cursor] = try
+            @ccall GLFW.libglfw.glfwCreateStandardCursor(shape::Cint)::Ptr{Cvoid}
+        catch err
+            if !(err isa GLFW.GLFWError)
+                rethrow()
+            end
+            @ccall GLFW.libglfw.glfwCreateStandardCursor(GLFW.ARROW_CURSOR::Cint)::Ptr{Cvoid}
+        end
+    end
+
+    main_window = unsafe_load(ig.GetMainViewport().PlatformHandle)
+    viewports = unsafe_load(ig.GetPlatformIO().Viewports)
+    windows = Set{Ptr{Cvoid}}()
+    for i in 1:viewports.Size
+        window = unsafe_load(unsafe_load(viewports.Data, i).PlatformHandle)
+        if window == C_NULL || window == main_window
+            continue
+        end
+        push!(windows, window)
+        if !haskey(viewport_cursors, window) || viewport_cursors[window] != cursor
+            viewport_cursors[window] = cursor
+            @ccall GLFW.libglfw.glfwSetCursor(window::Ptr{Cvoid}, glfw_cursors[cursor]::Ptr{Cvoid})::Cvoid
+        end
+    end
+    # A closed window's address may be reused by a new one that starts out with
+    # the default cursor, so forget windows that are gone.
+    filter!(kv -> kv.first in windows, viewport_cursors)
+end
+
 function draw_gui()
     # Dock the main window by default
     viewport = ig.igGetMainViewport()
@@ -1998,6 +2062,8 @@ function draw_gui()
         save_settings(client)
         io.WantSaveIniSettings = false
     end
+
+    update_viewport_cursors()
 end
 
 """Start the XFA GUI."""
