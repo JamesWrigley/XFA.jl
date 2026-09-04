@@ -28,6 +28,9 @@ include("states.jl")
 using TOML: TOML
 using Sockets: Sockets
 using CRC32c: crc32c
+using Logging: global_logger
+using Sentry: Sentry
+using XfaContext: XfaContext
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
@@ -2067,6 +2070,18 @@ function draw_gui()
 end
 
 """Start the XFA GUI."""
+# Reports exceptions to Sentry when a DSN is configured
+function setup_sentry(settings)
+    sentry_settings = get(settings, "Sentry", Dict{String, Any}())
+    if haskey(sentry_settings, "dsn") || haskey(ENV, "SENTRY_DSN")
+        Sentry.init(get(sentry_settings, "dsn", nothing);
+                    environment=get(sentry_settings, "environment", nothing),
+                    release="xfa@$(pkgversion(XFA))",
+                    in_app_modules=[XFA, XfaContext, XfaEngine])
+        global_logger(Sentry.SentryLogger())
+    end
+end
+
 function main(; test_engine=nothing)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
@@ -2074,7 +2089,9 @@ function main(; test_engine=nothing)
         ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
     end
 
-    gui_state = GuiState(load_settings())
+    settings = load_settings()
+    setup_sentry(settings)
+    gui_state = GuiState(settings)
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)

@@ -23,6 +23,7 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+Sentry = "22473447-a6cd-4572-bdc6-902d1f188b6a"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
@@ -33,6 +34,7 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
+Sentry = {rev = "updates", url = "https://github.com/JamesWrigley/Sentry.jl"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
 
@@ -54,6 +56,7 @@ ModernGL = "1"
 NaNStatistics = "0.6.55"
 PrecompileTools = "1.2.1"
 Revise = "3"
+Sentry = "0.3.0"
 SpecialFunctions = "2.7.2"
 Statistics = "1.11.1"
 TOML = "1"
