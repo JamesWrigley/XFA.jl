@@ -419,11 +419,21 @@ function Base.push!(sb::ScanBinner, value, positions...;
     end
     D = length(sb.last_coords)
     varr = value isa DD.AbstractDimArray ? parent(value) : value
+    vshape = varr isa AbstractArray ? size(varr) : ()
+
+    # A value of a different shape can't be folded into the existing bins or
+    # recompute buffer, so start over.
+    if !isnothing(sb.seq) && vshape != sb.value_shape
+        @warn "Scan value shape changed from $(sb.value_shape) to $vshape, resetting the bins"
+        sb.seq = nothing
+        sb.history = nothing
+        empty!(sb.coord_history)
+        sb.needs_rebin = false
+    end
 
     # Lazily build the binner and recompute buffer once the value shape is known.
     if isnothing(sb.seq)
-        N = varr isa AbstractArray ? ndims(varr) : 0
-        vshape = varr isa AbstractArray ? size(varr) : ()
+        N = length(vshape)
         vlen = prod(vshape; init=1)
         sb.value_dims = value isa DD.AbstractDimArray ? DD.dims(value) :
                         varr isa AbstractArray ?
@@ -431,7 +441,7 @@ function Base.push!(sb::ScanBinner, value, positions...;
         sb.seq = scan_binner(N, D, resolve_resolutions(resolutions, D), sb.value_dims; names=sb.axis_names)
         sb.value_shape = vshape
         if sb.keep_history
-            max_len = clamp(history_budget ÷ (sizeof(Float64) * vlen), 1, 100_000)
+            max_len = clamp(history_budget ÷ (sizeof(Float64) * max(vlen, 1)), 1, 100_000)
             sb.history = VectorHistory{Float64}(vlen; max_len)
             sb.coord_history = [CircularBuffer{Float64}(max_len) for _ in 1:D]
         end
