@@ -155,7 +155,16 @@ function Spinner(text="")
 end
 
 macro guiasync(expr)
-    return :(errormonitor(Threads.@spawn $(esc(expr))))
+    return quote
+        errormonitor(Threads.@spawn begin
+            try
+                $(esc(expr))
+            catch
+                Sentry.capture_exception(; message="Unhandled task error")
+                rethrow()
+            end
+        end)
+    end
 end
 
 macro Disabled(cond, expr)
