@@ -781,8 +781,6 @@ function store_variable_data!(client, variable::VariableData)
         if data isa Number
             values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
             tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-            push!(values, data)
-            push!(tids, variable.tid)
             client.variable_data[name] = VariableStore(; data=values, scalar_tids=tids)
         elseif data isa AbstractArray
             client.variable_data[name] = VariableStore(; data)
