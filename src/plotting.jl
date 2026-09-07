@@ -650,6 +650,7 @@ end
     requested::Bool = false
     restrict_x::Bool = false
     x_roi::LinearROI = LinearROI()
+    amplitude_sign::Int = 1
     popt::Maybe{Vector{Float64}} = nothing
     retcode::Maybe{Symbol} = nothing
     # Wall time of the most recent fit, in seconds.
@@ -722,7 +723,8 @@ function compute_fit!(fit::FitSettings, ydata::AbstractVector,
     if name == "Line"
         fit.popt, fit.retcode = fit_line(ydata, xdata; sigma, fixed)
     elseif name == "Gaussian"
-        fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma, fixed)
+        fit.popt, fit.retcode = fit_gaussian(ydata, xdata; sigma, fixed,
+                                             A_sign=fit.amplitude_sign)
     elseif name == "erf"
         fit.popt, fit.retcode = fit_erf(ydata, xdata; sigma, fixed)
     elseif name == "sin"
@@ -1633,10 +1635,58 @@ function draw_fitting_settings(id, fit::FitSettings)
             fit.requested = true
         end
         ig.EndDisabled()
-        if @c ig.Checkbox("Restrict X##$(id)", &fit.restrict_x)
+
+        if name == "Gaussian"
+            ig.AlignTextToFramePadding()
+            ig.Text("Amplitude is:")
+            ig.SameLine()
+            if toggle_button("positive##a-sign-$(id)", fit.amplitude_sign > 0)
+                fit.amplitude_sign = 1
+                fit.requested = true
+            end
+            ig.SameLine()
+            if toggle_button("negative##a-sign-$(id)", fit.amplitude_sign < 0)
+                fit.amplitude_sign = -1
+                fit.requested = true
+            end
+        end
+
+        checkbox_x = ig.GetCursorPosX()
+        if @c ig.Checkbox("##restrict-x-$(id)", &fit.restrict_x)
             fit.requested = true
         end
         ig.SetItemTooltip("Only fit the samples inside a draggable range of the X axis")
+        ig.SameLine()
+        header_indent = ig.GetCursorPosX() - checkbox_x
+        ig.BeginDisabled(!fit.restrict_x)
+        expanded = ig.CollapsingHeader("Restrict X##$(id)")
+        ig.EndDisabled()
+
+        if expanded && fit.restrict_x && isassigned(fit.x_roi)
+            ig.Indent(header_indent)
+            lo = Ref(Cdouble(fit.x_roi.start))
+            hi = Ref(Cdouble(fit.x_roi.start + fit.x_roi.length))
+            speed = Cfloat(fit.x_roi.length / 100)
+            ig.SetNextItemWidth(120)
+            edited = ig.DragScalar("Min##$(id)", ig.ImGuiDataType_Double, lo, speed,
+                                   C_NULL, C_NULL, "%.6e")
+            ig.SetNextItemWidth(120)
+            if ig.DragScalar("Max##$(id)", ig.ImGuiDataType_Double, hi, speed,
+                             C_NULL, C_NULL, "%.6e")
+                edited = true
+            end
+
+            if edited
+                a, b = minmax(lo[], hi[])
+                fit.x_roi = LinearROI(a, b - a; axis=fit.x_roi.axis)
+                fit.requested = true
+            end
+            ig.Unindent(header_indent)
+        end
+
+        ig.Spacing()
+        ig.Spacing()
+        ig.Text("Parameters:")
 
         for (i, (pname, param)) in enumerate(fit.params)
             ig.PushID("fit-param-$(id)-$(pname)")
@@ -1654,7 +1704,7 @@ function draw_fitting_settings(id, fit::FitSettings)
 
             flags = param.fixed ? ig.ImGuiInputTextFlags_None :
                                   ig.ImGuiInputTextFlags_ReadOnly
-            ig.SetNextItemWidth(120)
+            ig.SetNextItemWidth(130)
             # InputDouble's bound buffer updates per keystroke (only the commit
             # to `param.value` is gated on Enter / focus-loss), so comparing
             # edit_buf to value detects uncommitted changes mid-edit.
@@ -1662,7 +1712,7 @@ function draw_fitting_settings(id, fit::FitSettings)
             if uncommitted
                 ig.PushStyleColor(ig.ImGuiCol_FrameBg, ig.IM_COL32(143, 98, 0, 255))
             end
-            ig.InputDouble("$(pname)", param.edit_buf, 0.0, 0.0, "%g", flags)
+            ig.InputDouble("$(pname)", param.edit_buf, 0.0, 0.0, "%.8g", flags)
             if uncommitted
                 ig.PopStyleColor()
             end
@@ -1997,7 +2047,7 @@ as_frames(fs::AbstractVector{<:PlotType}) = fs
 
 function draw_plot(plot::Plot, updated_variables)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
-    side_panel_width = 300f0
+    side_panel_width = 320f0
     colorbar_width = 100f0
 
     # Build window title from the first layer that has an opinion.
@@ -2060,6 +2110,8 @@ function draw_plot(plot::Plot, updated_variables)
             if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
                 ImPlot.SetupAxis(ImPlot.ImAxis_X1, xlabel)
                 ImPlot.SetupAxis(ImPlot.ImAxis_Y1, ylabel)
+                ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
+                ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, "%.9g")
                 apply_log_scales(plot)
                 for (L, fs) in zip(plot.layers, layer_frames)
                     for f in fs
