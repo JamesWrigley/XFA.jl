@@ -1,0 +1,35 @@
+{
+    "$schema": "https://lnav.org/schemas/format-v1.schema.json",
+    "xfa_engine": {
+        "title": "XFA engine log",
+        "description": "Julia ConsoleLogger output prefixed with a timestamp, as written by XfaEngine.",
+        "file-pattern": "xfa-engine-\\d{4}-\\d{2}\\.log",
+        "regex": {
+            "std": {
+                "pattern": "^(?:\\[|┌) (?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?<level>Debug|Info|Warning|Error): (?<body>.*)$"
+            }
+        },
+        "timestamp-format": ["%Y-%m-%d %H:%M:%S"],
+        "level-field": "level",
+        "level": {
+            "debug": "Debug",
+            "info": "Info",
+            "warning": "Warning",
+            "error": "Error"
+        },
+        "sample": [
+            {
+                "line": "[ 2026-09-04 18:06:02 Info: Starting engine",
+                "level": "info"
+            },
+            {
+                "line": "┌ 2026-09-04 18:06:03 Error: failed\n│   exception =\n│    boom\n│    Stacktrace:\n│     [1] error(s::String)\n│       @ Base ./error.jl:44\n└ @ Main none:10",
+                "level": "error"
+            },
+            {
+                "line": "┌ 2026-09-04 18:06:03 Warning: multi\n│ line\n└ @ Main none:11",
+                "level": "warning"
+            }
+        ]
+    }
+}
