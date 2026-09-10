@@ -68,7 +68,7 @@ end
 function subscribe_sources(bridge::KaraboInput)
     device = bridge.trainmatcher[]
     reply = call_slot(get_webproxy(device), device.name, "subscribeSources",
-                      Dict("sources" => bridge.sources))
+                      Dict("sources" => bridge.sources); timeout=15)
     if !reply["success"]
         @warn "Trainmatcher '$(device.name)' rejected the source subscription" reason=get(reply, "reason", "unknown")
     end
