@@ -719,7 +719,16 @@ function draw_variable(name, var_data)
         # doesn't have. Pending nodes fall back to the default parameter UI.
         if isnothing(pending)
             gui_state = get(client.variable_gui_states, name, nothing)
-            new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+            # Ending the editor with a node still open crashes it, so an error
+            # here is reported and the frame finished; the render loop's crash
+            # screen takes over from the next frame.
+            new_gui_state = try
+                draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+            catch ex
+                @error "Error while drawing node '$(name)'" exception=(ex, catch_backtrace())
+                state[].disable_rendering = true
+                nothing
+            end
             if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
                 client.variable_gui_states[name] = new_gui_state
             end

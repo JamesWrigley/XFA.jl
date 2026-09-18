@@ -294,8 +294,8 @@ end
 # Handles patterns like: `my_group = Foo(; x=old_value)`
 # If the kwarg doesn't exist, it is appended. If there are no kwargs at all,
 # a new parameter section is inserted.
-function replace_constructor_kwarg(source::String, var_name::String,
-                                   kwarg_name::String, new_value::String;
+function replace_constructor_kwarg(source::String, var_name::AbstractString,
+                                   kwarg_name::AbstractString, new_value::AbstractString;
                                    warn::Bool=true)
     tree = parseall(SyntaxNode, source; ignore_errors=true)
     assign_node = find_assignment_call(tree, var_name)
@@ -544,7 +544,7 @@ function remove_variable_source(source::String, name::String)
     end
 end
 
-set_group_param(state, var_name::String, kwarg_name::String, new_value::String; reload::Bool=true) =
+set_group_param(state, var_name::AbstractString, kwarg_name::AbstractString, new_value::AbstractString; reload::Bool=true) =
     apply_source_edit(state, s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value);
                       reload)
 

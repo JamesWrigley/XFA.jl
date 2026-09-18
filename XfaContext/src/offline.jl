@@ -4,6 +4,63 @@
 # data-collection method lives in the PythonCall package extension; everything
 # here is the pure-Julia machinery it builds on.
 
+const PythonCall_pkgid = Base.PkgId(Base.UUID("6099a3de-0909-46bc-b1f4-468b9a2dfc0d"), "PythonCall")
+
+# Load PythonCall on first use (like Pkg in IJulia). Callers must
+# `@invokelatest` extension methods.
+#
+# The importing thread becomes Python's main thread, and finalising Python at
+# exit only works from that thread: any other one gets its own thread state,
+# which finalisation treats as a daemon thread and parks forever when a
+# finaliser (e.g. h5py's) re-takes the GIL. Exit hooks run on thread 1, so
+# the import is pinned there.
+function load_pythoncall()
+    if !haskey(Base.loaded_modules, PythonCall_pkgid)
+        if Threads.threadid() == 1
+            import_pythoncall()
+        else
+            task = Task(import_pythoncall)
+            ccall(:jl_set_task_tid, Cint, (Any, Cint), task, 0)
+            schedule(task)
+            wait(task)
+        end
+    end
+
+    return Base.loaded_modules[PythonCall_pkgid]
+end
+
+# The importing thread is left holding the GIL, so the task is pinned while
+# importing and the GIL released before returning.
+function import_pythoncall()
+    task = current_task()
+    was_sticky = task.sticky
+    task.sticky = true
+    try
+        Base.require(PythonCall_pkgid)
+        PythonCall = Base.loaded_modules[PythonCall_pkgid]
+        @invokelatest PythonCall.C.PyEval_SaveThread()
+
+        # PythonCall's exit hook finalises Python, which needs the GIL held
+        # by the exiting thread. Exit hooks run last-registered-first.
+        atexit(() -> @invokelatest PythonCall.C.PyGILState_Ensure())
+    finally
+        task.sticky = was_sticky
+    end
+end
+
+# Offline input API over an extra-data DataCollection, implemented by the
+# PythonCall extension.
+function open_data_collection end
+function data_collection_devices end
+function data_collection_schema end
+function open_stream end
+function feed! end
+function release! end
+
+# Replace Python-backed arrays with Julia views over the same memory, the
+# caller must `GC.@preserve` the original.
+unwrap_python(x) = x
+
 # Shallow copy of a context, sharing immutable/loaded state (functions, groups,
 # parameters, postprocessors) but with fresh containers for everything `run`
 # mutates while building an offline plan, so the loaded context is left pristine
@@ -23,8 +80,10 @@ function Base.copy(ctx::ContextState)
                  prelude=ctx.prelude,
                  dep_to_input=copy(ctx.dep_to_input),
                  path=ctx.path,
-                 forwarder=ctx.forwarder,
-                 on_parameter_changed=ctx.on_parameter_changed)
+                 on_output=ctx.on_output,
+                 on_train_processed=ctx.on_train_processed,
+                 on_parameter_changed=ctx.on_parameter_changed,
+                 on_displayable_changed=ctx.on_displayable_changed)
 end
 
 # Turn a `select` pattern into an anchored regex. Names are dot-separated
@@ -98,8 +157,10 @@ function prepare_offline!(plan::ContextState, select, override)
                 delete!(plan.dag, name)
                 delete!(plan.functions, name)
                 delete!(plan.variable_postprocessors, name)
+                for target in [name; plan.subvariables[name]]
+                    delete!(plan.displays, target)
+                end
                 delete!(plan.subvariables, name)
-                delete!(plan.displays, name)
             end
         end
     end
@@ -150,29 +211,23 @@ function offline_emitter(name, stream_output, downstream, value, tids)
     end
 end
 
-# Offline forwarder: drains a finished pipeline's stream_output into `raw`,
-# recording each variable's and subvariable's per-train data.
-function accumulate_stream!(raw::Dict{String, Vector{Pair{Int, Any}}}, stream)
-    try
-        while isopen(stream) || isready(stream)
-            vd = take!(stream)
-            record_sample!(raw, vd.name, vd.tid, vd.data)
-            for (sub_name, sub_vd) in vd.subvariables
-                record_sample!(raw, sub_name, vd.tid, sub_vd.data)
-            end
-        end
-    catch ex
-        if !(ex isa InvalidStateException)
-            @error "Offline result collection failed" exception=(ex, catch_backtrace())
-        end
+# Offline `on_output`: records each variable's and subvariable's per-train data
+# into `raw`.
+function record_train!(raw::Dict{String, Vector{Pair{Int, Any}}}, vd::VariableData)
+    record_sample!(raw, vd.name, vd.tid, vd.data)
+    for (sub_name, sub_vd) in vd.subvariables
+        record_sample!(raw, sub_name, vd.tid, sub_vd.data)
     end
 end
 
+# Arrays are copied because a variable's data is only valid until its train has
+# cleared the pipeline (an input may be a view into a buffer the feeder re-uses).
 function record_sample!(raw, name, tid, data)
     if isnothing(name) || isnothing(data)
         return
     end
-    push!(get!(raw, name, Pair{Int, Any}[]), tid => data)
+    sample = data isa AbstractArray ? copy(data) : data
+    push!(get!(raw, name, Pair{Int, Any}[]), tid => sample)
 end
 
 # Assemble the final per-variable result from accumulated samples, sorted by
@@ -204,24 +259,21 @@ end
 # Shared driver for both `run` methods. Given a prepared `plan`, the matched
 # train ids and an `input_feeder` closure (pushes `(tid, data)` per train), wire
 # the single "offline" input, run the streaming pipeline to completion and
-# collect the per-train results. `wait_guard` wraps the blocking wait on the
-# pipeline tasks — the PythonCall path passes `GIL.@unlock` so the feeder task
-# can take the GIL; the default runs it directly.
-function run_offline_plan(plan::ContextState, matched_tids, input_feeder; wait_guard=(f -> f()))
+# collect the per-train results. The plan's `on_train_processed` is left to the
+# caller (the PythonCall path uses it to return trains to the streamer).
+function run_offline_plan(plan::ContextState, matched_tids, input_feeder)
     plan.matched_tids = matched_tids
     plan.input_feeder = input_feeder
     plan.inputs = Dict{String, Any}("offline" => OrderedDict{Any, Any}())
     plan.dep_to_input = build_dep_routing(plan)
 
     raw = Dict{String, Vector{Pair{Int, Any}}}()
-    plan.forwarder = stream -> accumulate_stream!(raw, stream)
+    plan.on_output = Base.Fix1(record_train!, raw)
 
     start_pipeline(plan; offline=true)
     try
-        wait_guard() do
-            wait(plan.watcher_task)
-            wait(plan.output_forwarder_task)
-        end
+        wait(plan.watcher_task)
+        wait(plan.output_forwarder_task)
     finally
         stop_pipeline(plan)
     end

@@ -1,5 +1,7 @@
 [deps]
+CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 FHist = "68837c9b-b678-4cd5-9925-8a54edc8f695"
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"

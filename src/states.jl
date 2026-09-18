@@ -506,6 +506,7 @@ end
     # source_list grouped by topic. Rebuilt alongside source_list so the routing
     # rules table can look up its per-topic source list without rescanning.
     sources_by_topic::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
+    sources_by_input::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
 
     # Parameter widget states, keyed by parameter name
     parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()

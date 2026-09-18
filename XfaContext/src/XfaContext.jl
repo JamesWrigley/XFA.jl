@@ -1,6 +1,6 @@
 module XfaContext
 
-export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, Parameter, tryset, KaraboDevice, SourceInfo,
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
     RectROI, LinearROI, Context
@@ -17,7 +17,7 @@ const VARIABLE_CHANNEL_SIZE = 100
 
 import Base.ScopedValues: @with
 
-using DistributedNext: DistributedNext, RemoteChannel, remote_do, remoteref_id, remotecall_fetch
+using DistributedNext: DistributedNext, RemoteChannel, remote_do, remoteref_id, remotecall_fetch, myid
 
 import MacroTools
 import MacroTools: @capture, postwalk, prettify
@@ -56,6 +56,9 @@ function channel_stat(rc::RemoteChannel)::ChannelStat
     end
 end
 
+# A blocking channel (offline pipelines) never drops.
+channel_stat(ch::Channel)::ChannelStat = ChannelStat(0, Base.n_avail(ch), ch.sz_max)
+
 # Trait functions for dispatch-based metadata registration.
 # Overloaded by @Variable, @Input, and @Group macros for each
 # function/type they define, enabling Revise compatibility.
@@ -67,7 +70,7 @@ function group_fields end
 function group_default_parameters end
 variable_subvariables(_) = String[]
 variable_postprocessors(_) = VariablePostprocessor[]
-variable_displays(_) = String[]
+variable_displays(_) = Pair{String, String}[]
 
 # Returns the topic served by an input group, or nothing for generic inputs
 input_topic(::Any) = nothing
@@ -149,6 +152,7 @@ end
     displays::Dict{String, Vector{String}} = Dict()
     postprocessors::Dict{String, AbstractPostprocessor} = Dict()
     parameters::Dict{String, Parameter} = Dict()
+    displayables::Dict{String, Displayable} = Dict()
     exprs::Vector{Expr} = Expr[]
 
     inputs::Dict{String, Any} = Dict()
@@ -177,13 +181,16 @@ end
     input_rates::Dict{String, Float64} = Dict()
 
     stream_output::Union{RemoteChannel, Channel, Nothing} = nothing
-    forwarder::Function = Returns(nothing)
+    on_output::Union{Function, Nothing} = nothing
+    on_train_processed::Union{Function, Nothing} = nothing
     output_forwarder_task::Union{Task, Nothing} = nothing
 
     # Invoked on proc 1 when a parameter changes value via `tryset`, as
     # (name, value). The engine installs a closure that broadcasts the change
     # to connected clients; offline runners leave it as the no-op default.
     on_parameter_changed::Function = Returns(nothing)
+    # Likewise for a Displayable set by the pipeline, passed the Displayable.
+    on_displayable_changed::Function = Returns(nothing)
 
     # Why the running pipeline should stop, consumed by `wait_pipeline`:
     # `:finished` (all variables done), `:stop` (`request_stop`) or `:rewire`
@@ -240,15 +247,20 @@ function external_dependencies(ctx::ContextState; per_variable=false, monitored=
         return deps_per_variable
     end
 
-    # Overloads come from the context file, so they may be newer than the
-    # caller's world.
     if monitored
-        for group in values(ctx.groups)
-            append!(all_deps, @invokelatest monitored_properties(group))
-        end
+        append!(all_deps, monitored_dependencies(ctx))
     end
 
     return unique(all_deps)
+end
+
+# The groups' monitored properties.
+function monitored_dependencies(ctx::ContextState)
+    deps = Dependency[]
+    for group in values(ctx.groups)
+        append!(deps, @invokelatest monitored_properties(group))
+    end
+    return unique(deps)
 end
 
 # Returns the group object for an input, or nothing if it has no group.
@@ -459,12 +471,16 @@ function to_dict(ctx::ContextState)
         postprocessor_origins[pp_name] = origin_path(typeof(pp))
     end
 
+    displayables = Dict{String, Displayable}(name => typeof(d)(; name, value=d.value)
+                                            for (name, d) in ctx.displayables)
+
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
                 "postprocessor_origins" => postprocessor_origins,
                 "displays" => ctx.displays,
                 "parameters" => parameters,
+                "displayables" => displayables,
                 "inputs" => inputs,
                 "groups" => groups,
                 "origins" => origins,
@@ -600,6 +616,10 @@ end
 function change_parameter(ctx::ContextState, new_param::Parameter)
     pause_pipeline() do
         ctx_param = worker_state.parameters[new_param.name]
+        ctx_param.value = new_param.value
+        ctx_param.set_by_user = true
+
+        # Runs after the assignment so a handler sees the owner's new state
         if !isnothing(ctx_param.update_handler)
             owner = find_parameter_owner(ctx, new_param.name)
             if !isnothing(owner)
@@ -608,9 +628,6 @@ function change_parameter(ctx::ContextState, new_param::Parameter)
                 ctx_param.update_handler(new_param.value)
             end
         end
-
-        ctx_param.value = new_param.value
-        ctx_param.set_by_user = true
     end
 end
 
@@ -792,7 +809,13 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
     matcher = Trainmatcher((k for (k, v) in upstream if v isa Union{RemoteChannel, Channel}), max_train_latency)
     matched_trains = Dict{Int, Any}()
+    dropped_trains = Int[]
     args = Vector{Any}(undef, length(deps))
+
+    function emit(vd)
+        put!(stream_output, vd)
+        putall!(values(downstream), vd)
+    end
 
     # Parameter deps are constant config (e.g. an unassigned optional group
     # dependency), not per-train data, so they never gate execution.
@@ -825,7 +848,11 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     try
         while true
             while isempty(matched_trains)
-                match_train!(matched_trains, matcher, take!(input_data))
+                match_train!(matched_trains, dropped_trains, matcher, take!(input_data))
+                for tid in dropped_trains
+                    emit(VariableData(tid, name, nothing))
+                end
+                empty!(dropped_trains)
             end
 
             tid, matched_data = only(matched_trains)
@@ -856,7 +883,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
                 # Don't execute the variable if any required input is `nothing`
                 if any(i -> !optional_args[i] && isnothing(args[i]), eachindex(args))
-                    putall!(values(downstream), empty_result)
+                    emit(empty_result)
                     continue
                 end
 
@@ -869,7 +896,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                                 @invokelatest f(args...))
                 catch ex
                     @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
-                    putall!(values(downstream), empty_result)
+                    emit(empty_result)
                     continue
                 end
 
@@ -907,8 +934,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             # Send output (NaN rate before the second tick → report 0)
             update_rate = isnan(rate.value) ? 0.0 : rate.value
             out = wrap_result(out, tid, name; subvariables=subvar_values, update_rate)
-            put!(stream_output, out)
-            putall!(values(downstream), out)
+            emit(out)
             @debug "Pushed output from '$(name)' to: $(keys(downstream))"
         end
     catch ex
@@ -930,6 +956,44 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
         end
 
         wait(input_task)
+    end
+end
+
+# Post-pipeline stage: passes each output to `ctx.on_output` and calls
+# `ctx.on_train_processed` once all `n_variables` variables have emitted for a train.
+function run_post_pipeline(ctx::ContextState, n_variables::Int)
+    stream = ctx.stream_output
+    pending = Dict{Int, Int}()
+    try
+        while isopen(stream) || isready(stream)
+            vd = take!(stream)
+            if !isnothing(ctx.on_output)
+                ctx.on_output(vd)
+            end
+
+            remaining = get(pending, vd.tid, n_variables) - 1
+            if remaining == 0
+                delete!(pending, vd.tid)
+                if !isnothing(ctx.on_train_processed)
+                    ctx.on_train_processed(vd.tid)
+                end
+            else
+                pending[vd.tid] = remaining
+            end
+        end
+    catch ex
+        if !(ex isa InvalidStateException)
+            @error "Post-pipeline stage failed" exception=(ex, catch_backtrace())
+        end
+    end
+
+    if !isempty(pending)
+        @warn "$(length(pending)) train(s) did not clear the pipeline"
+        if !isnothing(ctx.on_train_processed)
+            for tid in sort!(collect(keys(pending)))
+                ctx.on_train_processed(tid)
+            end
+        end
     end
 end
 
@@ -969,8 +1033,7 @@ function update_input_sources(ctx::ContextState)
 
         input_deps = [dep for dep in deps
                       if get(ctx.dep_to_input, string(dep), nothing) == input_name]
-        sources = [trainmatcher_dep_string(dep) for dep in input_deps]
-        update_sources(group, sources)
+        update_sources(group, input_deps)
     end
 end
 
@@ -1006,8 +1069,6 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
 
     ctx.stream_output = variable_channel(offline)
     ctx.events_channel = RemoteChannel(() -> Channel(100))
-    ctx.output_forwarder_task = Threads.@spawn :samepool ctx.forwarder(ctx.stream_output)
-    errormonitor(ctx.output_forwarder_task)
 
     global current_ctx = ctx
 
@@ -1168,6 +1229,12 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         )
         ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
         errormonitor(ctx.variable_tasks[name])
+    end
+
+    # Without a consumer the outputs stay in `stream_output` for the owner to read.
+    if !isnothing(ctx.on_output) || !isnothing(ctx.on_train_processed)
+        ctx.output_forwarder_task = Threads.@spawn :samepool run_post_pipeline(ctx, length(ctx.variable_tasks))
+        errormonitor(ctx.output_forwarder_task)
     end
 
     # Start the watcher task
@@ -1387,6 +1454,7 @@ end
 
 function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Returns(nothing), prelude=Expr[])
     parameters = Dict{String, Parameter}()
+    displayables = Dict{String, Displayable}()
 
     # Discover all variables, inputs, group types, and parameters defined
     # in ctx_module by scanning its names and checking for trait methods.
@@ -1544,6 +1612,10 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 param = getproperty(object, field)
                 param.name = "$(group_name).$(field)"
                 parameters[param.name] = param
+            elseif fieldtype(group_type, field) <: Displayable
+                displayable = getproperty(object, field)
+                displayable.name = "$(group_name).$(field)"
+                displayables[displayable.name] = displayable
             end
         end
 
@@ -1624,15 +1696,17 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     # reference with a dot ("GroupType.field") names a group field and is
     # mapped to the instantiated group: variables in a group are named
     # "$group_name.$func_name", so we use the variable's group_name prefix.
-    # A reference without a dot is a top-level Parameter binding name.
+    # A reference without a dot is a top-level Parameter binding name. The
+    # result is keyed by plot target: the variable or one of its subvariables.
     ctx_displays = Dict{String, Vector{String}}()
     for var_name in keys(dag)
-        refs = variable_displays(functions[var_name])
-        if isempty(refs)
-            continue
-        end
-        resolved = String[]
-        for ref in refs
+        func_base = string(nameof(functions[var_name]))
+        for (target, ref) in variable_displays(functions[var_name])
+            target = replace(target, func_base => var_name; count=1)
+            if target != var_name && target ∉ ctx_subvariables[var_name]
+                throw(XfaContextException("@display targets unknown subvariable '$(target)' (on variable '$(var_name)')"))
+            end
+
             param_name = if occursin('.', ref)
                 _, field = split(ref, '.'; limit=2)
                 group_name, _ = split(var_name, '.'; limit=2)
@@ -1643,9 +1717,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
             if !haskey(parameters, param_name)
                 throw(XfaContextException("@display references unknown parameter '$(param_name)' (from '$(ref)' on variable '$(var_name)')"))
             end
-            push!(resolved, param_name)
+            push!(get!(ctx_displays, target, String[]), param_name)
         end
-        ctx_displays[var_name] = resolved
     end
 
     ctx = ContextState(; functions, group_types, groups, dag,
@@ -1653,7 +1726,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
                      displays=ctx_displays,
-                     parameters, exprs, inputs, prelude, dep_router)
+                     parameters, displayables, exprs, inputs, prelude, dep_router)
     ctx.dep_to_input = build_dep_routing(ctx, dep_router)
     global current_ctx = ctx
     return ctx

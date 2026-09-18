@@ -2,6 +2,22 @@ module XfaEngineTests
 
 __revise_mode__ = :eval
 
+# Copy CondaPkg.toml to the test project so that it gets found by CondaPkg
+# during the tests (it's a symlink to the XfaContext one, so the two suites
+# share the same Python environment).
+cp(joinpath(@__DIR__, "CondaPkg.toml"), joinpath(dirname(Base.active_project()), "CondaPkg.toml");
+   force=true, follow_symlinks=true)
+
+ENV["JULIA_CONDAPKG_ENV"] = "@xfacontext-tests"
+ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
+
+# If you're running the tests locally you could uncomment the two environment
+# variables below. This will be a bit faster since it stops CondaPkg from
+# re-resolving the environment each time (but you do need to run it at least
+# once locally to initialize the environment).
+# ENV["JULIA_PYTHONCALL_EXE"] = joinpath(Base.DEPOT_PATH[1], "conda_environments", "xfacontext-tests", "bin", "python")
+# ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
+
 using Logging: Logging
 using Sockets: Sockets, @ip_str, send, recv
 using Statistics: mean
@@ -158,6 +174,13 @@ end
             Protocol.client_send(ws, Protocol.GetInputSources())
             @test Protocol.receive(ws).msg isa Protocol.InputSources
 
+            # Without a webproxy (or an offline input) a schema request fails
+            # gracefully
+            Protocol.client_send(ws, Protocol.GetDeviceSchema("T", "DEV"))
+            schema_msg = Protocol.receive(ws).msg
+            @test schema_msg isa Protocol.DeviceSchema
+            @test schema_msg.schema isa Protocol.ExceptionMessage
+
             # Test GetVariables: the engine reports its registered @Variable's,
             # @Group's, and @Input's, including the KaraboInput input group.
             Protocol.client_send(ws, Protocol.GetVariables())
@@ -175,6 +198,18 @@ end
                 # msg = Protocol.receive(ws).msg
                 # @test msg isa Protocol.ContextInfo
                 # @test msg.info isa Exception
+
+                # Online and offline inputs can't be mixed
+                write(path, """
+                            a = KaraboInput(; trainmatcher=KaraboDevice("T//DEV"))
+                            b = KaraboInput(; offline=true)
+                            @Variable x -> karabo"T//foo.bar"
+                            """)
+                Protocol.client_send(ws, Protocol.LoadContext(path))
+                msg = Protocol.receive(ws).msg
+                @test msg isa Protocol.ContextInfo
+                @test msg.info isa Protocol.ExceptionMessage
+                @test contains(msg.info.text, "mix online and offline")
 
                 # Test loading a valid context
                 write(path, """
@@ -626,6 +661,134 @@ end
     end
 end
 
+@testset "Offline input" begin
+    mktempdir() do dir
+        # Made in a subprocess so the test never has to hold the GIL itself;
+        # PythonCall is loaded lazily by the input under test.
+        path = joinpath(dir, "RAW-R0450-DA01-S00000.h5")
+        run(`$(ENV["JULIA_PYTHONCALL_EXE"]) -c "from extra_data.tests.make_examples import make_fxe_da_file; make_fxe_da_file('$(path)')"`)
+
+        ctx = Context.load_from_string("""
+        @Group mutable struct Watcher
+            changes::Vector{Any} = []
+        end
+        Context.monitored_properties(::Watcher) = [karabo"SA1_XTD2_XGM/DOOCS/MAIN.pulseEnergy.photonFlux"]
+        function Context.on_properties_changed(w::Watcher, changed)
+            push!(w.changes, changed)
+            return false
+        end
+        watcher = Watcher()
+
+        bridge = KaraboInput(; offline=true, run_directory="$(dir)", rate=1e6)
+
+        @Variable flux -> karabo"SA1_XTD2_XGM/DOOCS/MAIN.pulseEnergy.photonFlux"
+        @Variable function intensity(x -> karabo"SA1_XTD2_XGM/DOOCS/MAIN:output[data.intensityTD]")
+            sum(x)
+        end
+        """; prelude=KARABO_PRELUDE)
+        bridge = ctx.groups["bridge"]
+
+        # Sources come from the run with topics derived from the device names
+        @test isnothing(Context.input_topic(bridge))
+        sources = Context.get_sources(bridge)
+        @test Context.SourceInfo("SA1", "SA1_XTD2_XGM/DOOCS/MAIN", "DoocsXGM") in sources
+        @test Set(s.topic for s in sources) == Set(["SA1", "SPB", "FXE"])
+        @test !any(s -> contains(s.name, ':'), sources)
+        @test ctx.dep_to_input == Dict("SA1_XTD2_XGM/DOOCS/MAIN.pulseEnergy.photonFlux" => "bridge.stream",
+                                       "SA1_XTD2_XGM/DOOCS/MAIN:output[data.intensityTD]" => "bridge.stream")
+
+        # The schema is synthesized from the run
+        schema = XfaEngine.device_schema(ctx, "SA1", "SA1_XTD2_XGM/DOOCS/MAIN")
+        @test schema["pulseEnergy"]["photonFlux"] == Dict("nodeType" => "Leaf")
+        @test schema["output"]["noInputShared"] == true
+        @test schema["output"]["schema"]["data"]["intensityTD"] == Dict("nodeType" => "Leaf")
+        @test_throws ErrorException XfaEngine.device_schema(ctx, "SA1", "NOT/A/DEVICE")
+
+        outputs = Dict{String, Vector{Any}}()
+        ctx.on_output = vd -> push!(get!(outputs, vd.name, []), vd.data)
+        released = Int[]
+        ctx.on_train_processed = function (tid)
+            push!(released, tid)
+            XfaEngine.release_train(bridge, tid)
+        end
+
+        Context.run(ctx; offline=true, timeout=60) do
+            @test timedwait(() -> isready(ctx.pipeline_events), 30) == :ok
+            @test take!(ctx.pipeline_events) == :finished
+        end
+
+        @test length(outputs["flux"]) == 400
+        @test all(==(0), outputs["flux"])
+        @test all(==(0), outputs["intensity"])
+        @test sort(released) == 10000:10399
+        @test isnothing(bridge.stream)
+
+        # The monitored property never changes, so it's reported once
+        @test ctx.groups["watcher"].changes == [Dict("pulseEnergy.photonFlux" => (; value=0.0f0, tid=10000))]
+
+        # The rate paces the feeder: 400 trains at 1kHz take at least 0.4s
+        stream = @invokelatest Context.open_stream(bridge.dc, Context.Dependency[])
+        elapsed = @elapsed @invokelatest Context.feed!(stream, Channel(Inf), Ref(1000.0))
+        @test 0.4 <= elapsed < 5
+
+        # Unsetting the run drops the sources
+        bridge.run_directory[] = ""
+        @test isnothing(XfaEngine.data_collection(bridge))
+        @test isempty(Context.get_sources(bridge))
+
+        # Stream the run through the engine to a client
+        @testset "Streaming to a client" begin
+            temp_engine() do address, stop_event, info_path
+                WebSockets.open(address) do ws
+                    WebSockets.receive(ws) # client id
+
+                    mktemp() do path, io
+                        write(path, """
+                        bridge = KaraboInput(; offline=true, run_directory="$(dir)", rate=1e6)
+                        @Variable flux -> karabo"SA1_XTD2_XGM/DOOCS/MAIN.pulseEnergy.photonFlux"
+                        @Variable itd -> karabo"SA1_XTD2_XGM/DOOCS/MAIN:output[data.intensityTD]"
+                        @Variable itd_raw -> karabo"SA1_XTD2_XGM/DOOCS/MAIN:output[data.intensityTD]"
+                        @Variable function itd_view(x -> karabo"SA1_XTD2_XGM/DOOCS/MAIN:output[data.intensityTD]")
+                            @view x[1:10]
+                        end
+                        """)
+                        Protocol.client_send(ws, Protocol.LoadContext(path))
+                        while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                    end
+
+                    Protocol.client_send(ws, Protocol.SetVariableSubscriptions(Dict("itd" => 0.0, "itd_view" => 0.0)))
+                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                    Protocol.client_send(ws, Protocol.Start())
+                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                    received = Dict{String, Vector{VariableData}}()
+                    progress = Tuple{Int, Int}[]
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.Stopped)
+                        if msg isa Protocol.TrainData
+                            for vd in msg.variables
+                                push!(get!(received, vd.name, []), vd)
+                            end
+                        elseif msg isa Protocol.DisplayableChanged && msg.displayable.name == "bridge.progress"
+                            push!(progress, msg.displayable.value)
+                        end
+                        msg = Protocol.receive(ws).msg
+                    end
+
+                    @test issorted(progress) && progress[end] == (400, 400)
+                    @test all(v -> length(v) == 400, values(received))
+                    @test [vd.tid for vd in received["itd"]] == 10000:10399
+                    @test all(vd -> vd.data == 0.0f0, received["flux"])
+                    @test all(vd -> vd.data isa CompressedArray, received["itd"])
+                    @test decompress_array(ZfpWorkspace(), received["itd"][end].data) == zeros(Float32, 1000)
+                    @test all(vd -> vd.data isa ArrayMetadata && vd.data.size == [1000], received["itd_raw"])
+                    @test all(vd -> length(vd.data) == 10 && iszero(vd.data), received["itd_view"])
+                end
+            end
+        end
+    end
+end
+
 @testset "Scheduler" begin
     @testset "Routing" begin
         @testset "match_rule" begin
@@ -887,7 +1050,13 @@ end
                                                             "bar.window.size" => Parameter("bar.window.size", 5),
                                                             "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
-                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false)),
+                                                            "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false),
+                                                            "bridge.offline" => Parameter("bridge.offline", false),
+                                                            "bridge.proposal" => Parameter("bridge.proposal", 0),
+                                                            "bridge.run" => Parameter("bridge.run", 0),
+                                                            "bridge.run_directory" => Parameter("bridge.run_directory", ""),
+                                                            "bridge.rate" => Parameter("bridge.rate", 10.0)),
+                                       "displayables" => Dict("bridge.progress" => Context.Displayable(; name="bridge.progress", value=(0, 0))),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "group_parameter_args" => Dict(),
                                        "path" => "")
