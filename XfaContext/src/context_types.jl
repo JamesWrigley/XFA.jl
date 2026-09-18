@@ -592,6 +592,51 @@ macro add_subvariable(name, value)
     end)
 end
 
+"""
+    @get_scratch(name, ex; key=nothing)
+
+Return the object cached under `name` in `Meta.scratch[]`, evaluating `ex` to
+create it if it doesn't exist or if `key` has changed since it was created.
+Names are namespaced by `Meta.name[]` so a variable's postprocessors can't
+collide with it.
+"""
+macro get_scratch(args...)
+    positional = []
+    kwargs = []
+    for arg in args
+        if Base.Meta.isexpr(arg, :parameters)
+            append!(kwargs, arg.args)
+        elseif Base.Meta.isexpr(arg, :(=))
+            push!(kwargs, arg)
+        else
+            push!(positional, arg)
+        end
+    end
+
+    if length(positional) != 2
+        throw(ArgumentError("@get_scratch expects a name and an expression, got: $(args)"))
+    end
+    name, ex = positional
+
+    key = nothing
+    for kw in kwargs
+        if Base.Meta.isexpr(kw, (:kw, :(=))) && kw.args[1] == :key
+            key = kw.args[2]
+        else
+            throw(ArgumentError("@get_scratch only supports a `key` keyword argument, got: $(kw)"))
+        end
+    end
+
+    quote
+        let s = $Meta.scratch[], name = string($Meta.name[], '/', $(esc(name))), k = $(esc(key))
+            if !haskey(s, name) || !isequal(first(s[name]), k)
+                s[name] = (k, $(esc(ex)))
+            end
+            last(s[name])
+        end
+    end
+end
+
 macro postprocess(args...)
     error("The @postprocess macro may only be used inside of a @Variable block.")
 end
@@ -653,6 +698,33 @@ Base.setindex!(param::Parameter, value) = param.value = value
 
 Base.isassigned(param::Parameter) = !isnothing(param.value)
 
+# A group field that the pipeline updates and clients display, but that isn't
+# user-editable or saved in the context file. `d[] = value` forwards the new
+# value to proc 1 and from there to the clients.
+@kwdef mutable struct Displayable{T}
+    name::String = ""
+    value::T
+end
+
+Displayable(value) = Displayable(; value)
+
+function Base.:(==)(one::Displayable{T}, two::Displayable{T}) where T
+    one.name == two.name && one.value == two.value
+end
+
+Base.getindex(d::Displayable) = d.value
+
+function Base.setindex!(d::Displayable, value)
+    d.value = value
+    if !isempty(d.name)
+        if myid() == 1
+            set_displayable(d)
+        else
+            remote_do(set_displayable, 1, d)
+        end
+    end
+end
+
 # Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
 # into the coordinator's parameter dict and notifies the context's
 # `on_parameter_changed` hook so the engine can broadcast it to clients.
@@ -666,6 +738,15 @@ function set_parameter(name::String, value, requestor::String)
     end
 
     current_ctx.on_parameter_changed(name, value)
+end
+
+# Runs on proc 1 when a Displayable is set, mirroring `set_parameter`.
+function set_displayable(d::Displayable)
+    if haskey(current_ctx.displayables, d.name)
+        current_ctx.displayables[d.name].value = d.value
+    end
+
+    current_ctx.on_displayable_changed(d)
 end
 
 function _input(ctx_module, expr, side_effects)
