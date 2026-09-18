@@ -582,6 +582,39 @@ end
     """)
     @test isempty(@invokelatest(Context.variable_displays(ctx.functions["renamed"])))
 end
+
+@testset "@get_scratch" begin
+    n_built = 0
+    function build(x)
+        n_built += 1
+        return zeros(length(x))
+    end
+    get_ws(x) = @get_scratch("ws", build(x); key=length(x))
+
+    scratch = Dict{String, Any}()
+    Base.ScopedValues.@with Context.Meta.scratch => scratch Context.Meta.name => "foo" begin
+        ws = get_ws(1:3)
+        @test get_ws(4:6) === ws
+        @test n_built == 1
+        @test length(get_ws(1:5)) == 5
+        @test n_built == 2
+
+        # Without a key the object is never rebuilt, and NaN keys compare equal
+        @test @get_scratch("nokey", 1) == 1
+        @test @get_scratch("nokey", 2) == 1
+        @test @get_scratch("nan", 1, key=NaN) == 1
+        @test @get_scratch("nan", 2, key=NaN) == 1
+    end
+
+    # A postprocessor sharing the dict gets its own namespace
+    Base.ScopedValues.@with Context.Meta.scratch => scratch Context.Meta.name => "foo.mean" begin
+        @test @get_scratch("nokey", 2) == 2
+    end
+    @test haskey(scratch, "foo/nokey")
+    @test haskey(scratch, "foo.mean/nokey")
+
+    @test_throws ArgumentError macroexpand(@__MODULE__, :(@get_scratch("ws", 1; foo=2)))
+    @test_throws ArgumentError macroexpand(@__MODULE__, :(@get_scratch("ws")))
 end
 
 @testset "ROIs" begin
