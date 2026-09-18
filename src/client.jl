@@ -45,7 +45,11 @@ function ssh_initialize(state::GuiState)
 
     if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
         push!(client.ssh_hops, SshState(; address=BASTION))
-        push!(client.ssh_hops, SshState(; address=GATEWAY))
+        # Maxwell nodes (max-*) are reachable from bastion, the online cluster
+        # needs the gateway hop too.
+        if !startswith(address, "max-")
+            push!(client.ssh_hops, SshState(; address=GATEWAY))
+        end
     end
 
     # This is the blocking SSH session used for SFTP
