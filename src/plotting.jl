@@ -1592,7 +1592,9 @@ function draw_roi_overlays(layer::Union{VariableLayer, SpecLayer}, frames)
         end
         anchor = ImPlot.PixelsToPlot(top_left)
         ImPlot.PushStyleColor(ImPlot.ImPlotCol_InlayText, col)
-        ImPlot.PlotText(param_name, anchor.x, anchor.y, ImVec2(text_size.x / 2, dy))
+        # NoFit, otherwise a label pinned to the plot's edge holds back autoscaling
+        ImPlot.PlotText(param_name, anchor.x, anchor.y, ImVec2(text_size.x / 2, dy),
+                        ImPlot.ImPlotSpec(; Flags=Cint(ImPlot.ImPlotItemFlags_NoFit)))
         ImPlot.PopStyleColor()
         ig.PopFont()
     end
