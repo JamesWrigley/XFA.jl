@@ -457,6 +457,9 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
+        ctx_state[name]["displayables"] = Dict{String, Any}(chopprefix(d_name, "$(name).") => d
+                                                            for (d_name, d) in ctx_info["displayables"]
+                                                            if group_filter(d_name))
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
@@ -925,6 +928,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             @error "Error from server with INPUTSOURCES" exception=msg.input_sources.text
             log_engine_error(state, "Failed to get the input sources", msg.input_sources.text)
         else
+            client.sources_by_input = msg.input_sources
             client.source_list = build_source_list(Iterators.flatten(values(msg.input_sources)))
 
             sources_by_topic = Dict{String, Vector{SourceInfo}}()
@@ -976,7 +980,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remap_rules = msg.rules
 
     elseif msg isa DeviceSchema
-        client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        if msg.schema isa ExceptionMessage
+            @error "Error from server with DEVICESCHEMA" exception=msg.schema.text
+            log_engine_error(state, "Failed to get the schema of $(msg.topic)//$(msg.name)", msg.schema.text)
+        else
+            client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        end
         delete!(client.device_schema_requests, (msg.topic, msg.name))
 
     elseif msg isa DeviceProperty
@@ -1008,6 +1017,11 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 store_variable_data!(client, subvar)
             end
         end
+    elseif msg isa DisplayableChanged
+        group, field = rsplit(msg.displayable.name, '.'; limit=2)
+        if haskey(client.context.context_state, group)
+            client.context.context_state[group]["displayables"][field] = msg.displayable
+        end
     elseif msg isa ParameterChanged
         param = msg.parameter
         # Top-level dict covers globals (which aren't attached to any node).
@@ -1037,9 +1051,11 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             end
         end
 
-        # An input's trainmatcher moved, so it's serving a different set of
-        # sources now.
-        if param.value isa KaraboDevice
+        # An input's configuration changed (trainmatcher, offline run...), so
+        # it may be serving a different set of sources now.
+        owner = find_parameter_owner(client, param.name)
+        if !isnothing(owner) && owner.kind == ParameterOwner_Group &&
+           any(startswith(input, "$(owner.var_name).") for input in keys(client.sources_by_input))
             get_input_sources(client)
         end
 
@@ -1048,7 +1064,6 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
 
         if client.pending_source_edit == param.name
-            owner = find_parameter_owner(client, param.name)
             new_value = isnothing(owner) ? nothing : format_param_value(param.value)
             if !isnothing(new_value)
                 if owner.kind == ParameterOwner_Group

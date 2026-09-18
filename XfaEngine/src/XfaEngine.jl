@@ -3,7 +3,7 @@ module XfaEngine
 # The pipeline core. `Context` is kept as a back-compat alias for the module so
 # existing `Context.foo` references (here and in macro-generated code) resolve.
 using XfaContext
-using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter
+using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter, Displayable
 const Context = XfaContext
 
 include("zfp_workspace.jl")
@@ -91,6 +91,7 @@ end
     ctx::ContextState = ContextState()
     # Keeps the pipeline running across rewires, see start_pipeline(::EngineState).
     pipeline_task::Union{Task, Nothing} = nothing
+    stop_requested::Bool = false
 
     # One zfp workspace per qualified variable name. Sized to the variable's
     # data on first use and reused across trains; switching k on the
@@ -134,7 +135,7 @@ const METADATA_K = -Inf
 function client_view_for(state::EngineState, variable::VariableData, qualified::String,
                          subscriptions::Dict{String, Float64},
                          cache::Dict{String, Tuple{Float64, VariableData}})
-    data = variable.data
+    data = @invokelatest Context.unwrap_python(variable.data)
     requested = get(subscriptions, qualified, nothing)
 
     k = if is_scalar_data(data)
@@ -166,7 +167,7 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
         data
     end
 
-    view = if new_data === data
+    view = if new_data === variable.data
         variable
     else
         @set variable.data = new_data
@@ -205,17 +206,19 @@ function build_client_view!(state::EngineState, variable::VariableData,
     return @set parent_view.subvariables = new_subvars
 end
 
-function forward_output(state::EngineState, stream_output)
-    cache = Dict{String, Tuple{Float64, VariableData}}()
-    for data in stream_output
-        empty!(cache)
-        for (id, client) in state.clients
-            try
-                view = build_client_view!(state, data, client.subscriptions, cache)
-                Protocol.server_send(client.websocket, TrainData([view]))
-            catch ex
-                @warn "Couldn't forward data to client '$(id)'" exception=ex
-            end
+function forward_output(state::EngineState, data::VariableData, cache)
+    if isnothing(data.data)
+        return
+    end
+
+    empty!(cache)
+    # The views may alias Python-backed arrays in `data`
+    GC.@preserve data for (id, client) in state.clients
+        try
+            view = build_client_view!(state, data, client.subscriptions, cache)
+            Protocol.server_send(client.websocket, TrainData([view]))
+        catch ex
+            @warn "Couldn't forward data to client '$(id)'" exception=ex
         end
     end
 end
@@ -231,6 +234,17 @@ function broadcast_parameter_changed(state::EngineState, name, value)
             Protocol.server_send(client.websocket, msg)
         catch ex
             @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
+        end
+    end
+end
+
+function broadcast_displayable_changed(state::EngineState, displayable::Displayable)
+    msg = Protocol.DisplayableChanged(displayable)
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast DisplayableChanged to client '$(id)'" exception=ex
         end
     end
 end
@@ -251,23 +265,60 @@ end
 # its dependencies (see Context.wait_pipeline). Starting synchronously lets
 # callers report a failed start; the task only ever restarts.
 function start_pipeline(state::EngineState)
-    @invokelatest Context.start_pipeline(state.ctx)
+    @invokelatest Context.start_pipeline(state.ctx; offline=has_offline_input(state.ctx))
+    state.stop_requested = false
 
-    state.pipeline_task = Threads.@spawn :samepool while Context.wait_pipeline(state.ctx)
-        try
-            @invokelatest Context.start_pipeline(state.ctx)
-        catch ex
-            @error "Failed to restart the pipeline after rewiring" exception=(ex, catch_backtrace())
-            break
+    state.pipeline_task = Threads.@spawn :samepool begin
+        while Context.wait_pipeline(state.ctx)
+            try
+                @invokelatest Context.start_pipeline(state.ctx; offline=has_offline_input(state.ctx))
+            catch ex
+                @error "Failed to restart the pipeline after rewiring" exception=(ex, catch_backtrace())
+                break
+            end
+            broadcast_context_info(state)
         end
-        broadcast_context_info(state)
+
+        # A requested stop is acknowledged by its own handler; only a pipeline
+        # that ended on its own (e.g. an offline run finishing) is unannounced.
+        if !state.stop_requested
+            for (id, client) in state.clients
+                try
+                    Protocol.server_send(client.websocket, Stopped())
+                catch ex
+                    @warn "Failed to broadcast Stopped to client '$(id)'" exception=ex
+                end
+            end
+        end
     end
     errormonitor(state.pipeline_task)
+end
+
+function device_schema(ctx::ContextState, topic, name)
+    if has_offline_input(ctx)
+        for input_name in keys(ctx.inputs)
+            group = Context.get_input_group(ctx, input_name)
+            if group isa KaraboInput && any(s -> s.topic == topic && s.name == name, Context.get_sources(group))
+                return @invokelatest Context.data_collection_schema(data_collection(group), name)
+            end
+        end
+        error("No offline input serves $(topic)//$(name)")
+    else
+        return get_schema(KaraboDevice(topic, name))
+    end
+end
+
+function has_offline_input(ctx::ContextState)
+    return any(keys(ctx.inputs)) do input_name
+        group = Context.get_input_group(ctx, input_name)
+        group isa KaraboInput && group.offline[]
+    end
 end
 
 # Stop the pipeline through its task, so the restart loop ends with it.
 function stop_pipeline(state::EngineState)
     if !isnothing(state.pipeline_task)
+        state.stop_requested = true
         Context.request_stop(state.ctx)
         wait(state.pipeline_task)
         state.pipeline_task = nothing
@@ -394,9 +445,14 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
     elseif msg isa GetDeviceSchema
-        schema = get_schema(KaraboDevice(msg.topic, msg.name))
-        Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
-        @info "Responded to 'GetDeviceSchema' from $(id)"
+        try
+            schema = Dict{String, Dict}(device_schema(state.ctx, msg.topic, msg.name))
+            Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
+            @info "Responded to 'GetDeviceSchema' ($(msg.topic)//$(msg.name)) from $(id)"
+        catch ex
+            @error "Error in 'GetDeviceSchema', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
 
     elseif msg isa GetDeviceProperty
         try
@@ -437,8 +493,18 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             dep_router = (topic, source) -> match_rule(state.routing_rules, topic, source)
             prelude = [:(using XfaEngine: KaraboInput)]
             ctx = Context.load_from_file(path; dep_router, prelude)
-            ctx.forwarder = Base.Fix1(forward_output, state)
+            cache = Dict{String, Tuple{Float64, VariableData}}()
+            ctx.on_output = data -> forward_output(state, data, cache)
+            inputs = [Context.get_input_group(ctx, name) for name in keys(ctx.inputs)]
+
+            karabo_inputs = KaraboInput[group for group in inputs if group isa KaraboInput]
+            if length(unique(group.offline[] for group in karabo_inputs)) > 1
+                throw(Context.XfaContextException("A context cannot mix online and offline KaraboInputs"))
+            end
+
+            ctx.on_train_processed = tid -> foreach(group -> release_train(group, tid), karabo_inputs)
             ctx.on_parameter_changed = (name, value) -> broadcast_parameter_changed(state, name, value)
+            ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
             ctx
         catch ex
             Protocol.ExceptionMessage(ex, catch_backtrace())

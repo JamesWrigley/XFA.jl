@@ -13,7 +13,7 @@ export AbstractMessage, Ping, Shutdown,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
     Started, Stopped, InputSources,
-    ContextInfo, ParameterChanged, TrainData, RemoteReplState,
+    ContextInfo, ParameterChanged, DisplayableChanged, TrainData, RemoteReplState,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
@@ -21,7 +21,7 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import XfaContext
-using XfaContext: ContextState, VariableData, Parameter, SourceInfo, VariableSpec
+using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec
 using ..XfaEngine: RoutingRule, RemapRule
 
 
@@ -136,7 +136,7 @@ end
 struct DeviceSchema <: AbstractMessage
     topic::String
     name::String
-    schema::Dict{String, Dict}
+    schema::Union{Dict{String, Dict}, ExceptionMessage}
 end
 
 struct DeviceProperty <: AbstractMessage
@@ -156,6 +156,10 @@ ContextInfo(ctx::ContextState, source::String) = ContextInfo(XfaContext.to_dict(
 
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter
+end
+
+struct DisplayableChanged <: AbstractMessage
+    displayable::Displayable
 end
 
 struct TrainData <: AbstractMessage

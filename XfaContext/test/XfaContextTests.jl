@@ -24,6 +24,7 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity, isfull
 using FHist: bincounts, bincenters, binedges
+using DimensionalData: DimArray, lookup, hasdim
 
 using PythonCall
 
@@ -150,12 +151,17 @@ end
     @test length(matched_trains) == 1
     @test Set(keys(matched_trains[1])) == Set(["foo.bar", "foo.baz"])
 
-    # Test the max train latency
+    # Test the max train latency. A stale train is dropped and reported, and
+    # late data for it is matched afresh rather than ignored.
     tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 1)
-    @test isempty(Context.match_train(tm, VariableData(1, "foo.bar", 1)))
-    @test isempty(Context.match_train(tm, VariableData(3, "foo.bar", 1)))
-    @test isempty(Context.match_train(tm, VariableData(1, "foo.baz", 1)))
-    @test length(Context.match_train(tm, VariableData(3, "foo.baz", 1))) == 1
+    matched = Dict{Int, Any}()
+    dropped = Int[]
+    @test isempty(Context.match_train!(matched, dropped, tm, VariableData(1, "foo.bar", 1)))
+    @test isempty(Context.match_train!(matched, dropped, tm, VariableData(3, "foo.bar", 1)))
+    @test dropped == [1]
+    @test isempty(Context.match_train!(matched, dropped, tm, VariableData(1, "foo.baz", 1)))
+    @test dropped == [1, 1]
+    @test length(Context.match_train!(matched, dropped, tm, VariableData(3, "foo.baz", 1))) == 1
 end
 
 @testset "karabo_dependency" begin
@@ -455,7 +461,7 @@ end
         return data
     end
     """)
-    @test invokelatest(Context.variable_displays, ctx.functions["img"]) == ["roi"]
+    @test @invokelatest(Context.variable_displays(ctx.functions["img"])) == ["img" => "roi"]
 
     # Group parameter reference; the stored name is qualified by the group
     # type, not the (not-yet-known) instantiated group name.
@@ -472,20 +478,49 @@ end
     cam = Cam()
     """)
     img_func = only(f for (n, f) in ctx.functions if endswith(n, ".img"))
-    @test invokelatest(Context.variable_displays, img_func) == ["Cam.roi"]
+    @test @invokelatest(Context.variable_displays(img_func)) == ["img" => "Cam.roi"]
 
-    # Multiple @display entries on one variable
+    # Multiple @display entries on one variable, some targeting subvariables
+    # (including a postprocessor's). These follow a renamed reference.
     ctx = Context.load_from_string(raw"""
+    using Main.PostprocessorLibrary: TestMean
+
     a = Parameter(Context.RectROI())
     b = Parameter(Context.RectROI())
 
     @Variable function img(data -> karabo"camera.data")
         @display a
         @display b
+        @display ("half", "mean") b
+        @display "half" a
+        @add_subvariable("half", data / 2)
+        @postprocess(TestMean())
+        return data
+    end
+
+    @Variable renamed -> img
+    """)
+    @test @invokelatest(Context.variable_displays(ctx.functions["img"])) ==
+        ["img" => "a", "img" => "b", "img.half" => "b", "img.mean" => "b", "img.half" => "a"]
+    @test ctx.displays["img"] == ctx.displays["renamed"] == ["a", "b"]
+    @test ctx.displays["img.half"] == ctx.displays["renamed.half"] == ["b", "a"]
+    @test ctx.displays["img.mean"] == ctx.displays["renamed.mean"] == ["b"]
+
+    # Targets must be string literals naming subvariables of the variable
+    @test_throws "optional subvariable name" Context._variable(@__MODULE__, quote
+        function img(data -> karabo"camera.data")
+            @display (half,) roi
+            return data
+        end
+    end, false)
+    @test_throws "unknown subvariable 'img.nope'" Context.load_from_string(raw"""
+    roi = Parameter(Context.RectROI())
+
+    @Variable function img(data -> karabo"camera.data")
+        @display ("nope",) roi
         return data
     end
     """)
-    @test invokelatest(Context.variable_displays, ctx.functions["img"]) == ["a", "b"]
 
     # `head.tail` where `head` isn't the group arg is rejected
     @test_throws "not the group argument" Context._variable(@__MODULE__, quote
@@ -522,13 +557,15 @@ end
 
     @Variable function img(c::Cam)
         @display c.roi
+        @display ("half",) c.roi
+        @add_subvariable("half", 0)
         return 0
     end
 
     cam = Cam()
     """)
     @test ctx.displays["global_img"] == ["roi"]
-    @test ctx.displays["cam.img"] == ["cam.roi"]
+    @test ctx.displays["cam.img"] == ctx.displays["cam.img.half"] == ["cam.roi"]
 
     # Reference to a missing parameter is rejected at load time
     @test_throws "unknown parameter" Context.load_from_string(raw"""
@@ -538,12 +575,13 @@ end
     end
     """)
 
-    # @display references propagate across @Variable references
+    # A reference to a variable without displays has none either
     ctx = Context.load_from_string(raw"""
     using Main: VariableLibrary
     @Variable renamed -> VariableLibrary.normalize
     """)
-    @test invokelatest(Context.variable_displays, ctx.functions["renamed"]) == String[]
+    @test isempty(@invokelatest(Context.variable_displays(ctx.functions["renamed"])))
+end
 end
 
 @testset "ROIs" begin
@@ -558,6 +596,23 @@ end
     @test Context.LinearROI(2, 2)(stack) == stack[2:4, :, :]
     @test Context.LinearROI(2, 1; axis=:y)(stack) == stack[2:3, :, :]
     @test Context.LinearROI(2.4, 1; axis=:y)(1:5) == 2:3
+end
+
+@testset "Displayable" begin
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Counter
+        count::Context.Displayable{Int} = Context.Displayable(0)
+    end
+    counter = Counter()
+    """)
+    d = ctx.groups["counter"].count
+    @test ctx.displayables == Dict("counter.count" => Context.Displayable(; name="counter.count", value=0))
+    @test Context.to_dict(ctx)["displayables"] == ctx.displayables
+
+    changed = []
+    ctx.on_displayable_changed = d -> push!(changed, (d.name, d.value))
+    d[] = 3
+    @test d[] == 3 && changed == [("counter.count", 3)]
 end
 
 @testset "Parameter" begin
@@ -704,7 +759,7 @@ end
     end
     x = Context.MockInput()
     """
-    follow_outputs(ctx) = [v.data for v in ctx.stream_output if v.name == "f.follow"]
+    follow_outputs(ctx) = [v.data for v in ctx.stream_output if v.name == "f.follow" && !isnothing(v.data)]
 
     # Manual rewire: an unset optional dependency is a Parameter placeholder in
     # the DAG until the group assigns it and the context is rewired.
@@ -771,7 +826,7 @@ end
                                                                   for (k, v) in props))
     train(tid, motor, pos, intensity) = tid => Dict("det" => Dict("intensity" => intensity),
                                                      motor => Dict("actualPosition" => pos))
-    scan_outputs() = [v for v in ctx.stream_output if v.name == "scn.scan"]
+    scan_outputs() = [v for v in ctx.stream_output if v.name == "scn.scan" && !isnothing(v.data)]
 
     # Nothing is mirrored while the scantool's state is incomplete
     @test !Context.on_properties_changed(scn, Dict("scanEnv.scanType" => (; value="ascan", tid=1)))
@@ -1183,12 +1238,13 @@ end
         log = TestLogger()
         with_logger(log) do
             Context.run(ctx) do
-                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+                @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
             end
         end
         @test length(log.logs) == 1
         @test occursin("Execution of variable 'foo' failed", log.logs[1].message)
-        @test take!(ctx.stream_output) == VariableData(0, "bar", 1)
+        # foo and bar run concurrently so their outputs may arrive in either order
+        @test Set((v.name, v.data) for v in ctx.stream_output) == Set([("foo", nothing), ("bar", 1)])
 
         # Variables that fail should block downstream dependencies from running
         ctx = Context.load_from_string(raw"""
@@ -1212,7 +1268,7 @@ end
             end
         end
         @test length(log.logs) == 1
-        @test !isready(ctx.stream_output)
+        @test [(v.name, v.data) for v in ctx.stream_output] == [("foo", nothing), ("bar", nothing)]
 
         # Slightly more complicated DAG to test that everything is wired up correctly
         ctx = Context.load_from_string(raw"""
@@ -2074,6 +2130,30 @@ end
     # Nothing carrying a trainId dimension would be an infinite stream
     @test_throws ArgumentError Context.run(ctx, Dict("camera.data" => 5); select=["bar"])
 
+    # Each train is signalled as processed exactly once, in the order fed (even
+    # out of train ID order), after every variable has emitted for it, whether
+    # or not it produced a result.
+    ctx = Context.load_from_string(raw"""
+    @Variable foo -> karabo"camera.data"
+    @Variable function odd(x -> foo)
+        return isodd(x) ? x : nothing
+    end
+    @Variable function bar(x -> odd)
+        return x + 1
+    end
+    """)
+    processed = Int[]
+    ctx.on_train_processed = tid -> push!(processed, tid)
+    feeder = function (channel)
+        for (tid, x) in [(12, 3), (10, 1), (13, 4), (11, 2)]
+            put!(channel, (tid, Dict("camera" => Dict("data" => x))))
+        end
+    end
+    r = Context.run_offline_plan(ctx, [10, 11, 12, 13], feeder)
+    @test processed == [12, 10, 13, 11]
+    @test r["bar"] == [2, 4]
+    @test lookup(r["bar"], :trainId) == [10, 12]
+
     @testset "DataCollection method" begin
         # Drive the PythonCall extension's run against a real extra-data
         # DataCollection. The AGIPD1M example run carries a constant control
@@ -2086,7 +2166,7 @@ end
         end
 
         @Variable function module0(x -> karabo"SPB_DET_AGIPD1M-1/DET/0CH0:xtdf[image.data]")
-            nanmean(x; dim=(:trainId, :dim_0))
+            nanmean(x; dim=(:entry, :dim_0))
         end
 
         @Variable itime_proxied -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime@proxy:output"
@@ -2105,21 +2185,47 @@ end
             r = Context.run(ctx, dc; select=["double"])
             @test keyset(r) == Set(["itime", "double"])
             @test length(r["itime"]) == 100
-            @test all(==(15), collect(r["itime"]))
-            @test all(==(30), collect(r["double"]))
-            @test collect(Context.DD.lookup(r["itime"], :trainId))[1:3] == [10000, 10001, 10002]
+            @test all(==(15), r["itime"])
+            @test all(==(30), r["double"])
+            @test lookup(r["itime"], :trainId)[1:3] == [10000, 10001, 10002]
 
             # Test returning arrays
             r = Context.run(ctx, dc; select=["module0"])
             @test keyset(r) == Set(["module0"])
             @test size(r["module0"]) == (128, 512, 100)
-            @test Context.DD.hasdim(r["module0"], :trainId)
-            @test collect(Context.DD.lookup(r["module0"], :trainId))[1:3] == [10000, 10001, 10002]
+            @test hasdim(r["module0"], :trainId)
+            @test lookup(r["module0"], :trainId)[1:3] == [10000, 10001, 10002]
+
+            # With a single buffer slot each train's buffer is re-used as soon
+            # as it clears the pipeline, so a missing copy would corrupt the
+            # results.
+            r1 = Context.run(ctx, dc; select=["module0"], trains_per_chunk=1, buffer_slots=1)
+            @test parent(r1["module0"]) == parent(r["module0"])
+
+            # Unwrapping aliases the numpy memory and rejects non-contiguous arrays
+            arr = PythonCall.GIL.@lock pyconvert(DimArray, dc["SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "integrationTime.value"].xarray(); copy=false)
+            unwrapped = Context.unwrap_python(arr)
+            @test parent(unwrapped) isa Vector && pointer(parent(unwrapped)) == parent(arr).ptr
+            @test parent(lookup(unwrapped, :trainId)) isa Vector && lookup(unwrapped, :trainId) == lookup(arr, :trainId)
+            viewed = Context.unwrap_python(@view arr[1:3])
+            @test parent(viewed) isa SubArray{<:Any, 1, <:Vector} && viewed == arr[1:3]
+            strided = PythonCall.GIL.@lock PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
+            @test_throws ArgumentError Context.unwrap_python(strided)
 
             # Test that proxied dependencies are ignored
             r = Context.run(ctx, dc; select=["itime_proxied"])
             @test keyset(r) == Set(["itime_proxied"])
-            @test all(==(15), collect(r["itime_proxied"]))
+            @test all(==(15), r["itime_proxied"])
+
+            devices = Context.data_collection_devices(dc)
+            @test ("SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "") in devices
+            @test ("SPB_DET_AGIPD1M-1/DET/0CH0", "") in devices
+            @test !any(d -> contains(d[1], ':'), devices)
+            schema = Context.data_collection_schema(dc, "SPB_IRU_AGIPD1M1/MDL/FPGA_COMP")
+            @test schema["integrationTime"] == Dict("nodeType" => "Leaf")
+            schema = Context.data_collection_schema(dc, "SPB_DET_AGIPD1M-1/DET/0CH0")
+            @test schema["xtdf"]["noInputShared"] == true
+            @test schema["xtdf"]["schema"]["image"]["data"] == Dict("nodeType" => "Leaf")
         end
     end
 end

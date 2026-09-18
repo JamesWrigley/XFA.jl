@@ -401,7 +401,8 @@ function _variable_reference(new_name, ref_expr, side_effects)
                                                                 for pp in Context.variable_postprocessors($orig_func_expr)]
     end
     displays_code = quote
-        Context.variable_displays(::typeof($new_name)) = Context.variable_displays($orig_func_expr)
+        Context.variable_displays(::typeof($new_name)) = [replace(target, $orig_name_str => $new_name_str; count=1) => param
+                                                          for (target, param) in Context.variable_displays($orig_func_expr)]
     end
 
     return esc(quote
@@ -478,7 +479,7 @@ function _variable(ctx_module, expr, side_effects)
         subvariables = String[]
         postprocessors = []  # (name_expr, pp_expr) tuples
         postprocessor_indices = Int[]
-        displays = String[]  # fully-qualified parameter names
+        displays = Pair{String, String}[]  # plot target => fully-qualified parameter name
         display_indices = Int[]
         for (i, body_expr) in enumerate(body.args)
             if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
@@ -490,17 +491,33 @@ function _variable(ctx_module, expr, side_effects)
             elseif @capture(body_expr, @macroname_(pp_expr_)) && macroname == Symbol("@postprocess")
                 push!(postprocessors, (nothing, pp_expr))
                 push!(postprocessor_indices, i)
-            elseif @capture(body_expr, @macroname_(disp_expr_)) && macroname == Symbol("@display")
+            elseif @capture(body_expr, @macroname_(disp_args__)) && macroname == Symbol("@display")
                 push!(display_indices, i)
-                if @capture(disp_expr, head_.tail_)
+                if length(disp_args) == 1
+                    targets = ["$(func_name)"]
+                    disp_expr = disp_args[1]
+                elseif length(disp_args) == 2 && disp_args[1] isa String
+                    targets = ["$(func_name).$(disp_args[1])"]
+                    disp_expr = disp_args[2]
+                elseif length(disp_args) == 2 && @capture(disp_args[1], (subvar_names__,)) && all(n -> n isa String, subvar_names)
+                    targets = ["$(func_name).$(n)" for n in subvar_names]
+                    disp_expr = disp_args[2]
+                else
+                    throw(ArgumentError("@display takes an optional subvariable name (or tuple of names) and a parameter, got: $(join(disp_args, ' '))"))
+                end
+
+                param_ref = if @capture(disp_expr, head_.tail_)
                     if isnothing(group_arg_name) || string(head) != group_arg_name
                         throw(ArgumentError("@display: '$(head)' is not the group argument of this @Variable"))
                     end
-                    push!(displays, "$(group_type_name).$(tail)")
+                    "$(group_type_name).$(tail)"
                 elseif disp_expr isa Symbol
-                    push!(displays, string(disp_expr))
+                    string(disp_expr)
                 else
                     throw(ArgumentError("@display takes a parameter name or group.field, got: $(disp_expr)"))
+                end
+                for target in targets
+                    push!(displays, target => param_ref)
                 end
             end
         end
@@ -533,7 +550,7 @@ function _variable(ctx_module, expr, side_effects)
         # get interpolated/evaluated properly.
         dependencies_expr = Expr(:vect, dependencies...)
         subvariables_expr = Expr(:vect, subvariables...)
-        displays_expr = Expr(:vect, displays...)
+        displays_expr = Expr(:ref, :(Pair{String, String}), [:($target => $param) for (target, param) in displays]...)
         new_function = quote
             function $func_name($(new_args...))
                 $body

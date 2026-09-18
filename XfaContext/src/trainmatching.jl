@@ -140,12 +140,16 @@ mutable struct Trainmatcher
 end
 
 """
-    match_train!(matched_trains, tm::Trainmatcher, variable::VariableData)
+    match_train!(matched_trains, dropped_trains, tm::Trainmatcher, variable::VariableData)
 
 Match `variable` with the trains already in `tm` and write the matched trains to
-`matched_trains`.
+`matched_trains`. Trains given up on because they stayed incomplete for longer
+than `max_train_latency` are appended to `dropped_trains`. Data for a dropped
+train arriving later is matched afresh (slow devices legitimately send old
+train IDs), so such a train can be dropped more than once.
 """
-function match_train!(matched_trains::Dict{Int, Any}, tm::Trainmatcher, variable::VariableData)
+function match_train!(matched_trains::Dict{Int, Any}, dropped_trains::Vector{Int},
+                      tm::Trainmatcher, variable::VariableData)
     if variable.name ∉ tm.sources
         throw(ArgumentError("Variable '$(variable.name)' is not in the list of sources to match"))
     end
@@ -163,6 +167,7 @@ function match_train!(matched_trains::Dict{Int, Any}, tm::Trainmatcher, variable
             matched_trains[tid] = pop!(tm.train_data, tid)
         elseif tm.max_train_latency >= 0 && tm.latest_trainid - tid > tm.max_train_latency
             pop!(tm.train_data, tid)
+            push!(dropped_trains, tid)
         end
     end
 
@@ -172,9 +177,9 @@ end
 """
     match_train(tm::Trainmatcher, variable::VariableData)
 
-Non-modifying version of `match_train!()`.
+Non-modifying version of `match_train!()`, returning only the matched trains.
 """
 function match_train(tm::Trainmatcher, variable::VariableData)
     matched_trains = Dict{Int, Any}()
-    match_train!(matched_trains, tm, variable)
+    match_train!(matched_trains, Int[], tm, variable)
 end
