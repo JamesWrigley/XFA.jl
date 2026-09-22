@@ -25,17 +25,23 @@ function mask_finite(ydata::AbstractVector, xdata::Maybe{AbstractVector},
     if isnothing(xdata)
         xdata = eachindex(ydata)
     end
-    mask = isfinite.(ydata)
-    if !isnothing(sigma)
-        mask .&= isfinite.(sigma) .& (sigma .> 0)
+    # Vector{Float64} rather than float.(): the solver builds its function wrappers
+    # for Vector{Float64}, so a Float32 eltype or a wrapper array (DimArray)
+    # reaching it fails with "No matching function wrapper was found!".
+    x_all = Vector{Float64}(xdata)
+    y_all = Vector{Float64}(ydata)
+    σ_all = isnothing(sigma) ? nothing : Vector{Float64}(sigma)
+
+    mask = isfinite.(y_all)
+    if !isnothing(σ_all)
+        mask .&= isfinite.(σ_all) .& (σ_all .> 0)
     end
-    x = float.(xdata[mask])
-    y = float.(ydata[mask])
+    y = y_all[mask]
     if isempty(y)
         return nothing
     end
-    σ = isnothing(sigma) ? nothing : float.(sigma[mask])
-    return x, y, σ
+    σ = isnothing(σ_all) ? nothing : σ_all[mask]
+    return x_all[mask], y, σ
 end
 
 # Solve a nonlinear least-squares fit, returning `(popt_or_nothing, retcode)`
@@ -129,8 +135,12 @@ function fit_gaussian(ydata::AbstractVector, xdata::Maybe{AbstractVector}=nothin
 
     lb, ub = nothing, nothing
     if A_sign != 0
+        # σ is deliberately left unbounded: the model only sees σ², so the
+        # solver may descend into negative σ (flipped back by abs() below). A
+        # σ ≥ 0 bound clips that path and parks it at σ = 0, where the model is
+        # flat and the fit stalls.
         Amin, Amax = A_sign > 0 ? (0.0, Inf) : (-Inf, 0.0)
-        lb = [-Inf, Amin, -Inf, 0.0]
+        lb = [-Inf, Amin, -Inf, -Inf]
         ub = [Inf, Amax, Inf, Inf]
     end
 

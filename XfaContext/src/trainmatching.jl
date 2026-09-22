@@ -28,44 +28,179 @@ function tick!(rr::RunningRate)
     return rr.value
 end
 
-# One mark within a PlotSpec. `data` names the variable to render (the client
-# subscribes to it). `mark` picks the ImPlot primitive. The axis channels say
-# where each axis's values come from: a String pulls from a sibling variable, a
-# Symbol selects a named dimension of `data` (e.g. a DimArray dim), and nothing
-# lets the client infer it from the data. A grouping channel bound to a dim
-# (e.g. color=:foo) fans the layer out into one series per coordinate along that
-# dim; set `gradient` to shade those series along a single-hue gradient instead
-# of distinct colors (useful when there are many). Modelled on Vega-Lite's
-# mark/encoding split so the same data can be plotted different ways by
-# reshaping channels.
-@kwdef struct LayerSpec
+# Plot specs are the typed form of a Vega-Lite spec, restricted to the subset
+# the client draws: a PlotSpec is a layered spec and a LayerSpec one of its unit
+# specs, with the same vocabulary (mark, encoding channels, lookup transform,
+# params).
+
+@enum Mark Mark_Line Mark_Point Mark_Bar Mark_Rect
+@enum FieldType FieldType_Quantitative FieldType_Nominal FieldType_Ordinal
+@enum LookupKey LookupKey_TrainId LookupKey_Index
+@enum ModelFunction ModelFunction_Gaussian
+
+# An encoding channel. `field` is a field of the layer's variable: a dim by name
+# or position (`index`, or `row`/`col`), `value`, or `trainId` for a scalar
+# history. On a matrix grouped into series by a color channel, `index` runs
+# along each series. `title` is "" when hidden, and nothing when left to the
+# data's own labels.
+struct ChannelDef
+    field::String
+    type::FieldType
+    title::Union{String, Nothing}
+    log::Bool
+    scheme::Union{String, Nothing}
+    binned::Bool
+end
+
+# Pulls `field` of `dataset` into the layer as `as`, matched on `key`.
+struct LookupTransform
+    key::LookupKey
+    dataset::String
+    field::String
+    as::String
+end
+
+struct LayerSpec
     data::String
-    mark::Symbol = :line          # :line, :scatter, :bars, :image
-    x::Union{String, Symbol, Nothing} = nothing
-    y::Union{String, Symbol, Nothing} = nothing
-    color::Union{String, Symbol, Nothing} = nothing
-    gradient::Bool = false
-    label::Union{String, Nothing} = nothing
+    mark::Mark
+    opacity::Float64
+    x::ChannelDef
+    y::ChannelDef
+    color::Union{ChannelDef, Nothing}
+    lookup::Union{LookupTransform, Nothing}
 end
 
-# A named, openable plot a variable advertises in addition to its default
-# output. The client opens it by `name`, which also keys reconciliation across
-# trains: name/title/labels/layers may change per train and the client reshapes
-# an already-open plot to match. Layers are stacked into one plot.
-@kwdef struct PlotSpec
+# An interval selection named after the parameter it edits. `initial` is
+# unassigned when the spec gives no value.
+struct RoiParam
     name::String
-    layers::Vector{LayerSpec}
-    title::Union{String, Nothing} = nothing
-    xlabel::Union{String, Nothing} = nothing
-    ylabel::Union{String, Nothing} = nothing
+    initial::AbstractROI
 end
 
-PlotSpec(name::AbstractString, layers::AbstractVector{LayerSpec}; kwargs...) =
-    PlotSpec(; name=String(name), layers=collect(layers), kwargs...)
+# A model curve drawn over the spec's layers, its parameters read from dataset
+# `params`.
+struct ModelOverlay
+    func::ModelFunction
+    params::String
+    title::Union{String, Nothing}
+end
+
+# Sugar: the model function by name (:gaussian).
+function ModelOverlay(func::Symbol; params::AbstractString,
+                      title::Union{AbstractString, Nothing}=nothing)
+    functions = (gaussian=ModelFunction_Gaussian,)
+    if !haskey(functions, func)
+        throw(ArgumentError("unsupported model function :$(func), expected one of: $(join(keys(functions), ", "))"))
+    end
+    ModelOverlay(functions[func], String(params), isnothing(title) ? nothing : String(title))
+end
+
+# A named plot a variable advertises on `VariableData.plot_specs`, besides its
+# default one. The user opens it by `name`; the rest may change from train to
+# train and an open plot follows it.
+struct PlotSpec
+    name::String
+    title::String
+    xlabel::Union{String, Nothing}
+    ylabel::Union{String, Nothing}
+    layers::Vector{LayerSpec}
+    rois::Vector{RoiParam}
+    models::Vector{ModelOverlay}
+    fixed_aspect::Bool
+end
+
+function Base.:(==)(a::PlotSpec, b::PlotSpec)
+    all(f -> getfield(a, f) == getfield(b, f), fieldnames(PlotSpec))
+end
+
+function Base.hash(spec::PlotSpec, h::UInt)
+    for f in fieldnames(PlotSpec)
+        h = hash(getfield(spec, f), h)
+    end
+    return h
+end
+
+# Layers share their axes: unless given, each label is the first layer's
+# channel title that isn't hidden.
+function PlotSpec(name::AbstractString, layers::AbstractVector{LayerSpec}=[LayerSpec()];
+                  title::AbstractString=name,
+                  xlabel::Union{AbstractString, Nothing}=nothing,
+                  ylabel::Union{AbstractString, Nothing}=nothing,
+                  rois::Vector{RoiParam}=RoiParam[], models::Vector{ModelOverlay}=ModelOverlay[],
+                  fixed_aspect::Bool=true)
+    x_title = y_title = ""
+    for layer in layers
+        if x_title == ""
+            x_title = layer.x.title
+        end
+        if y_title == ""
+            y_title = layer.y.title
+        end
+    end
+    PlotSpec(String(name), String(title), isnothing(xlabel) ? x_title : xlabel, isnothing(ylabel) ? y_title : ylabel,
+             collect(layers), rois, models, fixed_aspect)
+end
+
+# `spec` with the layers that don't name a variable ("") pointed at `variable`,
+# the one advertising it.
+function bind_variable(spec::PlotSpec, variable)
+    if all(layer -> !isempty(layer.data), spec.layers)
+        spec
+    else
+        @set spec.layers = [isempty(layer.data) ? (@set layer.data = variable) : layer for layer in spec.layers]
+    end
+end
+
+# Lets `VariableData(; plot_specs = spec)` take a lone spec.
+Base.convert(::Type{Vector{PlotSpec}}, spec::PlotSpec) = [spec]
 
 # Sugar: a vector of variable names becomes one default line layer per name.
 PlotSpec(name::AbstractString, vars::AbstractVector{<:AbstractString}; kwargs...) =
-    PlotSpec(name, [LayerSpec(; data=String(v)) for v in vars]; kwargs...)
+    PlotSpec(name, [LayerSpec(; data=v) for v in vars]; kwargs...)
+
+# Sugar for a layer drawing variable `data` (by default the one advertising the
+# spec, see bind_variable) with `mark` (:line, :scatter, :bars or :image). `x`
+# is a dim of `data` (a Symbol), or for 1D data another variable
+# to plot against elementwise (a String); by default the index. `y` is only for
+# images, which take the dim along each axis. `color` is a dim to group a matrix
+# by, into one series per coordinate (with `x` along the other dim by default),
+# shaded along a continuous scheme unless `gradient` is false, which gives them
+# distinct colours.
+function LayerSpec(; data::AbstractString="", mark::Symbol=:line,
+                   x::Union{AbstractString, Symbol, Nothing}=nothing, y::Union{Symbol, Nothing}=nothing,
+                   color::Union{Symbol, Nothing}=nothing, gradient::Bool=true)
+    marks = (line=Mark_Line, scatter=Mark_Point, bars=Mark_Bar, image=Mark_Rect)
+    if !haskey(marks, mark)
+        throw(ArgumentError("unsupported mark :$(mark), expected one of: $(join(keys(marks), ", "))"))
+    end
+    # The axes are labelled by the data
+    axis(field) = ChannelDef(String(field), FieldType_Quantitative, nothing, false, nothing, false)
+    colored(field, type, scheme) = ChannelDef(String(field), type, String(field), false, scheme, false)
+
+    if mark == :image
+        if x isa AbstractString || !isnothing(color)
+            throw(ArgumentError("an image takes a dim for x and y, and no color"))
+        end
+        LayerSpec(String(data), Mark_Rect, 1.0, axis(something(x, "col")), axis(something(y, "row")),
+                  colored("value", FieldType_Quantitative, "turbo"), nothing)
+    else
+        if !isnothing(y)
+            throw(ArgumentError("y is only supported for images"))
+        elseif !isnothing(color) && x isa AbstractString
+            throw(ArgumentError("color groups a matrix by a dim, so x must be its other dim, not a variable"))
+        end
+        color_channel = if isnothing(color)
+            nothing
+        elseif gradient
+            colored(color, FieldType_Quantitative, "viridis")
+        else
+            colored(color, FieldType_Nominal, nothing)
+        end
+        lookup = x isa AbstractString ? LookupTransform(LookupKey_Index, String(x), "value", String(x)) : nothing
+        LayerSpec(String(data), marks[mark], 1.0, axis(something(x, "index")), axis("value"),
+                  color_channel, lookup)
+    end
+end
 
 @kwdef struct VariableData{T}
     tid::Int = 0
@@ -86,8 +221,13 @@ PlotSpec(name::AbstractString, vars::AbstractVector{<:AbstractString}; kwargs...
     compress::Bool = true
 end
 
+VariableData(data; kwargs...) = VariableData(; data, kwargs...)
 VariableData(tid, name, data) = VariableData(; tid=Int(tid), name, data)
 VariableData(tid, name, data, subvariables) = VariableData(; tid=Int(tid), name, data, subvariables)
+
+# The default constructor of a parametric struct doesn't convert its arguments,
+# this one does (e.g. a lone PlotSpec for `plot_specs`).
+VariableData(tid, name, data::T, fields...) where {T} = VariableData{T}(tid, name, data, fields...)
 
 # `update_rate` is a runtime metric, not part of value identity, so it's
 # excluded from equality and hashing.

@@ -12,8 +12,13 @@ using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
 using DataStructures: CircularBuffer, OrderedDict
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, AbstractROI, RectROI, LinearROI, PlotSpec, LayerSpec, VariableSpec, VariableKind_Variable,
-    Scalar1dScan, positions, upstream_closure
+    ArrayMetadata, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
+    Scalar1dScan, positions, upstream_closure,
+    PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
+    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
+    FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
+include("plot_spec.jl")
 include("plotting.jl")
 
 using LibSSH: LibSSH as ssh
@@ -28,6 +33,7 @@ include("states.jl")
 using TOML: TOML
 using Sockets: Sockets
 using CRC32c: crc32c
+using LibGit2: LibGit2
 using Logging: global_logger
 using Sentry: Sentry
 using XfaContext: XfaContext
@@ -450,7 +456,9 @@ function plot_button(label, name; button=ig.Button)
 end
 
 function clear_variable_data(store)
-    if store.data isa AbstractVector
+    # Only scalar histories accumulate; array data is replaced wholesale and
+    # may not even be resizable (e.g. a view into a decompression buffer).
+    if store.data isa CircularBuffer
         empty!(store.data)
     end
     if !isnothing(store.scalar_tids)
@@ -2131,7 +2139,6 @@ function main(; test_engine=nothing)
 
     # Setup ImPlot context
     implot_ctx = ImPlot.CreateContext()
-    add_turbo_colormap()
 
     # Enable docking and viewports by default
     io = ig.GetIO()

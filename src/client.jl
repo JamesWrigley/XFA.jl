@@ -177,6 +177,33 @@ function auth_supported(auth_method)
     end
 end
 
+# The sources of the package at `dir` that differ from HEAD, staged or not, as
+# paths relative to `dir`. Untracked files aren't included.
+function changed_sources(dir)
+    repo = LibGit2.GitRepoExt(dir)
+    # The default flags would also report untracked files
+    status = LibGit2.GitStatus(repo; status_opts=LibGit2.StatusOptions(; flags=0))
+    # Status paths are relative to the repository
+    prefix = normpath(joinpath(relpath(dir, LibGit2.workdir(repo)), "src")) * "/"
+
+    sources = String[]
+    try
+        for i in 1:length(status)
+            entry = status[i]
+            delta = entry.index_to_workdir == C_NULL ? entry.head_to_index : entry.index_to_workdir
+            path = unsafe_string(unsafe_load(delta).new_file.path)
+            if startswith(path, prefix)
+                push!(sources, joinpath("src", chopprefix(path, prefix)))
+            end
+        end
+    finally
+        close(status)
+        close(repo)
+    end
+
+    return sources
+end
+
 function sync_files()
     client = state[].client
     if client.embedded_engine
@@ -185,26 +212,31 @@ function sync_files()
 
     client.syncing = true
     try
-        engine_dir = joinpath(pkgdir(XfaEngine), "src")
-        git_diff = readchomp(`git diff --name-only $(engine_dir)`)
-        if isempty(git_diff)
-            @info "No files to sync"
-            return
+        synced = 0
+        for (local_dir, remote_dir) in ((pkgdir(XfaEngine), client.remote_engine_dir),
+                                        (pkgdir(XfaContext), client.remote_context_dir))
+            for path in changed_sources(local_dir)
+                local_path = joinpath(local_dir, path)
+                # Deleted files are in the diff too, there's nothing to send for them
+                if !isfile(local_path)
+                    continue
+                end
+
+                # Note that we read `local_path` before opening the remote path.
+                # This to avoid the file getting truncated by `open(; write=true)`
+                # if we're SSH'ing locally.
+                data = read(local_path)
+                open(joinpath(remote_dir, path), client.sftp; write=true) do f
+                    write(f, data)
+                end
+                synced += 1
+            end
         end
 
-        changed_files = split(git_diff, "\n")
-
-        for path in changed_files
-            local_path = joinpath(engine_dir, basename(path))
-            remote_path = joinpath(client.remote_engine_dir, "src", basename(path))
-
-            # Note that we read `local_path` before opening `remote_path`. This to
-            # avoid the file getting truncated by `open(; write=true)` if we're
-            # SSH'ing locally.
-            data = read(local_path)
-            open(remote_path, client.sftp; write=true) do f
-                write(f, data)
-            end
+        if synced == 0
+            @info "No files to sync"
+        else
+            @info "Synced $(synced) file(s) to the engine"
         end
     finally
         client.syncing = false
@@ -376,6 +408,34 @@ end
 # editor ids use hash() directly (a Csize_t-width, content-derived id).
 int32_hash(x, y) = reinterpret(Cint, crc32c(y, crc32c(x)))
 
+# Add a subvariable of `var_name` to its node: a plain output pin, or a
+# postprocessor entry with its own parameters. `node_name` is the node the pin
+# lives on, which for a group variable is the group.
+function add_subvariable!(node, ctx_info, node_name, var_name, subvar, pp_names)
+    subvar_id = hash("$(var_name).outputs.$(subvar)")
+    if subvar in pp_names
+        pp_prefix = "$(subvar)."
+        pp_params = Dict{String, Any}()
+        for (param_name, param) in ctx_info["parameters"]
+            if startswith(param_name, pp_prefix)
+                pp_params[chopprefix(param_name, pp_prefix)] = param
+            end
+        end
+        push!(node["postprocessors"], (
+            id = subvar_id,
+            name = subvar,
+            display_name = chopprefix(subvar, "$(node_name)."),
+            tree_id_suffix = "###pp_$(subvar)",
+            plot_id = "Plot##pp_plot_$(subvar)",
+            params = pp_params,
+            origin = ctx_info["postprocessor_origins"][subvar],
+        ))
+    else
+        push!(node["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(node_name)."), true))
+    end
+    return subvar_id
+end
+
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
     # Drop all per-widget editing state so freshly-loaded parameter values
@@ -424,28 +484,8 @@ function build_context_state(state, ctx_info)
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
-            subvar_id = hash("$(name).outputs.$(subvar)")
+            subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, name, subvar, pp_names)
             state.client.ne_output_pins[subvar_id] = OutputPinInfo(name, subvar)
-            if subvar in pp_names
-                pp_prefix = "$(subvar)."
-                pp_params = Dict{String, Any}()
-                for (param_name, param) in ctx_info["parameters"]
-                    if startswith(param_name, pp_prefix)
-                        pp_params[chopprefix(param_name, pp_prefix)] = param
-                    end
-                end
-                push!(ctx_state[name]["postprocessors"], (
-                    id = subvar_id,
-                    name = subvar,
-                    display_name = chopprefix(subvar, "$(name)."),
-                    tree_id_suffix = "###pp_$(subvar)",
-                    plot_id = "Plot##pp_plot_$(subvar)",
-                    params = pp_params,
-                    origin = ctx_info["postprocessor_origins"][subvar],
-                ))
-            else
-                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
-            end
         end
     end
 
@@ -456,6 +496,7 @@ function build_context_state(state, ctx_info)
         ctx_state[name] = Dict{String, Any}("id" => hash(name))
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
+        ctx_state[name]["postprocessors"] = []
         ctx_state[name]["type"] = :group
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
@@ -520,9 +561,9 @@ function build_context_state(state, ctx_info)
             state.client.ne_output_pins[attr_id] = OutputPinInfo(var_name, var_name)
 
             # Its subvariables
+            pp_names = Set(get(postprocessors_info, var_name, String[]))
             for subvar in ctx_info["subvariables"][var_name]
-                subvar_id = hash("$(var_name).outputs.$(subvar)")
-                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
+                subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, var_name, subvar, pp_names)
                 state.client.ne_output_pins[subvar_id] = OutputPinInfo(var_name, subvar)
             end
         end
@@ -535,6 +576,11 @@ function build_context_state(state, ctx_info)
             stripped_name = chopprefix(param_name, "$(name).")
             if stripped_name in dep_param_names
                 # Already shown as a dependency input
+                continue
+            end
+
+            # Drawn in the postprocessor's own tree
+            if any(pp -> startswith(param_name, "$(pp.name)."), ctx_state[name]["postprocessors"])
                 continue
             end
 
@@ -804,12 +850,16 @@ function store_variable_data!(client, variable::VariableData)
     store = client.variable_data[name]
     store.title = if !isnothing(variable.title)
         variable.title
-    elseif data isa DimArray
-        DD.label(data)
-    elseif data isa CompressedArray && !isnothing(data.dims)
-        data.dims.name
     else
-        name
+        # An unnamed DimArray has an empty label, which would hide the legend entry
+        label = if data isa DimArray
+            DD.label(data)
+        elseif data isa CompressedArray && !isnothing(data.dims)
+            data.dims.name
+        else
+            ""
+        end
+        isempty(label) ? name : label
     end
     store.x_axis = variable.x_axis
     store.y_axis = variable.y_axis
@@ -884,13 +934,13 @@ function find_parameter_owner(client, param_name::String)
                     return ParameterOwner(ParameterOwner_Group, var_name, nothing, field_name)
                 end
             end
-        elseif var_data["type"] === :variable
-            for pp in var_data["postprocessors"]
-                for (field_name, stored) in pp.params
-                    if stored.name == param_name
-                        return ParameterOwner(ParameterOwner_Postprocessor,
-                                              var_name, pp.name, field_name)
-                    end
+        end
+
+        # A group's member variables can have postprocessors too
+        for pp in get(var_data, "postprocessors", ())
+            for (field_name, stored) in pp.params
+                if stored.name == param_name
+                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp.name, field_name)
                 end
             end
         end
@@ -945,8 +995,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.sources_by_topic = sources_by_topic
         end
 
-    elseif msg isa EngineDir
-        client.remote_engine_dir = msg.path
+    elseif msg isa PackageDirs
+        client.remote_engine_dir = msg.engine
+        client.remote_context_dir = msg.context
 
     elseif msg isa AvailableVariables
         if msg.variables isa ExceptionMessage
@@ -1131,7 +1182,7 @@ function handle_server(state)
                 client.client_id = id
 
                 client.status = RemoteStatus_Connected
-                send(client, GetEngineDir())
+                send(client, GetPackageDirs())
                 get_input_sources(client)
                 get_available_variables(client)
                 get_trainmatchers(client)

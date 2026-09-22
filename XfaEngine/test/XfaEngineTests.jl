@@ -15,8 +15,8 @@ ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
 # variables below. This will be a bit faster since it stops CondaPkg from
 # re-resolving the environment each time (but you do need to run it at least
 # once locally to initialize the environment).
-# ENV["JULIA_PYTHONCALL_EXE"] = joinpath(Base.DEPOT_PATH[1], "conda_environments", "xfacontext-tests", "bin", "python")
-# ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
+ENV["JULIA_PYTHONCALL_EXE"] = joinpath(Base.DEPOT_PATH[1], "conda_environments", "xfacontext-tests", "bin", "python")
+ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
 
 using Logging: Logging
 using Sockets: Sockets, @ip_str, send, recv
@@ -41,8 +41,7 @@ using XfaEngine: XfaEngine as engine
 using XfaContext: @Variable, @karabo_str, VariableData, Dependency, DependencyKind,
     DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    XfaContextException, Parameter, KaraboDevice, CircularChannel, drop_count,
-    PlotSpec, LayerSpec
+    XfaContextException, Parameter, KaraboDevice, CircularChannel, drop_count
 using XfaEngine.KaraboBridge: KaraboBridgeClient, KaraboBridgeServer, ThreadsafeSocket
 
 
@@ -157,11 +156,11 @@ end
             @test id isa String
             @test length(id) > 5
 
-            # Engine directory and trainmatchers are now only sent on request
-            Protocol.client_send(ws, Protocol.GetEngineDir())
-            engine_dir_msg = Protocol.receive(ws).msg
-            @test engine_dir_msg isa Protocol.EngineDir
-            @test engine_dir_msg.path == pkgdir(XfaEngine)
+            # Package directories and trainmatchers are now only sent on request
+            Protocol.client_send(ws, Protocol.GetPackageDirs())
+            package_dirs = Protocol.receive(ws).msg
+            @test package_dirs isa Protocol.PackageDirs
+            @test (package_dirs.engine, package_dirs.context) == (pkgdir(XfaEngine), pkgdir(XfaContext))
 
             Protocol.client_send(ws, Protocol.GetTrainmatchers())
             @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
@@ -995,13 +994,11 @@ end
     @test d !== a
     @test c["big"][1] == 0.5
 
-    # A 2D array plotted as lines (color-bound layer) must be compressed
-    # losslessly regardless of the client's requested k so its per-line detail
-    # is preserved.
-    spec = [PlotSpec("traces", [LayerSpec(; data="traces", color=:pulseId)])]
+    # A variable that opted out of lossy compression is compressed losslessly
+    # regardless of the client's requested k.
     traces = rand(300, 2)
-    lines = VariableData(; tid=0, name="traces", data=traces, plot_specs=spec)
-    v = build_client_view!(state, lines, sub("traces" => 0.5), c)
+    exact = VariableData(; tid=0, name="traces", data=traces, compress=false)
+    v = build_client_view!(state, exact, sub("traces" => 0.5), c)
     @test v.data isa CompressedArray
     @test c["traces"][1] == 0  # lossless, not the requested lossy k
     @test decompress_array(ZfpWorkspace(), v.data) == traces
@@ -1077,6 +1074,23 @@ end
     @test Context.to_dict(ctx)["group_parameter_args"] ==
         Dict("foo_group.foo" => Dict("data" => "source"))
 
+    # A reference to another variable of the same group has no kwarg to rewrite.
+    ctx = Context.load_from_string(raw"""
+        @Group struct Foo end
+
+        @Variable function producer(::Foo)
+            @add_subvariable("sub", 1)
+            42
+        end
+
+        @Variable function consumer(::Foo, whole -> Foo.producer, part -> Foo.producer.sub)
+            (whole, part)
+        end
+
+        foo_group = Foo()
+        """)
+    @test Context.to_dict(ctx)["group_parameter_args"] == Dict()
+
     # Subvariables of a grouped variable must be reported under the
     # group-qualified DAG name, not the bare function name. The client uses
     # these strings to build output-pin IDs; if they're not remapped the
@@ -1103,15 +1117,6 @@ end
         @test !should_compress(zeros(100))
         @test !should_compress("string")
         @test !should_compress(zeros(Bool, 600))
-
-        # A 2D array plotted as a bunch of lines (a color-bound layer) skips
-        # compression; the same array without that layer still compresses, and
-        # the line exception only applies to matrices.
-        lines = [PlotSpec("p", [LayerSpec(; data="v", color=:pulseId)])]
-        plain = [PlotSpec("p", [LayerSpec(; data="v")])]
-        @test !should_compress(VariableData(; data=rand(100, 5), plot_specs=lines))
-        @test should_compress(VariableData(; data=rand(100, 5), plot_specs=plain))
-        @test should_compress(VariableData(; data=rand(600), plot_specs=lines))
     end
 
     # k=0 requests lossless compression; zfp's reversible mode reconstructs
