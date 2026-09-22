@@ -577,7 +577,7 @@ end
 
         # An edited parameter whose value has no source representation is an error
         unwritable = Context.OrderedDict(:threshold => Context.Parameter(800.0),
-                                         :label => Context.Parameter(Context.KaraboDevice("MID", "A/B/C")))
+                                         :label => Context.Parameter(Dict("a" => 1)))
         @test_throws "Cannot represent parameter 'label'" add(spec, "my_group"; params=unwritable)
     end
 
@@ -873,6 +873,215 @@ end
         XFA.compute_fit!(fit, y, x)
         @test fit.popt ≈ [3.0, 1.0] atol=1e-10
         @test extrema(fit.model_x) == (2.0, 4.0)
+    end
+end
+
+@testset "Plot specs" begin
+    quantitative(field) = Dict("field" => field, "type" => "quantitative")
+
+    # A layered spec exercising a multi-series layer, a lookup, ROI params and a model
+    spec = Dict(
+        "title" => "Spectra",
+        "layer" => [
+            Dict("data" => Dict("name" => "spectra"), "mark" => "line",
+                 "encoding" => Dict("x" => Dict("field" => "X", "type" => "quantitative",
+                                                "axis" => Dict("title" => "Energy")),
+                                    "y" => Dict("field" => "value", "scale" => Dict("type" => "log"),
+                                                "title" => nothing),
+                                    "color" => Dict("field" => "pulseId")),
+                 "params" => [Dict("name" => "grp.band",
+                                   "select" => Dict("type" => "interval", "encodings" => ["x"]),
+                                   "value" => Dict("x" => [5, 2]))]),
+            Dict("data" => Dict("name" => "intensity"), "mark" => Dict("type" => "point"),
+                 "transform" => [Dict("lookup" => "trainId",
+                                      "from" => Dict("data" => Dict("name" => "motor"),
+                                                     "key" => "trainId", "fields" => ["value"]),
+                                      "as" => ["motor"])],
+                 "encoding" => Dict("x" => quantitative("motor"), "y" => quantitative("value")))],
+        "params" => [Dict("name" => "grp.roi", "select" => "interval")],
+        "usermeta" => Dict("other" => 1,
+                           "xfa" => Dict("fixed_aspect" => false,
+                                         "models" => [Dict("function" => "gaussian",
+                                                           "params" => "spectra.fit")])))
+    compiled = XFA.compile_spec("spectra", spec)
+    spectra, correlation = compiled.layers
+
+    # The hidden y title of the first layer falls through to the second's
+    @test (compiled.title, compiled.xlabel, compiled.ylabel) == ("Spectra", "Energy", "value")
+    @test (spectra.x.log, spectra.y.log, compiled.fixed_aspect) == (false, true, false)
+    # Types follow Vega-Lite's inference: a scale type implies quantitative,
+    # otherwise an untyped field is nominal.
+    @test spectra.y.type == XFA.FieldType_Quantitative
+    @test spectra.color.type == XFA.FieldType_Nominal
+    @test isnothing(spectra.lookup)
+    @test correlation.mark == XFA.Mark_Point
+    @test correlation.lookup == XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "motor")
+    @test compiled.rois == [XFA.RoiParam("grp.roi", XFA.RectROI()),
+                            XFA.RoiParam("grp.band", XFA.LinearROI(2.0, 3.0; axis=:x))]
+    @test compiled.models == [XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "spectra.fit", nothing)]
+    # A model's parameters come in a fixed order
+    @test XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0, 0.0, 1.0])(0.0) == 3.0
+    @test_throws "a gaussian takes 4 parameters" XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0])
+    @test XFA.datasets(compiled) == Set(["spectra", "intensity", "motor", "spectra.fit"])
+
+    # A unit spec: an image, with the defaults
+    image = XFA.compile_spec("detector", Dict(
+        "\$schema" => "https://vega.github.io/schema/vega-lite/v5.json",
+        "data" => Dict("name" => "detector"), "mark" => "rect",
+        "encoding" => Dict("x" => Dict("field" => "col", "type" => "ordinal"),
+                           "y" => Dict("field" => "row", "type" => "ordinal"),
+                           "color" => Dict("field" => "value", "type" => "quantitative",
+                                           "scale" => Dict("type" => "log", "scheme" => "turbo")))))
+    layer = only(image.layers)
+    @test layer.mark == XFA.Mark_Rect
+    @test (layer.color.log, layer.color.scheme) == (true, "turbo")
+    @test (image.name, image.title, image.xlabel, image.fixed_aspect) == ("detector", "detector", "col", true)
+    @test isempty(image.rois) && isempty(image.models)
+
+    base(pairs...) = Dict{String, Any}("data" => Dict("name" => "a"), "mark" => "line",
+                                       "encoding" => Dict("x" => quantitative("index"),
+                                                          "y" => quantitative("value")),
+                                       pairs...)
+
+    # Pre-binned bars need no type
+    histogram = XFA.compile_spec("a", base("mark" => "bar",
+                                      "encoding" => Dict("x" => Dict("field" => "index", "bin" => Dict("binned" => true)),
+                                                         "y" => quantitative("value"))))
+    @test only(histogram.layers).x == XFA.ChannelDef("index", XFA.FieldType_Quantitative, "index", false, nothing, true)
+
+    # A lookup plots the pulled field against the layer's own value, either way around
+    lookup(from_key) = [Dict("lookup" => "index", "as" => "b",
+                             "from" => Dict("data" => Dict("name" => "b"), "key" => from_key, "fields" => ["value"]))]
+    paired(x, y) = base("transform" => lookup("index"), "mark" => Dict("type" => "point", "opacity" => 0.5),
+                        "encoding" => Dict("x" => quantitative(x), "y" => quantitative(y)))
+    layer = only(XFA.compile_spec("a", paired("b", "value")).layers)
+    @test (layer.lookup.key, layer.opacity) == (XFA.LookupKey_Index, 0.5)
+    @test XFA.lookup_pair(layer) == ("b", "a")
+    @test XFA.lookup_pair(only(XFA.compile_spec("a", paired("value", "b")).layers)) == ("a", "b")
+
+    # Anything outside the subset is rejected with a message
+    rejected = [
+        base("width" => 300) => "spec: unsupported property",
+        base("title" => 1) => "spec.title: expected AbstractString, got Int64",
+        delete!(base(), "data") => "spec: missing",
+        Dict("layer" => []) => "at least one layer",
+        base("mark" => "area") => "spec.mark: unsupported value",
+        base("encoding" => Dict("x" => Dict("field" => "index"), "y" => quantitative("value"))) =>
+            "encoding.x: only quantitative axes",
+        base("mark" => "rect") => "a rect needs a quantitative color",
+        base("transform" => [Dict("filter" => "datum.value > 1")]) => "only lookup transforms",
+        base("transform" => lookup("trainId")) => "from.key: must be the same as lookup",
+        paired("index", "value") => "a lookup must pull",
+        base("params" => [Dict("name" => "p", "select" => "point")]) => "only interval selections",
+    ]
+    for (bad, message) in rejected
+        @test_throws message XFA.compile_spec("bad", bad)
+    end
+
+    @testset "Correlation specs" begin
+        motor = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar, title="Motor")
+        intensity = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar)
+        spec = XFA.correlation_spec("motor", "intensity", motor, intensity)
+        layer = only(spec.layers)
+        @test (layer.mark, layer.opacity) == (XFA.Mark_Point, 0.5)
+        @test layer.lookup == XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "x")
+        @test XFA.lookup_pair(layer) == ("motor", "intensity")
+        @test (spec.xlabel, spec.ylabel) == ("Motor", "")
+        @test XFA.datasets(spec) == Set(["motor", "intensity"])
+        # Vectors are paired per element instead
+        motor.type = intensity.type = XFA.VariableType_Vector
+        vectors = only(XFA.correlation_spec("motor", "intensity", motor, intensity).layers)
+        @test vectors.lookup.key == XFA.LookupKey_Index
+
+        # A new spec keeps the paired history if the same two variables are
+        # still paired, following a swap of the axes
+        matcher = XFA.VariableTrainmatcher()
+        append!(matcher.x_data, [1.0, 2.0])
+        append!(matcher.y_data, [10.0, 20.0])
+        previous = XFA.ViewLayer(; spec=layer, matcher)
+        @test XFA.carry_matcher(previous, layer) === matcher
+        swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
+        @test isnothing(XFA.carry_matcher(previous, swapped))   # now vectors, a different key
+        motor.type = intensity.type = XFA.VariableType_Scalar
+        swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
+        @test XFA.carry_matcher(previous, swapped) === matcher
+        @test (matcher.x_data, matcher.y_data) == ([10.0, 20.0], [1.0, 2.0])
+        other = only(XFA.correlation_spec("other", "motor", intensity, motor).layers)
+        @test isnothing(XFA.carry_matcher(previous, other))
+        @test isnothing(XFA.carry_matcher(nothing, layer))
+    end
+
+    @testset "Default specs" begin
+        # A DimArray vector is a line over its dim, with empty labels hidden
+        spectrum = XFA.VariableStore(; data=XFA.DimArray([4.0, 5.0, 6.0], (XFA.DD.Dim{:energy}([1.0, 2.0, 3.0]),)),
+                                     title="Spectrum", ylabel="counts")
+        spec = XFA.default_spec("spectrum", spectrum)
+        layer = only(spec.layers)
+        @test (layer.data, layer.mark, layer.x.field, layer.y.field) == ("spectrum", XFA.Mark_Line, "energy", "value")
+        @test (spec.title, spec.xlabel, spec.ylabel) == ("Spectrum", "", "counts")
+        @test XFA.field_values("spectrum", spectrum, "energy") == [1.0, 2.0, 3.0]
+        @test XFA.field_values("spectrum", spectrum, "value") == [4.0, 5.0, 6.0]
+        # The positional names work on a DimArray too
+        @test XFA.field_values("spectrum", spectrum, "index") == [1.0, 2.0, 3.0]
+        @test_throws "no field" XFA.field_values("spectrum", spectrum, "row")
+
+        # The spec is only resynthesised when something it depends on changes
+        key = XFA.default_spec_key(spectrum)
+        @test key == XFA.default_spec_key(spectrum)
+        spectrum.title = "Other"
+        @test key != XFA.default_spec_key(spectrum)
+
+        # A plain histogram is pre-binned bars, its explicit axis is the index
+        histogram = XFA.VariableStore(; data=[1, 2, 3], plot_type=:histogram)
+        layer = only(XFA.default_spec("h", histogram).layers)
+        @test (layer.mark, layer.x.field, layer.x.binned) == (XFA.Mark_Bar, "index", true)
+        @test XFA.field_values("h", histogram, "index") == 1:3
+        histogram.x_axis = [10, 20, 30]
+        @test XFA.field_values("h", histogram, "index") == [10, 20, 30]
+
+        # A matrix is an image, with rows along Y and columns along X
+        image = XFA.VariableStore(; data=zeros(2, 3), fixed_aspect=false)
+        spec = XFA.default_spec("image", image)
+        layer = only(spec.layers)
+        @test (layer.mark, layer.x.field, layer.y.field, layer.color.scheme) == (XFA.Mark_Rect, "col", "row", "turbo")
+        @test !spec.fixed_aspect
+        @test (XFA.field_dim(image.data, "row"), XFA.field_dim(image.data, "col")) == (1, 2)
+
+        # A scalar history is plotted against its train IDs
+        scalar = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), xlabel="trainId")
+        spec = XFA.default_spec("scalar", scalar)
+        @test (only(spec.layers).x.field, spec.xlabel) == ("trainId", "trainId")
+        @test XFA.field_values("scalar", scalar, "trainId") === scalar.scalar_tids_cache
+    end
+
+    @testset "Multi-series layers" begin
+        # The x and color dims of a matrix resolve by name or position, either
+        # way around, and x defaults to the dim the color isn't on
+        spectra = XFA.VariableStore(; data=XFA.DimArray(zeros(3, 2), (XFA.DD.Dim{:X}([1.0, 2.0, 3.0]),
+                                                                       XFA.DD.Dim{:pulseId}([10, 20]))))
+        by_name = XFA.LayerSpec(; data="spectra", x=:X, color=:pulseId)
+        @test XFA.series_dims("spectra", spectra.data, by_name) == (1, 2)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:col, color=:row)) == (2, 1)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:pulseId)) == (1, 2)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:X)) == (2, 1)
+        @test (XFA.dim_values(spectra, 1), XFA.dim_values(spectra, 2)) == ([1.0, 2.0, 3.0], [10, 20])
+        # An explicit x_axis runs along the columns
+        spectra.x_axis = [0.1, 0.2]
+        @test XFA.dim_values(spectra, 2) == [0.1, 0.2]
+
+        @test_throws "a color channel needs a matrix" XFA.series_dims("spectra", zeros(3), by_name)
+        @test_throws "a color channel needs a matrix" XFA.series_dims(
+            "spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:X, color=:X))
+
+        # Labels the spec leaves open come from the data, whose ylabel runs along the rows
+        spectra.ylabel, spectra.title = "energy", "Spectra"
+        gui = XFA.GuiState(Dict{String, Any}())
+        gui.client.variable_data["spectra"] = spectra
+        XFA.@with XFA.state => gui begin
+            lines = XFA.PlotSpec("lines", [by_name])
+            @test (XFA.axis_label(lines, lines.xlabel, :x), XFA.axis_label(lines, lines.ylabel, :y)) == ("energy", "Spectra")
+            @test XFA.axis_label(lines, "given", :x) == "given"
+        end
     end
 end
 
