@@ -28,6 +28,313 @@ end
     PipelineStatus_Stopped
 end
 
+# This enum tracks the original type of the variables. We need to distinguish
+# this from how they're stored because both scalars and vectors are stored as
+# vectors.
+@enum VariableType begin
+    VariableType_Scalar
+    VariableType_Vector
+    VariableType_Array
+    VariableType_Unknown
+end
+
+
+### Plotting types
+
+
+# Per-plot GPU resources for heatmap rendering:
+# - `data_tex`:   single-channel 2D texture holding the raw matrix data
+# - `output_tex`: RGBA8 2D texture holding the colormapped result (fed to PlotImage)
+# - `fbo`:        framebuffer targeting output_tex for off-screen rendering
+mutable struct GPUHeatmap
+    data_tex::GLuint
+    output_tex::GLuint
+    fbo::GLuint
+    width::Int
+    height::Int
+    is_integer::Bool
+    # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
+    # Avoids allocating a new array every frame.
+    convert_buf::Vector{UInt8}
+    # Reused histogram bin counts for approximate 1st/99th percentile
+    # estimation, avoiding a full copy + sort of the input.
+    hist_buf::Vector{Int32}
+    # Whether the texture was last rendered in log mode — toggling this in the
+    # UI forces a re-render with fresh percentiles.
+    log_scale::Bool
+    # The colormap it was last rendered with.
+    colormap::Cint
+end
+
+function GPUHeatmap()
+    tex_refs = Ref{GLuint}(0)
+
+    glGenTextures(1, tex_refs)
+    data_tex = tex_refs[]
+
+    glGenTextures(1, tex_refs)
+    output_tex = tex_refs[]
+
+    fbo_ref = Ref{GLuint}(0)
+    glGenFramebuffers(1, fbo_ref)
+    fbo = fbo_ref[]
+
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false, -1)
+end
+
+# Per-parameter UI state: `fixed` selects whether the slot is held in the next
+# fit; `value` is the committed value used by the fit; `edit_buf` is the
+# InputDouble binding, copied into `value` only on Enter so live keystrokes
+# don't drive the fit.
+@kwdef mutable struct FitParameter
+    fixed::Bool = false
+    value::Float64 = 0.0
+    const edit_buf::Ref{Cdouble} = Ref(0.0)
+end
+
+# Per-view fit configuration, kept in one struct so the side-panel fitting UI
+# can be driven from it. The fit follows the view's first layer.
+@kwdef mutable struct FitSettings
+    fit_type::Ref{Cint} = Ref(Cint(0))
+    live::Bool = true
+    requested::Bool = false
+    restrict_x::Bool = false
+    x_roi::LinearROI = LinearROI()
+    amplitude_sign::Int = 1
+    popt::Maybe{Vector{Float64}} = nothing
+    retcode::Maybe{Symbol} = nothing
+    # Wall time of the most recent fit, in seconds.
+    elapsed::Float64 = 0.0
+    # Sampled model curve, refreshed by compute_fit! on each successful fit so
+    # the GUI can overlay it without re-evaluating per frame.
+    const model_x::Vector{Float64} = Float64[]
+    const model_y::Vector{Float64} = Float64[]
+    # Per-parameter fix flags + values for the current fit type. Rebuilt when
+    # fit_type changes; iteration order matches the positional popt layout.
+    const params::OrderedDict{String, FitParameter} = OrderedDict{String, FitParameter}()
+end
+
+# A `PlotType` is what a SpecView's `prepare!` hands back each frame, drawn by
+# `plot_frame!`.
+abstract type PlotType end
+
+# 1D series. `style` selects the ImPlot primitive:
+#   :line    → PlotLine
+#   :scatter → PlotScatter
+struct Line <: PlotType
+    xs
+    ys
+    label::String
+    style::Symbol
+    # Explicit per-series color, used when a color channel groups a layer into
+    # series. nothing lets ImPlot cycle its palette as usual.
+    color::Maybe{ig.ImVec4}
+    opacity::Float64
+end
+
+# Bar series, for histograms and any vector drawn as bars.
+struct Bars <: PlotType
+    xs
+    ys
+    label::String
+    bar_size::Float64
+end
+
+# Shaded band + central line, sharing one legend entry. Used for binned
+# correlations where `lower`/`upper` bound the spread around `line_ys`.
+struct Band <: PlotType
+    xs
+    lower
+    upper
+    line_ys
+    label::String
+end
+
+# Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
+# may be nothing (defaults to pixel coords).
+struct Image <: PlotType
+    data
+    x_axis::Maybe{AbstractVector}
+    y_axis::Maybe{AbstractVector}
+    gpu::GPUHeatmap
+end
+
+# Nothing to draw this frame. `message`, when non-empty, is shown in place of
+# the plot.
+struct Empty <: PlotType
+    message::String
+end
+
+# Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
+# the colormap shader; `display_min`/`display_max` are the visible range
+# shown on the colorbar axis (>= clip range, controlled by mouse wheel).
+@kwdef mutable struct ColorbarState
+    const autoscale::Ref{Bool} = Ref(true)
+    const clip_min::Ref{Cdouble} = Ref(0.0)
+    const clip_max::Ref{Cdouble} = Ref(1.0)
+    const display_min::Ref{Cdouble} = Ref(0.0)
+    const display_max::Ref{Cdouble} = Ref(1.0)
+    drag::Symbol = :none
+    display_zoomed::Bool = false
+end
+
+# Matrix-rendering state: GPU heatmap resources, colormap log toggle, colorbar
+# state, ROI overlay bookkeeping. Lives on Plot whenever the plotted data is a
+# matrix.
+@kwdef mutable struct ImageState
+    const fixed_aspect::Ref{Bool} = Ref(true)
+    const log_scale::Ref{Bool} = Ref(false)
+    colormap::Cint = turbo_colormap()
+    const colorbar::ColorbarState = ColorbarState()
+    gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
+end
+
+# Pairs samples from two VariableData stores on matching train IDs. Owns the
+# paired history buffers and an optional binning accumulator. Pure data
+# plumbing — no ImGui state.
+@kwdef mutable struct VariableTrainmatcher
+    const x_data::Vector{Float64} = Float64[]
+    const y_data::Vector{Float64} = Float64[]
+    accu::Maybe{Scalar1dScan} = nothing
+    # Last vector-mode tid consumed, so we only copy once per matched train.
+    last_vector_tid::Int = -1
+end
+
+# Where a SpecView's spec comes from, see refresh_spec!.
+abstract type SpecSource end
+
+# The default plot of a variable, with model curves drawn over it if any.
+struct DefaultSpec <: SpecSource
+    variable::String
+    models::Vector{ModelOverlay}
+end
+
+# A correlation of two variables picked in the plot window, authored as a
+# lookup spec (see correlation_spec).
+@kwdef struct CorrelationSpec <: SpecSource
+    # The X and Y variables, "" until there's one to pick.
+    selected::Vector{String} = ["", ""]
+    # Refreshed each frame from client.variable_data; used by the X/Y combos.
+    variable_names::Vector{String} = String[]
+end
+
+# A plot that `variable` advertises under `name`, besides its default one.
+struct AdvertisedSpec <: SpecSource
+    variable::String
+    name::String
+end
+
+# One layer of a SpecView. `image` is the state of a rect layer, `matcher` pairs
+# the two variables of a lookup layer, and `series` holds the series a color
+# channel groups the data into, rebuilt when it updates.
+@kwdef mutable struct ViewLayer
+    const spec::LayerSpec
+    image::Maybe{ImageState} = nothing
+    const matcher::Maybe{VariableTrainmatcher} = nothing
+    const series::Vector{PlotType} = PlotType[]
+end
+
+# The curves of one of a spec's models, resampled when its parameters update.
+@kwdef struct ViewModel
+    overlay::ModelOverlay
+    xs::Vector{Float64} = Float64[]
+    curves::Vector{PlotType} = PlotType[]
+end
+
+@kwdef mutable struct VariableStore
+    const updates::Channel = Channel(100)
+    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
+    type::VariableType = VariableType_Unknown
+
+    # This field is only used for non-scalar data. Scalar data is stored as a
+    # CircularBuffer with a parallel CircularBuffer for train IDs.
+    trainId::Int = -1
+
+    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
+    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
+
+    # Background array decompression. `decode_task` is this variable's in-flight
+    # decode (or nothing); while it's running draw_plots drops newer frames
+    # instead of spawning another. `decode_variable` is that frame's message.
+    # `spare_buffer` is the off-screen buffer the task decodes into, swapped with
+    # `data` on pickup so decoding never mutates the array being rendered.
+    decode_task::Maybe{Task} = nothing
+    decode_variable::Maybe{VariableData} = nothing
+    spare_buffer::Maybe{Array} = nothing
+
+    # Contiguous caches for plotting scalar CircularBuffer data
+    const scalar_data_cache::Vector{Float64} = Float64[]
+    const scalar_tids_cache::Vector{Float64} = Float64[]
+
+    # Processing rate (Hz) reported by the engine.
+    update_rate::Float64 = 0.0
+
+    # Compression ratio (uncompressed / compressed bytes) of the most recent
+    # payload. NaN when the variable arrived uncompressed.
+    compression_ratio::Float64 = NaN
+
+    # Size in bytes of the most recent array payload on the wire — the
+    # compressed size for compressed payloads, otherwise sizeof(data).
+    received_bytes::Int = 0
+
+    # Metadata from VariableData
+    title::String = ""
+    x_axis::Maybe{AbstractVector} = nothing
+    y_axis::Maybe{AbstractVector} = nothing
+    xlabel::String = ""
+    ylabel::String = ""
+    unit::Maybe{String} = nothing
+    bin_resolution::Float64 = 0.0
+    fixed_aspect::Bool = true
+    plot_type::Symbol = :series
+    compress::Bool = true
+    plot_specs::Vector{PlotSpec} = PlotSpec[]
+end
+
+# Renders a PlotSpec from its source. Synthesised specs are rebuilt whenever
+# the source's `spec_key` changes.
+@kwdef mutable struct SpecView
+    const source::SpecSource
+    const id::String
+    const fit::FitSettings = FitSettings()
+    spec_key::Any = nothing
+    spec::Maybe{PlotSpec} = nothing
+    const layers::Vector{ViewLayer} = ViewLayer[]
+    const models::Vector{ViewModel} = ViewModel[]
+    const subscribed::Set{String} = Set{String}()
+    # Bin width of the trainId lookup layers, 0 for a plain scatter. Follows the
+    # X variable's hint until the user touches it.
+    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
+    resolution_touched::Bool = false
+    # ROI parameter values updated locally during a drag, keyed by parameter
+    # name. Flushed to the engine when the user releases the mouse so we don't
+    # flood it with per-frame updates.
+    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
+    # Array variables drawn from copies instead of the live stores, see sync_arrays!
+    const snapshots::Dict{String, Maybe{VariableStore}} = Dict{String, Maybe{VariableStore}}()
+    shown_tid::Int = -1
+    # Only every `update_every`'th matched train is shown
+    const update_every::Ref{Cint} = Ref(Cint(1))
+    update_age::Int = 0
+    matched_tid::Int = -1
+end
+
+# A plot window: the view, and the state of the plot's axes. `id` is also the
+# `##` suffix of the view's widgets.
+@kwdef mutable struct Plot
+    const id::String
+    const view::SpecView
+    const open::Ref{Bool} = Ref(true)
+    const autoscale_x::Ref{Bool} = Ref(true)
+    const autoscale_y::Ref{Bool} = Ref(true)
+    const log_x::Ref{Bool} = Ref(false)
+    const log_y::Ref{Bool} = Ref(false)
+    const show_side_panel::Ref{Bool} = Ref(false)
+    dock_id::UInt32 = 0
+end
+
+### GUI state types
+
 struct PropertyList
     names::Vector{String}
     displayed_names::Vector{String}
@@ -239,67 +546,7 @@ function Base.close(state::SshState)
     empty!(state.kbdint_prompts)
 end
 
-# This enum tracks the original type of the variables. We need to distinguish
-# this from how they're stored because both scalars and vectors are stored as
-# vectors.
-@enum VariableType begin
-    VariableType_Scalar
-    VariableType_Vector
-    VariableType_Array
-    VariableType_Unknown
-end
-
 const SCALAR_BUFFER_CAPACITY = 10_000
-
-@kwdef mutable struct VariableStore
-    const updates::Channel = Channel(100)
-    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
-    type::VariableType = VariableType_Unknown
-
-    # This field is only used for non-scalar data. Scalar data is stored as a
-    # CircularBuffer with a parallel CircularBuffer for train IDs.
-    trainId::Int = -1
-
-    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
-    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
-
-    # Background array decompression. `decode_task` is this variable's in-flight
-    # decode (or nothing); while it's running draw_plots drops newer frames
-    # instead of spawning another. `decode_tid` is that frame's train ID.
-    # `spare_buffer` is the off-screen buffer the task decodes into, swapped with
-    # `data` on pickup so decoding never mutates the array being rendered.
-    decode_task::Maybe{Task} = nothing
-    decode_tid::Int = -1
-    spare_buffer::Maybe{Array} = nothing
-
-    # Contiguous caches for plotting scalar CircularBuffer data
-    const scalar_data_cache::Vector{Float64} = Float64[]
-    const scalar_tids_cache::Vector{Float64} = Float64[]
-
-    # Processing rate (Hz) reported by the engine.
-    update_rate::Float64 = 0.0
-
-    # Compression ratio (uncompressed / compressed bytes) of the most recent
-    # payload. NaN when the variable arrived uncompressed.
-    compression_ratio::Float64 = NaN
-
-    # Size in bytes of the most recent array payload on the wire — the
-    # compressed size for compressed payloads, otherwise sizeof(data).
-    received_bytes::Int = 0
-
-    # Metadata from VariableData
-    title::String = ""
-    x_axis::Maybe{AbstractVector} = nothing
-    y_axis::Maybe{AbstractVector} = nothing
-    xlabel::String = ""
-    ylabel::String = ""
-    unit::Maybe{String} = nothing
-    bin_resolution::Float64 = 0.0
-    fixed_aspect::Bool = true
-    plot_type::Symbol = :series
-    compress::Bool = true
-    plot_specs::Vector{PlotSpec} = PlotSpec[]
-end
 
 struct LinkInfo
     id::UInt

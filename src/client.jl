@@ -848,6 +848,16 @@ function store_variable_data!(client, variable::VariableData)
     end
 
     store = client.variable_data[name]
+    push!(store.updates, variable)
+    store.update_rate = variable.update_rate
+    store.compression_ratio = compression_ratio
+    store.received_bytes = received_bytes
+    store.compress = variable.compress
+end
+
+function apply_metadata!(store, variable::VariableData)
+    data = variable.data
+    name = variable.name
     store.title = if !isnothing(variable.title)
         variable.title
     else
@@ -896,7 +906,7 @@ function store_variable_data!(client, variable::VariableData)
         ""
     end
 
-    type = if data isa Number
+    store.type = if data isa Number
         VariableType_Scalar
     elseif data isa AbstractVector
         VariableType_Vector
@@ -907,11 +917,6 @@ function store_variable_data!(client, variable::VariableData)
     else
         VariableType_Unknown
     end
-    push!(store.updates, (variable.tid, data, type))
-    store.update_rate = variable.update_rate
-    store.compression_ratio = compression_ratio
-    store.received_bytes = received_bytes
-    store.compress = variable.compress
 end
 
 @enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor ParameterOwner_Global
