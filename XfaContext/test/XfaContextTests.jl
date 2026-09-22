@@ -29,7 +29,7 @@ using DimensionalData: DimArray, lookup, hasdim
 using PythonCall
 
 using XfaContext
-using XfaContext: VariableData, XfaContextException, CircularChannel, drop_count
+using XfaContext: VariableData, XfaContextException, CircularChannel, drop_count, PlotSpec, LayerSpec
 
 keyset(dict) = Set(keys(dict))
 
@@ -162,6 +162,55 @@ end
     @test isempty(Context.match_train!(matched, dropped, tm, VariableData(1, "foo.baz", 1)))
     @test dropped == [1, 1]
     @test length(Context.match_train!(matched, dropped, tm, VariableData(3, "foo.baz", 1))) == 1
+end
+
+@testset "Plot specs" begin
+    # A color dim groups a matrix into series, as a gradient by default or
+    # distinct colours, with x along the other dim by default
+    lines = LayerSpec(; data="spectra", x=:X, color=:pulseId)
+    @test (lines.mark, lines.x.field, lines.y.field) == (Context.Mark_Line, "X", "value")
+    @test (lines.color.field, lines.color.type, lines.color.scheme) ==
+        ("pulseId", Context.FieldType_Quantitative, "viridis")
+    distinct = LayerSpec(; data="spectra", color=:pulseId, gradient=false)
+    @test (distinct.x.field, distinct.color.type) == ("index", Context.FieldType_Nominal)
+
+    # Another variable on x is an elementwise lookup
+    paired = LayerSpec(; data="intensity", mark=:scatter, x="motor")
+    @test (paired.mark, paired.x.field) == (Context.Mark_Point, "motor")
+    @test paired.lookup == Context.LookupTransform(Context.LookupKey_Index, "motor", "value", "motor")
+
+    image = LayerSpec(; data="detector", mark=:image)
+    @test (image.mark, image.x.field, image.y.field, image.color.field) == (Context.Mark_Rect, "col", "row", "value")
+    @test image.color.scheme == "turbo"
+
+    # A model fit drawn over the spec's layers
+    fit = Context.ModelOverlay(:gaussian; params="spectrum.fit")
+    @test fit == Context.ModelOverlay(Context.ModelFunction_Gaussian, "spectrum.fit", nothing)
+    @test PlotSpec("fits", ["spectrum"]; models=[fit]).models == [fit]
+    @test_throws "unsupported model function" Context.ModelOverlay(:lorentzian; params="a")
+
+    # A layer that names no variable gets the one advertising the spec
+    own = PlotSpec("own", [LayerSpec(; color=:pulseId), LayerSpec(; data="baseline")]; models=[fit])
+    bound = only(Context.wrap_result(VariableData(; data=1, plot_specs=own), 1, "spectra").plot_specs)
+    @test [layer.data for layer in bound.layers] == ["spectra", "baseline"]
+    @test Context.bind_variable(bound, "other") === bound
+    @test PlotSpec("own"; ylabel="counts") == PlotSpec("own", [LayerSpec()]; ylabel="counts")
+    @test VariableData(1; plot_specs=own) == VariableData(; data=1, plot_specs=[own])
+
+    @test_throws "unsupported mark" LayerSpec(; data="a", mark=:lines)
+    @test_throws "x must be its other dim" LayerSpec(; data="a", x="b", color=:c)
+    @test_throws "only supported for images" LayerSpec(; data="a", y=:b)
+
+    # A vector of names is one line each, and the labels are left to the data unless given
+    overview() = PlotSpec("overview", ["spectra", "baseline"]; ylabel="counts")
+    spec = overview()
+    @test (spec.name, spec.title, spec.xlabel, spec.ylabel) == ("overview", "overview", nothing, "counts")
+    @test [layer.data for layer in spec.layers] == ["spectra", "baseline"]
+
+    # Specs compare by value, so a VariableData carrying them does too
+    @test spec == overview() && hash(spec) == hash(overview())
+    @test spec != PlotSpec("overview", ["spectra"]; ylabel="counts")
+    @test VariableData(; data=1, plot_specs=[spec]) == VariableData(; data=1, plot_specs=[overview()])
 end
 
 @testset "karabo_dependency" begin
