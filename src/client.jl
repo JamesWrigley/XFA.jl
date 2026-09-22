@@ -1366,8 +1366,7 @@ end
 # Whether `property` is usable with `source`, given the device's schema property
 # `names`. A property is valid if it's in the schema, or if it's what a schema
 # property becomes once the remap rules run: committed sources store the
-# remapped form (a camera's `data.image.pixels` is saved as `data.image.data`),
-# which never appears in the schema itself.
+# remapped form, which never appears in the schema itself.
 function karabo_property_valid(client::ClientState, source::AbstractString, property::AbstractString, names)
     if property in names
         return true
