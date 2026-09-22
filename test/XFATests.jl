@@ -743,19 +743,19 @@ end
     @test p1 ≈ e1 atol = 1.0
     @test p99 ≈ e99 atol = 1.0
 
-    # Log mode: log10 of the positive-only percentiles.
+    # Log mode: percentiles of the log10 of the positive samples.
     small_pos = reshape(10.0 .^ collect(0.0:0.01:0.99), 10, 10)
-    e1, e99 = pct(vec(small_pos))
+    e1, e99 = pct(log10.(vec(small_pos)))
     p1, p99 = XFA.sampled_pctile!(buf, small_pos, true)
-    @test p1 ≈ log10(e1) atol = 0.05
-    @test p99 ≈ log10(e99) atol = 0.05
+    @test p1 ≈ e1 atol = 0.05
+    @test p99 ≈ e99 atol = 0.05
 
     # Non-positive samples are dropped before log10.
     mixed_log = [-1.0 0.0 NaN; 1.0 10.0 NaN; 100.0 1000.0 NaN]
-    e1, e99 = pct(filter(x -> isfinite(x) && x > 0, vec(mixed_log)))
+    e1, e99 = pct(log10.(filter(x -> isfinite(x) && x > 0, vec(mixed_log))))
     p1, p99 = XFA.sampled_pctile!(buf, mixed_log, true)
-    @test p1 ≈ log10(e1) atol = 0.1
-    @test p99 ≈ log10(e99) atol = 0.1
+    @test p1 ≈ e1 atol = 0.1
+    @test p99 ≈ e99 atol = 0.1
 
     # No positive samples → fallback, never NaN/-Inf from log10(≤0).
     @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
@@ -1083,6 +1083,78 @@ end
             @test XFA.axis_label(lines, "given", :x) == "given"
         end
     end
+end
+
+@testset "Metadata follows its data" begin
+    gui = XFA.GuiState(Dict{String, Any}())
+    client = gui.client
+    message(tid, data, title) = XFA.VariableData(; tid, name="a", data, title, x_axis=[tid])
+    XFA.@with XFA.state => gui begin
+        XFA.store_variable_data!(client, message(1, [1.0], "first"))
+        store = client.variable_data["a"]
+        @test store.title == ""
+        XFA.draw_plots()
+        @test (store.data, store.trainId, store.title, store.x_axis) == ([1.0], 1, "first", [1])
+
+        # A dropped frame's metadata is never shown
+        XFA.store_variable_data!(client, message(2, [2.0], "second"))
+        XFA.store_variable_data!(client, message(3, [3.0], "third"))
+        @test store.title == "first"
+        XFA.draw_plots()
+        @test (store.trainId, store.title, store.x_axis) == (3, "third", [3])
+
+        # Compressed data brings its metadata through the decode
+        ws = XFA.ZfpWorkspace()
+        compressed = XFA.XfaEngine.ZfpWorkspaces.compress_array(ws, rand(1000); k=0)
+        XFA.store_variable_data!(client, message(4, compressed, "fourth"))
+        XFA.draw_plots()
+        @test store.title == "third"
+        wait(store.decode_task)
+        XFA.draw_plots()
+        @test (store.trainId, store.title, store.x_axis) == (4, "fourth", [4])
+    end
+end
+
+@testset "Trainmatching array layers" begin
+    a = XFA.VariableStore(; data=[1.0, 2.0], trainId=1)
+    b = XFA.VariableStore(; data=XFA.DimArray([3.0, 4.0], (XFA.DD.Dim{:energy}([1.0, 2.0]),)), trainId=2)
+    fit = XFA.VariableStore(; data=[0.0, 1.0, 0.0, 1.0], trainId=1)
+    scalar = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10))
+    variable_data = Dict("a" => a, "b" => b, "fit" => fit, "scalar" => scalar)
+    view = XFA.SpecView(; source=XFA.DefaultSpec("a", XFA.ModelOverlay[]), id="view")
+    append!(view.layers, [XFA.ViewLayer(; spec=XFA.LayerSpec(; data)) for data in ("a", "b", "scalar")])
+    push!(view.models, XFA.ViewModel(; overlay=XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "fit", nothing)))
+    sync(names...) = keys(XFA.sync_arrays!(view, variable_data, Dict(name => Set(1) for name in names)))
+
+    # Nothing is shown until the arrays hold the same train, scalars aren't held
+    @test sync("a", "b", "fit", "scalar") == Set(["scalar"])
+    @test all(isnothing, values(view.snapshots))
+    a.trainId = 2
+    @test sync("a") == Set(["a", "b"])
+    # The fit is only taken once it's for the shown train
+    fit.trainId = 2
+    @test sync("fit") == Set(["fit"])
+
+    # The copies stay put while the stores move on
+    a.data[1] = 10.0
+    a.trainId = 3
+    @test isempty(sync("a"))
+    @test (view.snapshots["a"].data, view.snapshots["a"].trainId) == ([1.0, 2.0], 2)
+    @test XFA.DD.dims(view.snapshots["b"].data) == XFA.DD.dims(b.data)
+
+    # A lone array is drawn live
+    deleteat!(view.layers, 2)
+    @test sync("a") == Set(["a"])
+    @test isempty(view.snapshots)
+
+    # Unless only every n'th train is shown, the first straight away
+    view.update_every[] = 2
+    @test sync("a") == Set(["a"])
+    a.trainId = 4
+    @test isempty(sync("a"))
+    a.trainId = 5
+    @test sync("a") == Set(["a"])
+    @test view.snapshots["a"].trainId == 5
 end
 
 @testset "GUI" begin

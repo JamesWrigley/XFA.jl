@@ -338,48 +338,6 @@ end
 
 # --- Per-plot GPU state ---
 
-"""
-Per-plot GPU resources for heatmap rendering:
-- `data_tex`:   single-channel 2D texture holding the raw matrix data
-- `output_tex`: RGBA8 2D texture holding the colormapped result (fed to PlotImage)
-- `fbo`:        framebuffer targeting output_tex for off-screen rendering
-"""
-mutable struct GPUHeatmap
-    data_tex::GLuint
-    output_tex::GLuint
-    fbo::GLuint
-    width::Int
-    height::Int
-    is_integer::Bool
-    # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
-    # Avoids allocating a new array every frame.
-    convert_buf::Vector{UInt8}
-    # Reused histogram bin counts for approximate 1st/99th percentile
-    # estimation, avoiding a full copy + sort of the input.
-    hist_buf::Vector{Int32}
-    # Whether the texture was last rendered in log mode — toggling this in the
-    # UI forces a re-render with fresh percentiles.
-    log_scale::Bool
-    # The colormap it was last rendered with.
-    colormap::Cint
-end
-
-function GPUHeatmap()
-    tex_refs = Ref{GLuint}(0)
-
-    glGenTextures(1, tex_refs)
-    data_tex = tex_refs[]
-
-    glGenTextures(1, tex_refs)
-    output_tex = tex_refs[]
-
-    fbo_ref = Ref{GLuint}(0)
-    glGenFramebuffers(1, fbo_ref)
-    fbo = fbo_ref[]
-
-    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false, -1)
-end
-
 function destroy!(h::GPUHeatmap)
     for tex in (h.data_tex, h.output_tex)
         tex_ref = Ref(tex)
@@ -638,38 +596,6 @@ end
 
 const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
 
-# Per-parameter UI state: `fixed` selects whether the slot is held in the next
-# fit; `value` is the committed value used by the fit; `edit_buf` is the
-# InputDouble binding, copied into `value` only on Enter so live keystrokes
-# don't drive the fit.
-@kwdef mutable struct FitParameter
-    fixed::Bool = false
-    value::Float64 = 0.0
-    const edit_buf::Ref{Cdouble} = Ref(0.0)
-end
-
-# Per-view fit configuration, kept in one struct so the side-panel fitting UI
-# can be driven from it. The fit follows the view's first layer.
-@kwdef mutable struct FitSettings
-    fit_type::Ref{Cint} = Ref(Cint(0))
-    live::Bool = true
-    requested::Bool = false
-    restrict_x::Bool = false
-    x_roi::LinearROI = LinearROI()
-    amplitude_sign::Int = 1
-    popt::Maybe{Vector{Float64}} = nothing
-    retcode::Maybe{Symbol} = nothing
-    # Wall time of the most recent fit, in seconds.
-    elapsed::Float64 = 0.0
-    # Sampled model curve, refreshed by compute_fit! on each successful fit so
-    # the GUI can overlay it without re-evaluating per frame.
-    const model_x::Vector{Float64} = Float64[]
-    const model_y::Vector{Float64} = Float64[]
-    # Per-parameter fix flags + values for the current fit type. Rebuilt when
-    # fit_type changes; iteration order matches the positional popt layout.
-    const params::OrderedDict{String, FitParameter} = OrderedDict{String, FitParameter}()
-end
-
 # Parameter names per fit type, matching the order returned by the fit_* funcs.
 fit_param_names(name::AbstractString) = if name == "Line"
     ("slope", "intercept")
@@ -814,95 +740,6 @@ function draw_fit_overlay(view_id, fit::FitSettings)
     end
 end
 
-# --- Plot type payloads ---
-#
-# A `PlotType` is what a SpecView's `prepare!` hands back each frame, drawn by
-# `plot_frame!`.
-
-abstract type PlotType end
-
-# 1D series. `style` selects the ImPlot primitive:
-#   :line    → PlotLine
-#   :scatter → PlotScatter
-struct Line <: PlotType
-    xs
-    ys
-    label::String
-    style::Symbol
-    # Explicit per-series color, used when a color channel groups a layer into
-    # series. nothing lets ImPlot cycle its palette as usual.
-    color::Maybe{ig.ImVec4}
-    opacity::Float64
-end
-
-# Bar series, for histograms and any vector drawn as bars.
-struct Bars <: PlotType
-    xs
-    ys
-    label::String
-    bar_size::Float64
-end
-
-# Shaded band + central line, sharing one legend entry. Used for binned
-# correlations where `lower`/`upper` bound the spread around `line_ys`.
-struct Band <: PlotType
-    xs
-    lower
-    upper
-    line_ys
-    label::String
-end
-
-# Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
-# may be nothing (defaults to pixel coords).
-struct Image <: PlotType
-    data
-    x_axis::Maybe{AbstractVector}
-    y_axis::Maybe{AbstractVector}
-    gpu::GPUHeatmap
-end
-
-# Nothing to draw this frame. `message`, when non-empty, is shown in place of
-# the plot.
-struct Empty <: PlotType
-    message::String
-end
-
-# Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
-# the colormap shader; `display_min`/`display_max` are the visible range
-# shown on the colorbar axis (>= clip range, controlled by mouse wheel).
-@kwdef mutable struct ColorbarState
-    const autoscale::Ref{Bool} = Ref(true)
-    const clip_min::Ref{Cdouble} = Ref(0.0)
-    const clip_max::Ref{Cdouble} = Ref(1.0)
-    const display_min::Ref{Cdouble} = Ref(0.0)
-    const display_max::Ref{Cdouble} = Ref(1.0)
-    drag::Symbol = :none
-    display_zoomed::Bool = false
-end
-
-# Matrix-rendering state: GPU heatmap resources, colormap log toggle, colorbar
-# state, ROI overlay bookkeeping. Lives on Plot whenever the plotted data is a
-# matrix.
-@kwdef mutable struct ImageState
-    const fixed_aspect::Ref{Bool} = Ref(true)
-    const log_scale::Ref{Bool} = Ref(false)
-    colormap::Cint = turbo_colormap()
-    const colorbar::ColorbarState = ColorbarState()
-    gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
-end
-
-# Pairs samples from two VariableData stores on matching train IDs. Owns the
-# paired history buffers and an optional binning accumulator. Pure data
-# plumbing — no ImGui state.
-@kwdef mutable struct VariableTrainmatcher
-    const x_data::Vector{Float64} = Float64[]
-    const y_data::Vector{Float64} = Float64[]
-    accu::Maybe{Scalar1dScan} = nothing
-    # Last vector-mode tid consumed, so we only copy once per matched train.
-    last_vector_tid::Int = -1
-end
-
 # Walk updated_variables for x_name/y_name and append pairs for any tid present
 # in both x.scalar_tids and y.scalar_tids. Routes through accu if active.
 # Returns true if any pair was appended.
@@ -982,82 +819,6 @@ function swap!(m::VariableTrainmatcher)
         m.x_data[i], m.y_data[i] = m.y_data[i], m.x_data[i]
     end
     m.accu = nothing
-end
-
-# Where a SpecView's spec comes from, see refresh_spec!.
-abstract type SpecSource end
-
-# The default plot of a variable, with model curves drawn over it if any.
-struct DefaultSpec <: SpecSource
-    variable::String
-    models::Vector{ModelOverlay}
-end
-
-# A correlation of two variables picked in the plot window, authored as a
-# lookup spec (see correlation_spec).
-@kwdef struct CorrelationSpec <: SpecSource
-    # The X and Y variables, "" until there's one to pick.
-    selected::Vector{String} = ["", ""]
-    # Refreshed each frame from client.variable_data; used by the X/Y combos.
-    variable_names::Vector{String} = String[]
-end
-
-# A plot that `variable` advertises under `name`, besides its default one.
-struct AdvertisedSpec <: SpecSource
-    variable::String
-    name::String
-end
-
-# One layer of a SpecView. `image` is the state of a rect layer, `matcher` pairs
-# the two variables of a lookup layer, and `series` holds the series a color
-# channel groups the data into, rebuilt when it updates.
-@kwdef mutable struct ViewLayer
-    const spec::LayerSpec
-    image::Maybe{ImageState} = nothing
-    const matcher::Maybe{VariableTrainmatcher} = nothing
-    const series::Vector{PlotType} = PlotType[]
-end
-
-# The curves of one of a spec's models, resampled when its parameters update.
-@kwdef struct ViewModel
-    overlay::ModelOverlay
-    xs::Vector{Float64} = Float64[]
-    curves::Vector{PlotType} = PlotType[]
-end
-
-# Renders a PlotSpec from its source. Synthesised specs are rebuilt whenever
-# the source's `spec_key` changes.
-@kwdef mutable struct SpecView
-    const source::SpecSource
-    const id::String
-    const fit::FitSettings = FitSettings()
-    spec_key::Any = nothing
-    spec::Maybe{PlotSpec} = nothing
-    const layers::Vector{ViewLayer} = ViewLayer[]
-    const models::Vector{ViewModel} = ViewModel[]
-    const subscribed::Set{String} = Set{String}()
-    # Bin width of the trainId lookup layers, 0 for a plain scatter. Follows the
-    # X variable's hint until the user touches it.
-    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
-    resolution_touched::Bool = false
-    # ROI parameter values updated locally during a drag, keyed by parameter
-    # name. Flushed to the engine when the user releases the mouse so we don't
-    # flood it with per-frame updates.
-    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
-end
-
-# A plot window: the view, and the state of the plot's axes. `id` is also the
-# `##` suffix of the view's widgets.
-@kwdef mutable struct Plot
-    const id::String
-    const view::SpecView
-    const open::Ref{Bool} = Ref(true)
-    const autoscale_x::Ref{Bool} = Ref(true)
-    const autoscale_y::Ref{Bool} = Ref(true)
-    const log_x::Ref{Bool} = Ref(false)
-    const log_y::Ref{Bool} = Ref(false)
-    const show_side_panel::Ref{Bool} = Ref(false)
-    dock_id::UInt32 = 0
 end
 
 # The default plot of variable `name`, with `models` drawn over it.
@@ -1932,12 +1693,92 @@ function lookup_frame(view::SpecView, layer::ViewLayer, updated_variables)
     end
 end
 
+# Whether `name` holds array data, rather than a scalar history or nothing yet.
+function holds_array(variable_data, name)
+    haskey(variable_data, name) && variable_data[name].data isa AbstractArray &&
+        !(variable_data[name].data isa CircularBuffer)
+end
+
+# A view with several array layers only shows trains they all hold, and only
+# every `update_every`'th of those. They're drawn from copies since the stores
+# reuse their buffers. Returns `updated_variables` as the view sees it.
+function sync_arrays!(view::SpecView, variable_data, updated_variables)
+    arrays = Set(layer.spec.data for layer in view.layers
+                 if isnothing(layer.spec.lookup) && holds_array(variable_data, layer.spec.data))
+    snapshots = view.snapshots
+    if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1)
+        empty!(snapshots)
+        return updated_variables
+    end
+
+    # Model parameters follow the shown train, and can arrive after its data
+    params = Set(model.overlay.params for model in view.models
+                 if holds_array(variable_data, model.overlay.params) && !(model.overlay.params in arrays))
+    filter!(p -> p.first in arrays || p.first in params, snapshots)
+    updated = copy(updated_variables)
+    for name in union(arrays, params)
+        get!(snapshots, name, nothing)
+        delete!(updated, name)
+    end
+
+    tid = variable_data[first(arrays)].trainId
+    matched = all(name -> variable_data[name].trainId == tid, arrays)
+    if matched && tid != view.matched_tid
+        view.matched_tid = tid
+        view.update_age += 1
+    end
+    if matched && (view.update_age >= view.update_every[] || any(name -> isnothing(snapshots[name]), arrays))
+        view.update_age = 0
+        view.shown_tid = tid
+        for name in arrays
+            snapshot!(snapshots, name, variable_data[name])
+            updated[name] = Set(tid)
+        end
+    end
+    for name in params
+        if variable_data[name].trainId == view.shown_tid &&
+           (isnothing(snapshots[name]) || snapshots[name].trainId != view.shown_tid)
+            snapshot!(snapshots, name, variable_data[name])
+            updated[name] = Set(view.shown_tid)
+        end
+    end
+    return updated
+end
+
+# Replace `snapshots[name]` with `store` holding a copy of its data, reusing the
+# previous copy's buffer if it fits.
+function snapshot!(snapshots, name, store)
+    values = store.data isa DimArray ? parent(store.data) : store.data
+    old = snapshots[name]
+    buffer = if isnothing(old)
+        nothing
+    elseif old.data isa DimArray
+        parent(old.data)
+    else
+        old.data
+    end
+    if !(buffer isa Array{eltype(values)}) || size(buffer) != size(values)
+        buffer = Array{eltype(values)}(undef, size(values))
+    end
+    copyto!(buffer, values)
+    snapshots[name] = @set store.data = store.data isa DimArray ? DD.rebuild(store.data, buffer) : buffer
+end
+
+# The store a view draws `name` from, nothing if there's nothing to draw yet.
+function view_store(view::SpecView, name)
+    if haskey(view.snapshots, name)
+        view.snapshots[name]
+    else
+        get(state[].client.variable_data, name, nothing)
+    end
+end
+
 # Append what to draw for one layer to `frames`. Throws a SpecError if the spec
 # doesn't fit the data. The view's fit follows its first layer.
 function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variables)
     spec = layer.spec
     name = spec.data
-    store = get(state[].client.variable_data, name, nothing)
+    store = view_store(view, name)
     if !isnothing(spec.lookup)
         push!(frames, lookup_frame(view, layer, updated_variables))
     elseif isnothing(store) || store.data isa ArrayMetadata
@@ -1995,15 +1836,11 @@ end
 # holding train `tid`. A fit is never drawn over another train's data, so layers
 # from a different train don't contribute.
 function layers_extent(view::SpecView, tid)
-    variable_data = state[].client.variable_data
     xmin, xmax = Inf, -Inf
     for layer in view.layers
         name = layer.spec.data
-        if !haskey(variable_data, name)
-            continue
-        end
-        store = variable_data[name]
-        if store.data isa ArrayMetadata || store.trainId != tid
+        store = view_store(view, name)
+        if isnothing(store) || store.data isa ArrayMetadata || store.trainId != tid
             continue
         end
         lo, hi = extrema(field_values(name, store, layer.spec.x.field))
@@ -2017,12 +1854,11 @@ end
 # over update. A matrix of parameters gives one curve per column.
 function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
     overlay = model.overlay
-    variable_data = state[].client.variable_data
     if haskey(updated_variables, overlay.params) || isempty(model.curves) ||
        any(layer -> haskey(updated_variables, layer.spec.data), view.layers)
         empty!(model.curves)
-        if haskey(variable_data, overlay.params)
-            params = variable_data[overlay.params]
+        params = view_store(view, overlay.params)
+        if !isnothing(params)
             if !(params.data isa ArrayMetadata)
                 if !(params.data isa AbstractVecOrMat{<:Real})
                     throw(SpecError("$(overlay.params): a model needs a vector or matrix of parameters"))
@@ -2240,12 +2076,13 @@ function prepare!(view::SpecView, plot::Plot, updated_variables)
     try
         message = refresh_spec!(view, plot, view.source)
         if isnothing(message)
+            updated = sync_arrays!(view, state[].client.variable_data, updated_variables)
             frames = PlotType[]
             for layer in view.layers
-                layer_frames!(frames, view, layer, updated_variables)
+                layer_frames!(frames, view, layer, updated)
             end
             for model in view.models
-                sample_curves!(view, model, updated_variables)
+                sample_curves!(view, model, updated)
                 append!(frames, model.curves)
             end
             frames
@@ -2389,6 +2226,13 @@ end
 function side_panel(view::SpecView)
     id = view.id
     client = state[].client
+    ig.AlignTextToFramePadding()
+    ig.Text("Update every:")
+    ig.SameLine()
+    ig.SetNextItemWidth(100)
+    ig.DragInt("trains##update-every-$(id)", view.update_every, 0.1f0, 1, typemax(Cint), "%d",
+               ig.ImGuiSliderFlags_AlwaysClamp)
+
     # The compression of the first layer's variable, unless it's paired with another
     if !isempty(view.layers) && isnothing(view.layers[1].spec.lookup)
         name = view.layers[1].spec.data
@@ -2509,6 +2353,8 @@ function draw_plot(plot::Plot, updated_variables)
 
         frames = prepare!(view, plot, updated_variables)
         all_empty = all(f -> f isa Empty, frames)
+        # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
+        has_image = any(layer -> !isnothing(layer.image), view.layers)
 
         if all_empty
             for f in frames
@@ -2533,7 +2379,9 @@ function draw_plot(plot::Plot, updated_variables)
                 ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view.spec, view.spec.ylabel, :y))
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, "%.9g")
-                apply_log_scales(plot)
+                if !has_image
+                    apply_log_scales(plot)
+                end
                 for f in frames
                     if !(f isa Empty)
                         plot_frame!(f)
@@ -2561,8 +2409,10 @@ function draw_plot(plot::Plot, updated_variables)
 
         if !all_empty
             autoscale_buttons(plot)
-            ig.SameLine()
-            log_scale_buttons(plot)
+            if !has_image
+                ig.SameLine()
+                log_scale_buttons(plot)
+            end
             bottom_controls(view)
         end
     end

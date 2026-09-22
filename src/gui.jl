@@ -8,27 +8,28 @@ using GLFW: GLFW
 using ModernGL
 import ImGuiNodeEditor as ne
 
-using NaNStatistics: nanpctile
-using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
-using DataStructures: CircularBuffer, OrderedDict
-using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
-    Scalar1dScan, positions, upstream_closure,
-    PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
-    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
-    FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
-    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
-include("plot_spec.jl")
-include("plotting.jl")
-
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
+using DataStructures: CircularBuffer, OrderedDict
+using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
+using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
+    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
+    Scalar1dScan, positions, upstream_closure,
+    PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
+    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
+    FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
 include("states.jl")
+
+using NaNStatistics: nanpctile
+using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
+include("plot_spec.jl")
+include("plotting.jl")
 
 using TOML: TOML
 using Sockets: Sockets
@@ -1653,7 +1654,9 @@ function draw_plots()
             # Clear before fetching so a failed decode drops the frame instead of
             # wedging the variable on a task that rethrows every frame.
             task = store.decode_task
+            variable = store.decode_variable
             store.decode_task = nothing
+            store.decode_variable = nothing
             decoded = try
                 fetch(task)
             catch err
@@ -1667,8 +1670,9 @@ function draw_plots()
                 # the just-decoded buffer and a later decode would clobber it.
                 store.spare_buffer = prev isa DimArray ? parent(prev) : prev isa Array ? prev : nothing
                 store.data = decoded
-                store.trainId = store.decode_tid
-                push!(new_tids, store.decode_tid)
+                store.trainId = variable.tid
+                apply_metadata!(store, variable)
+                push!(new_tids, variable.tid)
                 if !isnothing(store.scalar_tids)
                     empty!(store.scalar_tids)
                 end
@@ -1676,12 +1680,13 @@ function draw_plots()
         end
 
         if isready(store.updates)
-            latest_array = nothing  # (tid, payload) — only the last array frame is kept
+            latest_array = nothing  # only the last array frame is kept
             while isready(store.updates)
-                tid, x, type = take!(store.updates)
-                push!(new_tids, tid)
-                store.type = type
+                variable = take!(store.updates)
+                x = variable.data
+                push!(new_tids, variable.tid)
                 if x isa Number
+                    apply_metadata!(store, variable)
                     # Reset scalar_tids too, to preserve the parallel-length
                     # invariant — store.data may have been overwritten outside
                     # this loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
@@ -1692,28 +1697,29 @@ function draw_plots()
                         store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
                     end
                     push!(store.data, x)
-                    push!(store.scalar_tids, tid)
+                    push!(store.scalar_tids, variable.tid)
                 else
                     # Arrays are latest-wins: discard intermediate frames and
                     # decompress only the most recent one after the loop.
-                    latest_array = (tid, x)
+                    latest_array = variable
                 end
             end
 
             if !isnothing(latest_array)
-                tid, x = latest_array
+                x = latest_array.data
                 if x isa CompressedArray
                     # Skip if already decoding (drop the frame, a newer one will
                     # arrive); otherwise decode off-thread into the spare buffer.
                     if isnothing(store.decode_task)
                         ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
                         spare = store.spare_buffer
-                        store.decode_tid = tid
+                        store.decode_variable = latest_array
                         store.decode_task = Threads.@spawn decode_frame(ws, x, spare)
                     end
                 else
                     store.data = x
-                    store.trainId = tid
+                    store.trainId = latest_array.tid
+                    apply_metadata!(store, latest_array)
                     if !isnothing(store.scalar_tids)
                         empty!(store.scalar_tids)
                     end

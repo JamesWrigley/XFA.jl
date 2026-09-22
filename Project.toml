@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["JamesWrigley <james@puiterwijk.org>"]
 
 [deps]
+Accessors = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
 CImGui = "5d785b6c-b76f-510e-a07c-3070796c7e87"
 CRC32c = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 CurveFit = "5a033b19-8c74-5913-a970-47c3779ef25c"
@@ -40,6 +41,7 @@ XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
 
 [compat]
+Accessors = "0.1.45"
 CImGui = "9"
 CRC32c = "1"
 CurveFit = "1.9.1"
