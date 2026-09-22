@@ -1081,6 +1081,17 @@ end
     @test ctx.dag["f.baz"]["whole"] == Context.Dependency("f.bar")
     @test ctx.dag["f.baz"]["part"] == subvariable_dependency("f.bar", "sub")
 
+    # A Parameter field and a @Variable of the same name are ambiguous
+    @test_throws XfaContextException Context.load_from_string(raw"""
+    @Group mutable struct Foo
+        bar::Parameter{Int} = Parameter(7)
+    end
+
+    @Variable function bar(::Foo) 42 end
+
+    f = Foo()
+    """)
+
     # Referencing a non-existent member through the GroupType throws
     @test_throws XfaContextException Context.load_from_string(raw"""
     @Group struct Foo end
@@ -1124,6 +1135,33 @@ end
     foo_group = Foo(; source=Dependency("bar.sub"))
     """)
     @test ctx.dag["foo_group.foo"]["data"] == subvariable_dependency("bar", "sub")
+
+    # A group variable depending on another group's variable, directly or
+    # through a Parameter{Dependency}. `aaa` sorts first, so the producing group
+    # is registered before the consumer that references it.
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Producer end
+    @Variable function out(::Producer)
+        42
+    end
+
+    @Group mutable struct Consumer
+        upstream::Parameter{Dependency}
+    end
+    @Variable function direct(::Consumer, x -> aaa.out)
+        x
+    end
+    @Variable function viaparam(::Consumer, x -> Consumer.upstream)
+        x
+    end
+
+    aaa = Producer()
+    zzz = Consumer(; upstream=Dependency("aaa.out"))
+    """)
+    @test ctx.dag["zzz.direct"]["x"] == Context.Dependency("aaa.out")
+    @test ctx.dag["zzz.viaparam"]["x"] == Context.Dependency("aaa.out")
+    Context.rewire!(ctx)
+    @test ctx.dag["zzz.viaparam"]["x"] == Context.Dependency("aaa.out")
 
     # An unset optional Parameter{Dependency} is an optional dependency: it's
     # kept in the DAG (so the variable's positional args line up) as the
