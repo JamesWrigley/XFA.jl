@@ -455,9 +455,13 @@ function to_dict(ctx::ContextState)
             continue
         end
 
+        group_name = var_name[1:findfirst('.', var_name) - 1]
         mapping = Dict{String, String}()
         for (arg_name, dep) in @invokelatest variable_dependencies(func)
-            if dep isa Dependency && dep.kind == DepKind_GroupParameter
+            # A GroupType reference may name another of the group's variables,
+            # which has no constructor kwarg to rewrite.
+            if dep isa Dependency && dep.kind == DepKind_GroupParameter &&
+               haskey(ctx.parameters, "$(group_name).$(dep.parameter)")
                 mapping[arg_name] = dep.parameter
             end
         end
@@ -668,6 +672,9 @@ function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update
         v = @set result.tid = tid
         v = @set v.name = name
         v = @set v.subvariables = subvariables
+        if !isempty(v.plot_specs)
+            v = @set v.plot_specs = [bind_variable(spec, name) for spec in v.plot_specs]
+        end
         @set v.update_rate = update_rate
     elseif result isa Histogram1D
         VariableData(result; tid, name, subvariables, update_rate)
@@ -1348,8 +1355,8 @@ function rewire!(ctx::ContextState)
                 # reference, which load_from_module promotes to the group
                 # variable once all groups are known; here they already are.
                 if resolved isa Dependency && resolved.kind == DepKind_Subvariable &&
-                   haskey(ctx.dag, "$(resolved.parent).$(resolved.name)")
-                    resolved = Dependency("$(resolved.parent).$(resolved.name)")
+                   haskey(ctx.dag, resolved.name)
+                    resolved = Dependency(resolved.name)
                 end
                 deps[arg_name] = resolved
             end
@@ -1424,7 +1431,7 @@ function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), 
         using XfaContext.DimensionalData
 
         using XfaContext
-        using XfaContext: VariableData, PlotSpec, LayerSpec, Parameter, Meta
+        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta
     end
     @eval ctx_module $init_expr
 
@@ -1568,6 +1575,14 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 continue
             end
 
+            # A field and a variable of the same name would both claim
+            # "$group_name.$field", and GroupType.<name> would silently mean the
+            # field.
+            field = Symbol(nameof(variable_func))
+            if hasfield(group_type, field) && fieldtype(group_type, field) <: Union{Parameter, Displayable}
+                throw(XfaContextException("'$(field)' is both a field and a @Variable of $(nameof(group_type))"))
+            end
+
             dag_deps = _get_deps(variable_func, parameters)
 
             # Replace the group dependency that originally contained the group
@@ -1588,18 +1603,6 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
             group_var_name = "$group_name.$func_name"
             dag[group_var_name] = dag_deps
             functions[group_var_name] = variable_func
-
-            # Dependencies of the form `foo.bar` are saved as
-            # SubvariableDependency's. But these may also refer to groups, so
-            # now we go through all the dependencies for all variables and check
-            # if any are actually group variables instead of subvariables.
-            for var_deps in values(dag)
-                for i in eachindex(var_deps)
-                    if var_deps[i] == subvariable_dependency(group_name, func_name)
-                        var_deps[i] = Dependency(group_var_name)
-                    end
-                end
-            end
         end
 
         # And add all the parameters too
@@ -1643,6 +1646,16 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
         if isempty(deps) || !(deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group)
             name = string(nameof(func))
             throw(XfaContextException("'$(name)' must belong to a Group to be a valid Input"))
+        end
+    end
+
+    # A `foo.bar` dependency is parsed as a subvariable reference, but it may
+    # name a group variable. All the groups are registered by now.
+    for var_deps in values(dag)
+        for (arg_name, dep) in var_deps
+            if dep isa Dependency && dep.kind == DepKind_Subvariable && haskey(dag, dep.name)
+                var_deps[arg_name] = Dependency(dep.name)
+            end
         end
     end
 

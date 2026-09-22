@@ -142,7 +142,8 @@ mutable struct HeatmapContext
 
     # 1D RGBA8 texture (256 entries) built from ImPlot's active colormap
     colormap_tex::GLuint
-    colormap_id::Int  # which ImPlot colormap is currently uploaded (-1 = none)
+    # Which ImPlot colormap is uploaded (-2 = none; -1 is a valid ImPlot value)
+    colormap_id::Int
 
     # Fullscreen quad geometry for FBO rendering
     vao::GLuint
@@ -222,7 +223,7 @@ function create_heatmap_context()
         shader_float, shader_int,
         loc_min_float, loc_max_float, loc_heatmap_float, loc_colormap_float, loc_log_float,
         loc_min_int, loc_max_int, loc_heatmap_int, loc_colormap_int, loc_log_int,
-        colormap_tex, -1,
+        colormap_tex, -2,
         vao, vbo,
     )
 end
@@ -237,9 +238,6 @@ function destroy!(ctx::HeatmapContext)
     glDeleteVertexArrays(1, vao_ref)
     glDeleteBuffers(1, vbo_ref)
 end
-
-# ImPlot colormap index of the custom Turbo colormap, set by add_turbo_colormap()
-TURBO_COLORMAP::Cint = -1
 
 # Google's Turbo colormap as packed ABGR colors, from
 # https://gist.github.com/mikhailov-work/ee72ba4191942acecc03fe6da94fc73f
@@ -278,11 +276,16 @@ const TURBO_COLORMAP_DATA = ig.ImU32[
     0xff010b92, 0xff010a8e, 0xff02098b, 0xff020888, 0xff020785, 0xff020681, 0xff02057e, 0xff03047a,
 ]
 
-# Register the Turbo colormap with ImPlot. Must be called after
-# ImPlot.CreateContext().
-function add_turbo_colormap()
-    global TURBO_COLORMAP = ImPlot.AddColormap("Turbo", TURBO_COLORMAP_DATA,
-                                               length(TURBO_COLORMAP_DATA), false)
+# The ImPlot index of the Turbo colormap, registering it on first use. The index
+# lives in the ImPlot context, so it can't be cached in a global: AddColormap
+# returns -1 (ImPlot's "current colormap") if the name is already taken.
+function turbo_colormap()
+    cmap = ImPlot.GetColormapIndex("Turbo")
+    if cmap == -1
+        cmap = ImPlot.AddColormap("Turbo", TURBO_COLORMAP_DATA,
+                                  length(TURBO_COLORMAP_DATA), false)
+    end
+    return Cint(cmap)
 end
 
 """
@@ -357,6 +360,8 @@ mutable struct GPUHeatmap
     # Whether the texture was last rendered in log mode — toggling this in the
     # UI forces a re-render with fresh percentiles.
     log_scale::Bool
+    # The colormap it was last rendered with.
+    colormap::Cint
 end
 
 function GPUHeatmap()
@@ -372,7 +377,7 @@ function GPUHeatmap()
     glGenFramebuffers(1, fbo_ref)
     fbo = fbo_ref[]
 
-    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false)
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false, -1)
 end
 
 function destroy!(h::GPUHeatmap)
@@ -482,9 +487,9 @@ end
 # two-pass histogram: pass 1 gets the value range, pass 2 bins the sample, then
 # we walk the cumulative counts to the target rank with linear in-bin
 # interpolation. Non-finite samples are dropped (and non-positive ones in log
-# mode, which have no real log). Percentiles are invariant under a monotonic
-# transform, so log mode just log10's the two final results rather than
-# transforming every sample. `buf` is the reused bin-count scratch.
+# mode, which have no real log). Log mode bins log10 of the samples, since
+# uniform linear bins lump the low decades of wide-range data into the first
+# bin. `buf` is the reused bin-count scratch.
 # Returns `(0.0, 1.0)` if no usable samples; always returns finite, log10-space
 # values when `log` is set (matching the colormap's domain).
 const PCTILE_NBINS = 2048
@@ -520,10 +525,10 @@ function sampled_pctile!(buf::Vector{Int32}, data::AbstractMatrix, log::Bool=fal
     if !isfinite(lo) || !isfinite(hi)
         return (0.0, 1.0)
     end
+    if log
+        lo, hi = log10(lo), log10(hi)
+    end
     if !(hi > lo)
-        if log
-            return hi > 0 ? (log10(hi), log10(hi)) : (0.0, 1.0)
-        end
         return (lo, lo)
     end
 
@@ -535,9 +540,10 @@ function sampled_pctile!(buf::Vector{Int32}, data::AbstractMatrix, log::Bool=fal
     scale = PCTILE_NBINS / (hi - lo)
     total = 0
     @inbounds for i in 1:stride:n
-        x = data[i]
+        x = Float64(data[i])
         if log ? (isfinite(x) && x > 0) : isfinite(x)
-            b = clamp(floor(Int, (x - lo) * scale) + 1, 1, PCTILE_NBINS)
+            v = log ? log10(x) : x
+            b = clamp(floor(Int, (v - lo) * scale) + 1, 1, PCTILE_NBINS)
             buf[b] += Int32(1)
             total += 1
         end
@@ -550,7 +556,7 @@ function sampled_pctile!(buf::Vector{Int32}, data::AbstractMatrix, log::Bool=fal
     binwidth = (hi - lo) / PCTILE_NBINS
     p1 = quantile_at(buf, 0.01 * total, lo, hi, binwidth)
     p99 = quantile_at(buf, 0.99 * total, lo, hi, binwidth)
-    return log ? (log10(p1), log10(p99)) : (p1, p99)
+    return (p1, p99)
 end
 
 # Walk the histogram's cumulative counts to the target rank, interpolating
@@ -642,8 +648,8 @@ const FIT_TYPES = ["None", "Line", "Gaussian", "erf", "sin"]
     const edit_buf::Ref{Cdouble} = Ref(0.0)
 end
 
-# Per-layer fit configuration. Used by both VariableLayer and CorrelationLayer
-# so the side-panel fitting UI can be driven from a single struct.
+# Per-view fit configuration, kept in one struct so the side-panel fitting UI
+# can be driven from it. The fit follows the view's first layer.
 @kwdef mutable struct FitSettings
     fit_type::Ref{Cint} = Ref(Cint(0))
     live::Bool = true
@@ -786,7 +792,7 @@ end
 
 # Overlay the fitted model curve on the current ImPlot plot, if any, and the
 # draggable X restriction band when enabled. Moving the band requests a refit.
-function draw_fit_overlay(layer_id, fit::FitSettings)
+function draw_fit_overlay(view_id, fit::FitSettings)
     name = FIT_TYPES[fit.fit_type[] + 1]
     if !isempty(fit.model_x)
         ImPlot.PlotLine("$(name) fit", fit.model_x, fit.model_y)
@@ -799,7 +805,7 @@ function draw_fit_overlay(layer_id, fit::FitSettings)
             fit.requested = true
         end
         col = ROI_COLORS[3]
-        new_roi = drag_roi(fit.x_roi, layer_id, "fit-restrict-x",
+        new_roi = drag_roi(fit.x_roi, view_id, "fit-restrict-x",
                            ImVec4(col.x, col.y, col.z, 0.75), Ref(false))
         if !isnothing(new_roi) && new_roi != fit.x_roi
             fit.x_roi = new_roi
@@ -810,9 +816,8 @@ end
 
 # --- Plot type payloads ---
 #
-# A `PlotType` is what a Layer hands back from `prepare!` each frame — a
-# description of what to draw. The Plot widget dispatches on the concrete type
-# to pick the right ImPlot primitive.
+# A `PlotType` is what a SpecView's `prepare!` hands back each frame, drawn by
+# `plot_frame!`.
 
 abstract type PlotType end
 
@@ -824,20 +829,18 @@ struct Line <: PlotType
     ys
     label::String
     style::Symbol
-    # Explicit per-series color, used by SpecLayer fan-out (e.g. a gradient over
-    # grouped series). nothing lets ImPlot cycle its palette as usual.
+    # Explicit per-series color, used when a color channel groups a layer into
+    # series. nothing lets ImPlot cycle its palette as usual.
     color::Maybe{ig.ImVec4}
+    opacity::Float64
 end
-Line(xs, ys, label, style) = Line(xs, ys, label, style, nothing)
 
-# Bar series. Separate from Line because it uses PlotBars/PlotBarsH and carries
-# a bar_size. Covers histograms and any vector drawn as bars.
+# Bar series, for histograms and any vector drawn as bars.
 struct Bars <: PlotType
     xs
     ys
     label::String
     bar_size::Float64
-    horizontal::Bool
 end
 
 # Shaded band + central line, sharing one legend entry. Used for binned
@@ -850,61 +853,20 @@ struct Band <: PlotType
     label::String
 end
 
-# Colormapped 2D data, rendered via the GPU heatmap path. `x_axis`/`y_axis`
+# Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
 # may be nothing (defaults to pixel coords).
 struct Image <: PlotType
     data
     x_axis::Maybe{AbstractVector}
     y_axis::Maybe{AbstractVector}
+    gpu::GPUHeatmap
 end
 
-# Layer has nothing to draw this frame. `message` (when non-empty) is surfaced
-# in place of the plot — used for "types must match" and similar diagnostics.
+# Nothing to draw this frame. `message`, when non-empty, is shown in place of
+# the plot.
 struct Empty <: PlotType
     message::String
 end
-
-# --- Layer interface ---
-#
-# A Layer is a self-contained piece of a Plot. Plot owns Vector{Layer} and
-# orchestrates BeginPlot/EndPlot; each layer contributes one PlotType and
-# optional overlays/side-panel/bottom-row widgets.
-
-abstract type Layer end
-
-# Called once per frame before BeginPlot. May mutate caches, run fits, push
-# subscriptions, etc. Returns what to draw this frame.
-function prepare! end
-
-# Called inside BeginPlot/EndPlot, after the primitive has been drawn.
-# Used for overlays that need plot-space coords: fit curves, ROI rects, hover
-# annotations.
-draw_overlay(::Layer, plot, ::PlotType) = nothing
-
-# Widgets rendered at the top of the plot window, above the plot area. Used by
-# layers that own variable-selection UI (e.g. correlation X/Y combos).
-top_controls(::Layer, plot) = nothing
-
-# Collapsing header(s) for this layer in the side panel.
-side_panel(::Layer, plot) = nothing
-
-# Extra widgets in the bottom row, right of the shared autoscale/log buttons.
-bottom_controls(::Layer, plot) = nothing
-
-# (xlabel, ylabel) this layer wants. Either may be "" to abstain — first
-# non-empty wins at the plot level.
-axis_labels(::Layer) = ("", "")
-
-# Title contribution for the window — same first-wins rule.
-window_title(::Layer) = ""
-
-# Reset any accumulated state (e.g. paired history) when the user hits Clear.
-# Default: no-op.
-clear_layer_data!(::Layer) = nothing
-
-# Unique-within-plot string used as the `##` suffix on this layer's ImGui
-# widgets. Assigned when the layer is added to a Plot.
-function layer_id end
 
 # Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
 # the colormap shader; `display_min`/`display_max` are the visible range
@@ -925,6 +887,7 @@ end
 @kwdef mutable struct ImageState
     const fixed_aspect::Ref{Bool} = Ref(true)
     const log_scale::Ref{Bool} = Ref(false)
+    colormap::Cint = turbo_colormap()
     const colorbar::ColorbarState = ColorbarState()
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
 end
@@ -1021,141 +984,135 @@ function swap!(m::VariableTrainmatcher)
     m.accu = nothing
 end
 
-# A layer that subscribes to one variable and renders its data as a line, bar
-# series, scalar buffer, or matrix. `image` is allocated lazily the first time
-# the variable's data turns out to be a matrix.
-@kwdef mutable struct VariableLayer <: Layer
-    const name::String
-    const layer_id_str::String
-    const k::Ref{Cfloat} = Ref(Cfloat(-1))
-    const fit::FitSettings = FitSettings()
+# Where a SpecView's spec comes from, see refresh_spec!.
+abstract type SpecSource end
+
+# The default plot of a variable, with model curves drawn over it if any.
+struct DefaultSpec <: SpecSource
+    variable::String
+    models::Vector{ModelOverlay}
+end
+
+# A correlation of two variables picked in the plot window, authored as a
+# lookup spec (see correlation_spec).
+@kwdef struct CorrelationSpec <: SpecSource
+    # The X and Y variables, "" until there's one to pick.
+    selected::Vector{String} = ["", ""]
+    # Refreshed each frame from client.variable_data; used by the X/Y combos.
+    variable_names::Vector{String} = String[]
+end
+
+# A plot that `variable` advertises under `name`, besides its default one.
+struct AdvertisedSpec <: SpecSource
+    variable::String
+    name::String
+end
+
+# One layer of a SpecView. `image` is the state of a rect layer, `matcher` pairs
+# the two variables of a lookup layer, and `series` holds the series a color
+# channel groups the data into, rebuilt when it updates.
+@kwdef mutable struct ViewLayer
+    const spec::LayerSpec
     image::Maybe{ImageState} = nothing
+    const matcher::Maybe{VariableTrainmatcher} = nothing
+    const series::Vector{PlotType} = PlotType[]
+end
+
+# The curves of one of a spec's models, resampled when its parameters update.
+@kwdef struct ViewModel
+    overlay::ModelOverlay
+    xs::Vector{Float64} = Float64[]
+    curves::Vector{PlotType} = PlotType[]
+end
+
+# Renders a PlotSpec from its source. Synthesised specs are rebuilt whenever
+# the source's `spec_key` changes.
+@kwdef mutable struct SpecView
+    const source::SpecSource
+    const id::String
+    const fit::FitSettings = FitSettings()
+    spec_key::Any = nothing
+    spec::Maybe{PlotSpec} = nothing
+    const layers::Vector{ViewLayer} = ViewLayer[]
+    const models::Vector{ViewModel} = ViewModel[]
+    const subscribed::Set{String} = Set{String}()
+    # Bin width of the trainId lookup layers, 0 for a plain scatter. Follows the
+    # X variable's hint until the user touches it.
+    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
+    resolution_touched::Bool = false
     # ROI parameter values updated locally during a drag, keyed by parameter
     # name. Flushed to the engine when the user releases the mouse so we don't
     # flood it with per-frame updates.
     const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
 end
 
-layer_id(layer::VariableLayer) = layer.layer_id_str
-
-# A layer that pairs samples from two variables on matching train IDs and
-# renders the result as a scatter (or shaded band when binning is enabled).
-@kwdef mutable struct CorrelationLayer <: Layer
-    const layer_id_str::String
-    const x_var::Ref{Cint} = Ref(Cint(0))
-    const y_var::Ref{Cint} = Ref(Cint(0))
-    const selected::Vector{String} = ["", ""]
-    const subscribed::Vector{String} = ["", ""]
-    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
-    resolution_touched::Bool = false
-    const matcher::VariableTrainmatcher = VariableTrainmatcher()
-    const fit::FitSettings = FitSettings()
-    # Refreshed each frame from client.variable_data; used by the X/Y combos.
-    const variable_names::Vector{String} = String[]
-end
-
-layer_id(layer::CorrelationLayer) = layer.layer_id_str
-
-# Renders an engine-advertised PlotSpec. Each frame it looks up the latest spec
-# (by name) from the source variable's store, reconciles its subscriptions to
-# the variables the spec references, and emits one or more PlotTypes. A
-# LayerSpec whose grouping channel (color) is bound to a dimension fans out into
-# one series per coordinate along that dim. Self-contained: it owns its
-# subscriptions and tracks the spec across trains. If the variable stops
-# advertising the spec, the last-seen layout is kept (the plot freezes rather
-# than vanishing). Frame drawing reuses the generic plot_frame! methods.
-@kwdef mutable struct SpecLayer <: Layer
-    const layer_id_str::String
-    const source_var::String           # variable advertising the spec
-    const spec_name::String            # which PlotSpec, by name
-    const subscribed::Set{String} = Set{String}()
-    image::Maybe{ImageState} = nothing
-    last_spec::Maybe{PlotSpec} = nothing
-    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
-end
-
-layer_id(layer::SpecLayer) = layer.layer_id_str
-
+# A plot window: the view, and the state of the plot's axes. `id` is also the
+# `##` suffix of the view's widgets.
 @kwdef mutable struct Plot
     const id::String
+    const view::SpecView
     const open::Ref{Bool} = Ref(true)
     const autoscale_x::Ref{Bool} = Ref(true)
     const autoscale_y::Ref{Bool} = Ref(true)
     const log_x::Ref{Bool} = Ref(false)
     const log_y::Ref{Bool} = Ref(false)
     const show_side_panel::Ref{Bool} = Ref(false)
-    const layers::Vector{Layer} = Layer[]
     dock_id::UInt32 = 0
 end
 
-# Build a VariableLayer wired to `name`, suitable for pushing onto `plot.layers`.
-# Seeds k from any existing subscription and bumps the subscription count.
-function VariableLayer(plot::Plot, name::AbstractString)
-    subscriptions = state[].client.subscriptions
-    k = haskey(subscriptions, name) ? subscriptions[name].k : -1.0
-    layer = VariableLayer(;
-        name = String(name),
-        layer_id_str = "$(plot.id)/$(name)/$(length(plot.layers) + 1)",
-        k = Ref(Cfloat(k)),
-    )
-    subscribe_variable(state[], name; k)
-    return layer
+# The default plot of variable `name`, with `models` drawn over it.
+function variable_plot(name::AbstractString, counter::Integer, models = ModelOverlay[])
+    id = "$(name)##plot-$(counter)"
+    view = SpecView(; source = DefaultSpec(String(name), models), id)
+    # Its spec can only be synthesised once there's data
+    subscribe_variable(state[], name)
+    push!(view.subscribed, name)
+    return Plot(; id, view)
 end
 
-# Convenience: a Plot containing a single VariableLayer for `name`.
-variable_plot(name::AbstractString, counter::Int) =
-    variable_plot(name, "$(name)##plot-$(counter)")
-
-function variable_plot(name::AbstractString, id::String, dock_id = 0)
-    plot = Plot(; id, dock_id = UInt32(dock_id))
-    push!(plot.layers, VariableLayer(plot, name))
-    return plot
-end
-
-# A Plot containing a single CorrelationLayer.
+# A plot correlating two variables picked in its window.
 function correlation_plot(counter::Integer)
     id = "CorrelationPlot##plot-$(counter)"
-    plot = Plot(; id)
-    push!(plot.layers, CorrelationLayer(; layer_id_str = "$(id)/correlation/1"))
-    return plot
+    Plot(; id, view = SpecView(; source = CorrelationSpec(), id))
 end
 
-function correlation_plot(id::String, dock_id::Integer = 0)
-    plot = Plot(; id, dock_id = UInt32(dock_id))
-    push!(plot.layers, CorrelationLayer(; layer_id_str = "$(id)/correlation/1"))
-    return plot
+# A plot of the spec `variable` advertises as `name`.
+function spec_plot(variable::AbstractString, name::AbstractString, counter::Integer)
+    id = "$(variable)/$(name)##plot-$(counter)"
+    Plot(; id, view = SpecView(; source = AdvertisedSpec(String(variable), String(name)), id))
 end
 
-# A Plot rendering a single advertised PlotSpec (by name) from `source_var`.
-function spec_plot(source_var::AbstractString, spec_name::AbstractString, counter::Integer)
-    id = "$(source_var)/$(spec_name)##plot-$(counter)"
-    plot = Plot(; id)
-    push!(plot.layers, SpecLayer(; layer_id_str = "$(id)/spec",
-                                 source_var = String(source_var), spec_name = String(spec_name)))
-    return plot
-end
+Base.close(plot::Plot) = close(plot.view)
 
-function Base.close(plot::Plot)
-    for layer in plot.layers
-        close(layer)
+function Base.close(image::ImageState)
+    if !isnothing(image.gpu_heatmap)
+        destroy!(image.gpu_heatmap)
+        image.gpu_heatmap = nothing
     end
 end
 
-function Base.close(layer::VariableLayer)
-    if !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap)
-        destroy!(layer.image.gpu_heatmap)
-        layer.image.gpu_heatmap = nothing
+function Base.close(view::SpecView)
+    for layer in view.layers
+        if !isnothing(layer.image)
+            close(layer.image)
+        end
     end
-    unsubscribe_variable(state[], layer.name)
+    for name in view.subscribed
+        unsubscribe_variable(state[], name)
+    end
+    empty!(view.subscribed)
 end
 
-function Base.close(layer::CorrelationLayer)
-    unsubscribe_variable(state[], layer.subscribed[1])
-    unsubscribe_variable(state[], layer.subscribed[2])
-end
+clear_plot(plot::Plot) = clear_paired_data!(plot.view)
 
-clear_plot(plot::Plot) = foreach(clear_layer_data!, plot.layers)
-clear_layer_data!(layer::CorrelationLayer) = empty!(layer.matcher)
+# Drop the history paired by the lookup layers.
+function clear_paired_data!(view::SpecView)
+    for layer in view.layers
+        if !isnothing(layer.matcher)
+            empty!(layer.matcher)
+        end
+    end
+end
 
 function check_plot_interaction!(plot)
     io = ig.GetIO()
@@ -1299,8 +1256,7 @@ end
 #
 # Hovering: drag a handle to set clip_min/clip_max (disables colorbar
 # autoscale); mouse wheel zooms the display range around the cursor.
-function interactive_colorbar(layer::VariableLayer, size::ImVec2)
-    img = layer.image
+function interactive_colorbar(img::ImageState, id, size::ImVec2)
     cb = img.colorbar
     display_min = cb.display_min[]
     display_max = cb.display_max[]
@@ -1309,7 +1265,6 @@ function interactive_colorbar(layer::VariableLayer, size::ImVec2)
     # In log mode all four refs hold log10(value); the colorbar renders that
     # space directly and tick labels read as exponents.
     tick_format = img.log_scale[] ? "1e%g" : "%g"
-    id = layer.layer_id_str
 
     # ColormapScale itself does not consume mouse input — without an overlay
     # button, clicks fall through to the parent window and start a window
@@ -1321,7 +1276,7 @@ function interactive_colorbar(layer::VariableLayer, size::ImVec2)
                          display_min, display_max,
                          size, tick_format,
                          ImPlot.ImPlotColormapScaleFlags_None,
-                         TURBO_COLORMAP)
+                         img.colormap)
     rect_min = ig.GetItemRectMin()
     rect_max = ig.GetItemRectMax()
 
@@ -1455,9 +1410,9 @@ end
 
 # Draw the drag handles for an ROI in colour `col`, setting `held` while any of
 # them is being dragged. Returns the updated ROI, or nothing if it didn't move.
-function drag_roi(roi::RectROI, layer_id, param_name, col, held)
+function drag_roi(roi::RectROI, view_id, param_name, col, held)
     x1, y1, x2, y2 = map(v -> Ref(Cdouble(v)), roi_corners(roi))
-    id = int32_hash(layer_id, param_name)
+    id = int32_hash(view_id, param_name)
     if ImPlot.DragRect(id, x1, y1, x2, y2, col, 0, C_NULL, C_NULL, held)
         xlo, xhi = minmax(x1[], x2[])
         ylo, yhi = minmax(y1[], y2[])
@@ -1470,7 +1425,7 @@ end
 # Like matplotlib's axvspan/axhspan: a shaded band spanning the plot with a
 # draggable line on each edge and a point in the centre that moves the whole
 # band. NoFit keeps the handles from stretching an auto-fitted axis.
-function drag_roi(roi::LinearROI, layer_id, param_name, col, held)
+function drag_roi(roi::LinearROI, view_id, param_name, col, held)
     x1, y1, x2, y2 = roi_corners(roi)
     p1 = ImPlot.PlotToPixels(x1, y1)
     p2 = ImPlot.PlotToPixels(x2, y2)
@@ -1486,8 +1441,8 @@ function drag_roi(roi::LinearROI, layer_id, param_name, col, held)
     hi = Ref(Cdouble(roi.start + roi.length))
     held_hi = Ref(false)
     flags = ImPlot.ImPlotDragToolFlags_NoFit
-    moved_lo = drag_line(int32_hash(layer_id, param_name), lo, col, 1, flags, C_NULL, C_NULL, held)
-    moved_hi = drag_line(int32_hash(layer_id, param_name * ".hi"), hi, col, 1, flags, C_NULL, C_NULL, held_hi)
+    moved_lo = drag_line(int32_hash(view_id, param_name), lo, col, 1, flags, C_NULL, C_NULL, held)
+    moved_hi = drag_line(int32_hash(view_id, param_name * ".hi"), hi, col, 1, flags, C_NULL, C_NULL, held_hi)
 
     # Centre handle, like ImPlot's DragPoint but following the mouse only along
     # the ROI's axis so the band can't be dragged sideways.
@@ -1495,7 +1450,7 @@ function drag_roi(roi::LinearROI, layer_id, param_name, col, held)
     cy = (y1 + y2) / 2
     center = ImPlot.PlotToPixels(cx, cy)
     grab = 4
-    center_id = ig.GetID(int32_hash(layer_id, param_name * ".center"))
+    center_id = ig.GetID(int32_hash(view_id, param_name * ".center"))
     ig.igKeepAliveID(center_id)
     bb = ig.ImRect(ImVec2(center.x - grab, center.y - grab), ImVec2(center.x + grab, center.y + grab))
     hovered_center = Ref(false)
@@ -1534,31 +1489,37 @@ function roi_bounds(::PlotType)
     (limits.X.Min, limits.X.Max, limits.Y.Min, limits.Y.Max)
 end
 
-# Draw the @display ROIs of a layer's variable (for a SpecLayer, the variable
-# advertising the spec) once per layer, after its frames.
-draw_roi_overlays(::Layer, frames) = nothing
-function draw_roi_overlays(layer::Union{VariableLayer, SpecLayer}, frames)
+# Drawn once per view, after its frames: the fit curve and the spec's ROIs. An
+# ROI edits the parameter it's named after, which also holds its live value; the
+# spec only gives the initial extent of an unassigned one.
+function draw_view_overlays(view::SpecView, frames)
     i = findfirst(f -> !(f isa Empty), frames)
+    if any(f -> f isa Union{Line, Bars, Band}, frames)
+        draw_fit_overlay(view.id, view.fit)
+    end
     if isnothing(i)
         return
     end
     x_min, x_max, y_min, y_max = roi_bounds(frames[i])
-    var_name = layer isa VariableLayer ? layer.name : layer.source_var
     client = state[].client
-    displays = get(client.context.displays, var_name, String[])
-    pending = layer.pending_roi_updates
-    for (idx, param_name) in enumerate(displays)
+    pending = view.pending_roi_updates
+    for (idx, roi_param) in enumerate(view.spec.rois)
+        param_name = roi_param.name
         param = get(client.context.parameters, param_name, nothing)
         if isnothing(param) || !(param.value isa AbstractROI)
             continue
         end
         roi = param.value
         if !isassigned(roi)
-            roi = default_roi(roi, x_min, x_max, y_min, y_max, idx)
+            if isassigned(roi_param.initial) && typeof(roi_param.initial) == typeof(roi)
+                roi = roi_param.initial
+            else
+                roi = default_roi(roi, x_min, x_max, y_min, y_max, idx)
+            end
         end
         col = ROI_COLORS[mod1(idx, length(ROI_COLORS))]
         held = Ref(false)
-        new_roi = drag_roi(roi, layer.layer_id_str, param_name,
+        new_roi = drag_roi(roi, view.id, param_name,
                            ImVec4(col.x, col.y, col.z, 0.75), held)
         if !isnothing(new_roi)
             roi = new_roi
@@ -1734,7 +1695,7 @@ function draw_fitting_settings(id, fit::FitSettings)
     end
 end
 
-# --- VariableLayer methods ---
+# --- SpecView methods ---
 
 # A dim's lookup values as a plain vector, but only when ForwardOrdered; an
 # unordered/reverse lookup wouldn't map onto the stretched heatmap axis, so
@@ -1749,71 +1710,560 @@ function forward_lookup(data::DimArray, dim::Int)
     end
 end
 
-function prepare!(layer::VariableLayer, plot::Plot, updated_variables)
-    client = state[].client
-    store = get(client.variable_data, layer.name, nothing)
-    if isnothing(store) || store.data isa ArrayMetadata
-        return Empty("Waiting for data: $(layer.name)")
-    end
+# Everything a variable's default spec depends on, it's only resynthesised when
+# this changes.
+function default_spec_key(store)
     data = store.data
-    if !(eltype(data) <: Real)
-        return Empty("$(layer.name): unsupported array type $(typeof(data))")
-    elseif isempty(data)
-        return Empty("$(layer.name): array has length 0, nothing to plot")
+    dim_names = data isa DimArray ? DD.name(DD.dims(data)) : ()
+    (data isa CircularBuffer, ndims(data), dim_names, store.title, store.xlabel, store.ylabel,
+     store.plot_type, store.fixed_aspect)
+end
+
+# The spec of a variable's default plot: a scalar history against its train IDs,
+# a vector as a line (or pre-binned bars for a histogram), a matrix as an image.
+function default_spec(name, store)
+    data = store.data
+    dim_field(dim, plain) = data isa DimArray ? string(DD.name(DD.dims(data, dim))) : plain
+
+    layer = if data isa AbstractMatrix
+        color = ChannelDef("value", FieldType_Quantitative, "value", false, "turbo", false)
+        LayerSpec(String(name), Mark_Rect, 1.0, axis_channel(dim_field(2, "col"), store.xlabel),
+                  axis_channel(dim_field(1, "row"), store.ylabel), color, nothing)
+    else
+        histogram = store.plot_type == :histogram
+        x_field = data isa CircularBuffer ? "trainId" : dim_field(1, "index")
+        LayerSpec(String(name), histogram ? Mark_Bar : Mark_Line, 1.0,
+                  axis_channel(x_field, store.xlabel, histogram), axis_channel("value", store.ylabel),
+                  nothing, nothing)
     end
+    PlotSpec(name, [layer]; title = store.title, fixed_aspect = store.fixed_aspect)
+end
 
-    was_updated = haskey(updated_variables, layer.name)
+# A quantitative x/y channel. An empty label hides the axis title.
+axis_channel(field, label, binned = false) = ChannelDef(field, FieldType_Quantitative, label, false, nothing, binned)
 
-    if data isa AbstractVector
-        xs, ys = if data isa CircularBuffer
-            store.scalar_tids_cache, store.scalar_data_cache
-        elseif !isnothing(store.x_axis)
-            store.x_axis, data
+# The spec correlating variable `y_name` against `x_name`: a lookup pulls X's
+# values into Y's layer, matched per train for scalar histories and per element
+# for vectors.
+function correlation_spec(x_name, y_name, x, y)
+    key = x.type == VariableType_Scalar ? LookupKey_TrainId : LookupKey_Index
+    layer = LayerSpec(String(y_name), Mark_Point, 0.5, axis_channel("x", x.title), axis_channel("value", y.title),
+                      nothing, LookupTransform(key, String(x_name), "value", "x"))
+    PlotSpec("", [layer])
+end
+
+# The number of the dim a field names: a DimArray's dim by name, or any array's
+# by position (index, or row/col). nothing if there's no such dim.
+function field_dim(data, field)
+    if data isa DimArray && DD.hasdim(data, Symbol(field))
+        DD.dimnum(data, Symbol(field))
+    else
+        findfirst(==(field), ndims(data) == 1 ? ("index",) : ("row", "col"))
+    end
+end
+
+# The values of a field of a 1D variable: `value` is the data itself, `trainId`
+# the train IDs of a scalar history, and a dim gives its coordinates.
+function field_values(name, store, field)
+    data = store.data
+    if field == "value"
+        if data isa CircularBuffer
+            store.scalar_data_cache
         elseif data isa DimArray
-            parent(lookup(data)[1]), parent(data)
+            parent(data)
         else
-            1:length(data), data
+            data
         end
-        if fit_wanted(layer.fit, was_updated)
-            compute_fit!(layer.fit, ys, xs)
-        end
-        if store.plot_type === :histogram
+    elseif field == "trainId" && data isa CircularBuffer
+        store.scalar_tids_cache
+    elseif !(data isa CircularBuffer) && field_dim(data, field) == 1
+        dim_values(store, 1)
+    else
+        throw(SpecError("$(name) has no field \"$(field)\""))
+    end
+end
+
+# The coordinates along a dim: the variable's explicit axis (`x_axis` runs along
+# a matrix's columns), else a DimArray's lookup, else the index range.
+function dim_values(store, dim)
+    data = store.data
+    explicit = ndims(data) == 1 || dim == 2 ? store.x_axis : store.y_axis
+    if !isnothing(explicit)
+        explicit
+    elseif data isa DimArray
+        parent(lookup(data)[dim])
+    else
+        1:size(data, dim)
+    end
+end
+
+# The ImPlot colormap of a Vega scheme.
+function scheme_colormap(scheme)
+    colormap = choice(COLOR_SCHEMES, scheme, "scale.scheme")
+    isnothing(colormap) ? turbo_colormap() : Cint(colormap)
+end
+
+# The colour of series `i` of `n`: sampled along the scheme for a quantitative
+# channel (viridis by default), else the i'th of a categorical palette.
+function series_color(channel::ChannelDef, i, n)
+    if channel.type == FieldType_Quantitative
+        # Start at 0.2, the dark end of most schemes vanishes against the background
+        t = Cfloat(0.2 + 0.8 * (i - 1) / max(n - 1, 1))
+        ImPlot.SampleColormap(t, scheme_colormap(something(channel.scheme, "viridis")))
+    elseif isnothing(channel.scheme)
+        ImPlot.GetColormapColor(i - 1)
+    else
+        ImPlot.GetColormapColor(i - 1, scheme_colormap(channel.scheme))
+    end
+end
+
+# The (x, color) dims of a multi-series layer, whose color channel groups a
+# matrix by one dim. An x on `index` runs along each series, i.e. the other dim.
+function series_dims(name, data, spec::LayerSpec)
+    color_dim = field_dim(data, spec.color.field)
+    x_dim = if spec.x.field == "index" && data isa AbstractMatrix && !isnothing(color_dim)
+        3 - color_dim
+    else
+        field_dim(data, spec.x.field)
+    end
+    if !(data isa AbstractMatrix) || isnothing(x_dim) || isnothing(color_dim) || x_dim == color_dim ||
+       spec.y.field != "value"
+        throw(SpecError("$(name): a color channel needs a matrix, with x and color on its two dims " *
+                        "and y on \"value\""))
+    end
+    x_dim, color_dim
+end
+
+# Rebuild `series` as one frame per coordinate along the color dim. The colours
+# are always explicit: ImPlot caches an item's colour and only refreshes it when
+# given one, so a changed scheme wouldn't show otherwise.
+function group_series!(series, name, store, spec::LayerSpec)
+    data = store.data
+    x_dim, color_dim = series_dims(name, data, spec)
+    xs = dim_values(store, x_dim)
+    coords = dim_values(store, color_dim)
+    values = data isa DimArray ? parent(data) : data
+
+    empty!(series)
+    for (i, ys) in enumerate(eachslice(values; dims = color_dim))
+        title = something(spec.color.title, "")
+        label = isempty(title) ? string(coords[i]) : "$(title) - $(coords[i])"
+        if spec.mark == Mark_Bar
             bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
-            return Bars(xs, ys, store.title, bar_size, false)
+            push!(series, Bars(xs, ys, label, bar_size))
         else
-            style = length(ys) == 1 ? :scatter : :line
-            return Line(xs, ys, store.title, style)
+            style = spec.mark == Mark_Point ? :scatter : :line
+            push!(series, Line(xs, ys, label, style, series_color(spec.color, i, length(coords)), spec.opacity))
         end
-    elseif data isa AbstractMatrix
-        if isnothing(layer.image)
-            layer.image = ImageState()
-            layer.image.fixed_aspect[] = store.fixed_aspect
-        end
-        # Fall back to a 2D DimArray's dim lookups for the axes (dim 1 → Y/rows,
-        # dim 2 → X/cols), mirroring the vector branch above.
-        xax = if !isnothing(store.x_axis)
-            store.x_axis
-        elseif data isa DimArray
-            forward_lookup(data, 2)
-        else
-            nothing
-        end
-        yax = if !isnothing(store.y_axis)
-            store.y_axis
-        elseif data isa DimArray
-            forward_lookup(data, 1)
-        else
-            nothing
-        end
-        return prepare_heatmap!(layer.image, data, xax, yax, was_updated)
     end
-    return Empty("$(layer.name): unsupported data shape $(typeof(data))")
+end
+
+# The coordinates of an image axis: the variable's explicit axis, else a
+# DimArray's lookup, else nothing for pixel indices.
+function image_axis(explicit, data, dim)
+    if !isnothing(explicit)
+        explicit
+    elseif data isa DimArray
+        forward_lookup(data, dim)
+    else
+        nothing
+    end
+end
+
+# The (x, y) variables a lookup layer pairs.
+function lookup_pair(spec::LayerSpec)
+    if spec.x.field == spec.lookup.as
+        spec.lookup.dataset, spec.data
+    else
+        spec.data, spec.lookup.dataset
+    end
+end
+
+# What to draw for a layer pairing two variables: their matched samples, or for
+# scalars a band around the binned means once there's a binning resolution.
+function lookup_frame(view::SpecView, layer::ViewLayer, updated_variables)
+    spec = layer.spec
+    x_name, y_name = lookup_pair(spec)
+    variable_data = state[].client.variable_data
+    if !haskey(variable_data, x_name) || !haskey(variable_data, y_name)
+        Empty("Waiting for data: $(x_name), $(y_name)")
+    else
+        x = variable_data[x_name]
+        y = variable_data[y_name]
+        by_train = spec.lookup.key == LookupKey_TrainId
+        if x.type != y.type || x.type != (by_train ? VariableType_Scalar : VariableType_Vector)
+            throw(SpecError("$(y_name): a lookup on $(by_train ? "trainId pairs scalars" : "index pairs vectors"), " *
+                            "got a $(var_type_label(x)) and a $(var_type_label(y))"))
+        end
+
+        m = layer.matcher
+        data_updated = if by_train
+            appended = ingest_scalar!(m, x, y, updated_variables, x_name, y_name)
+            # Follow the X variable's hint (0 for none) until the user sets a resolution
+            if !view.resolution_touched
+                view.binning_resolution[] = Cfloat(x.bin_resolution)
+            end
+            rebinned = set_resolution!(m, view.binning_resolution[])
+            appended || rebinned
+        else
+            ingest_vector!(m, x, y)
+        end
+
+        if length(m.x_data) != length(m.y_data)
+            Empty("Cannot correlate vectors of different lengths ($(length(m.x_data)) vs $(length(m.y_data))).")
+        else
+            # Only scalars are ever binned
+            binned = !isnothing(m.accu)
+            xs = binned ? positions(m.accu, 1) : m.x_data
+            ys = binned ? parent(m.accu.mean) : m.y_data
+            if layer === view.layers[1] && fit_wanted(view.fit, data_updated)
+                compute_fit!(view.fit, ys, xs; sigma = binned ? 1 ./ sqrt.(parent(m.accu.count)) : nothing)
+            end
+
+            label = "$(x_name) vs $(y_name)"
+            if binned
+                half = 0.5 .* parent(m.accu.std)
+                Band(xs, ys .- half, ys .+ half, ys, label)
+            else
+                style = spec.mark == Mark_Point ? :scatter : :line
+                Line(xs, ys, label, style, nothing, spec.opacity)
+            end
+        end
+    end
+end
+
+# Append what to draw for one layer to `frames`. Throws a SpecError if the spec
+# doesn't fit the data. The view's fit follows its first layer.
+function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variables)
+    spec = layer.spec
+    name = spec.data
+    store = get(state[].client.variable_data, name, nothing)
+    if !isnothing(spec.lookup)
+        push!(frames, lookup_frame(view, layer, updated_variables))
+    elseif isnothing(store) || store.data isa ArrayMetadata
+        push!(frames, Empty("Waiting for data: $(name)"))
+    elseif !(eltype(store.data) <: Real)
+        push!(frames, Empty("$(name): unsupported array type $(typeof(store.data))"))
+    elseif isempty(store.data)
+        push!(frames, Empty("$(name): array has length 0, nothing to plot"))
+    elseif spec.mark == Mark_Rect
+        data = store.data
+        # Rows run along Y and columns along X
+        if !(data isa AbstractMatrix) || field_dim(data, spec.x.field) != 2 ||
+           field_dim(data, spec.y.field) != 1
+            throw(SpecError("$(name): a rect needs a matrix, with x on its second dim and y on its first"))
+        end
+        push!(frames, prepare_heatmap!(layer.image, data, image_axis(store.x_axis, data, 2),
+                                       image_axis(store.y_axis, data, 1), haskey(updated_variables, name)))
+    elseif !isnothing(spec.color)
+        if haskey(updated_variables, name) || isempty(layer.series)
+            group_series!(layer.series, name, store, spec)
+        end
+        append!(frames, layer.series)
+    elseif !(store.data isa AbstractVector)
+        throw(SpecError("$(name): only a rect or a color channel can draw $(ndims(store.data))D data"))
+    else
+        xs = field_values(name, store, spec.x.field)
+        ys = field_values(name, store, spec.y.field)
+        if length(xs) != length(ys)
+            push!(frames, Empty("$(name): x has $(length(xs)) values but y has $(length(ys))"))
+        else
+            if layer === view.layers[1] && fit_wanted(view.fit, haskey(updated_variables, name))
+                compute_fit!(view.fit, ys, xs)
+            end
+            if spec.mark == Mark_Bar
+                bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
+                push!(frames, Bars(xs, ys, store.title, bar_size))
+            else
+                # A lone point would be an invisible line
+                style = spec.mark == Mark_Point || length(ys) == 1 ? :scatter : :line
+                push!(frames, Line(xs, ys, store.title, style, nothing, spec.opacity))
+            end
+        end
+    end
+end
+
+# The function of a model with the parameters `p`, which come in a fixed order.
+function model_function(func, name, p)
+    if length(p) != 4
+        throw(SpecError("$(name): a gaussian takes 4 parameters (y0, A, μ, σ), got $(length(p))"))
+    end
+    x -> gaussian(x, p[1], p[2], p[3], p[4])
+end
+
+# The x extent a model is sampled over: the union of the extents of the layers
+# holding train `tid`. A fit is never drawn over another train's data, so layers
+# from a different train don't contribute.
+function layers_extent(view::SpecView, tid)
+    variable_data = state[].client.variable_data
+    xmin, xmax = Inf, -Inf
+    for layer in view.layers
+        name = layer.spec.data
+        if !haskey(variable_data, name)
+            continue
+        end
+        store = variable_data[name]
+        if store.data isa ArrayMetadata || store.trainId != tid
+            continue
+        end
+        lo, hi = extrema(field_values(name, store, layer.spec.x.field))
+        xmin = min(xmin, Float64(lo))
+        xmax = max(xmax, Float64(hi))
+    end
+    return xmin, xmax
+end
+
+# Resample a model's curves when its parameters or any of the layers it's drawn
+# over update. A matrix of parameters gives one curve per column.
+function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
+    overlay = model.overlay
+    variable_data = state[].client.variable_data
+    if haskey(updated_variables, overlay.params) || isempty(model.curves) ||
+       any(layer -> haskey(updated_variables, layer.spec.data), view.layers)
+        empty!(model.curves)
+        if haskey(variable_data, overlay.params)
+            params = variable_data[overlay.params]
+            if !(params.data isa ArrayMetadata)
+                if !(params.data isa AbstractVecOrMat{<:Real})
+                    throw(SpecError("$(overlay.params): a model needs a vector or matrix of parameters"))
+                end
+                xmin, xmax = layers_extent(view, params.trainId)
+                values = params.data isa DimArray ? parent(params.data) : params.data
+                title = something(overlay.title, overlay.params)
+
+                if isfinite(xmin) && isfinite(xmax) && xmin != xmax
+                    for (k, p) in enumerate(eachcol(values))
+                        ys = Float64[]
+                        sample_model!(model.xs, ys, model_function(overlay.func, overlay.params, p), xmin, xmax, 200)
+                        label = size(values, 2) == 1 ? title : "$(title) $(k)"
+                        push!(model.curves, Line(model.xs, ys, label, :line, nothing, 1.0))
+                    end
+                end
+            end
+        end
+    end
+end
+
+# The matcher for a lookup layer replacing `previous`. It keeps the history when
+# it still pairs the same two variables, swapped over if they traded places.
+function carry_matcher(previous::Maybe{ViewLayer}, spec::LayerSpec)
+    if isnothing(previous) || isnothing(previous.matcher) ||
+       previous.spec.lookup.key != spec.lookup.key
+        nothing
+    elseif lookup_pair(previous.spec) == lookup_pair(spec)
+        previous.matcher
+    elseif reverse(lookup_pair(previous.spec)) == lookup_pair(spec)
+        swap!(previous.matcher)
+        previous.matcher
+    else
+        nothing
+    end
+end
+
+# Swap in a new spec. A layer keeps the state of the one it replaces where that
+# still applies (the image, the paired history), so they survive e.g. a title
+# change.
+function set_spec!(view::SpecView, plot::Plot, spec::PlotSpec)
+    wanted = datasets(spec)
+    for name in setdiff(wanted, view.subscribed)
+        # Lossy compression would mangle the fine detail of a matrix drawn as lines
+        as_lines = any(layer -> layer.data == name && layer.mark != Mark_Rect && !isnothing(layer.color),
+                       spec.layers)
+        subscribe_variable(state[], name; k = as_lines ? 0.0 : nothing)
+    end
+    for name in setdiff(view.subscribed, wanted)
+        unsubscribe_variable(state[], name)
+    end
+    empty!(view.subscribed)
+    union!(view.subscribed, wanted)
+
+    old = copy(view.layers)
+    empty!(view.layers)
+    for (i, layer_spec) in enumerate(spec.layers)
+        previous = i <= length(old) ? old[i] : nothing
+        image = nothing
+        if layer_spec.mark == Mark_Rect
+            if isnothing(previous) || isnothing(previous.image)
+                # The spec only seeds the toggles
+                image = ImageState(; fixed_aspect = Ref(spec.fixed_aspect), log_scale = Ref(layer_spec.color.log))
+            else
+                image = previous.image
+                previous.image = nothing
+            end
+            # The colormap follows the spec, Vega-Lite's default heatmap scheme is viridis
+            image.colormap = scheme_colormap(something(layer_spec.color.scheme, "viridis"))
+        end
+        matcher = nothing
+        if !isnothing(layer_spec.lookup)
+            matcher = carry_matcher(previous, layer_spec)
+            if isnothing(matcher)
+                matcher = VariableTrainmatcher()
+                # A new X variable goes back to following its resolution hint
+                if isnothing(previous) || isnothing(previous.matcher) ||
+                   lookup_pair(previous.spec)[1] != lookup_pair(layer_spec)[1]
+                    view.resolution_touched = false
+                end
+            end
+        end
+        push!(view.layers, ViewLayer(; spec = layer_spec, image, matcher))
+    end
+    for layer in old
+        if !isnothing(layer.image)
+            close(layer.image)
+        end
+    end
+
+    empty!(view.models)
+    for overlay in spec.models
+        push!(view.models, ViewModel(; overlay))
+    end
+
+    # The spec's scales only seed the log toggles
+    if isnothing(view.spec)
+        plot.log_x[] = any(layer -> layer.x.log, spec.layers)
+        plot.log_y[] = any(layer -> layer.y.log, spec.layers)
+    end
+    view.spec = spec
+end
+
+# The label the data gives a channel whose title the spec leaves open: what the
+# variable's default plot shows along it, or the title of a paired variable.
+function data_label(layer::LayerSpec, channel::ChannelDef)
+    paired = !isnothing(layer.lookup)
+    name = paired && channel.field == layer.lookup.as ? layer.lookup.dataset : layer.data
+    store = get(state[].client.variable_data, name, nothing)
+    if isnothing(store) || store.data isa ArrayMetadata
+        ""
+    elseif paired
+        store.title
+    elseif channel.field == "value"
+        store.data isa AbstractMatrix ? store.title : store.ylabel
+    elseif store.data isa AbstractMatrix
+        # xlabel runs along a matrix's columns and ylabel along its rows
+        dim = layer.mark == Mark_Rect ? field_dim(store.data, channel.field) : series_dims(name, store.data, layer)[1]
+        dim == 2 ? store.xlabel : store.ylabel
+    else
+        store.xlabel
+    end
+end
+
+# The label of an axis (:x or :y): the spec's, else the data's for the first
+# layer that leaves it open.
+function axis_label(spec::PlotSpec, label, axis::Symbol)
+    if isnothing(label)
+        i = findfirst(layer -> isnothing(getfield(layer, axis).title), spec.layers)
+        isnothing(i) ? "" : data_label(spec.layers[i], getfield(spec.layers[i], axis))
+    else
+        label
+    end
+end
+
+# The parameters `variable` shows on its plot with @display.
+displayed_parameters(variable) = get(state[].client.context.displays, variable, String[])
+
+# `spec` with the @display ROIs of `variable` and `models` added.
+function extend_spec(spec::PlotSpec, variable, models)
+    parameters = state[].client.context.parameters
+    rois = copy(spec.rois)
+    for name in displayed_parameters(variable)
+        if haskey(parameters, name) && parameters[name].value isa AbstractROI
+            push!(rois, RoiParam(name, parameters[name].value))
+        end
+    end
+    PlotSpec(spec.name, spec.layers; spec.title, spec.xlabel, spec.ylabel, spec.fixed_aspect,
+             rois, models = vcat(spec.models, models))
+end
+
+# Bring the view's spec up to date with its source, rebuilding it if the key of
+# what it depends on changed. Returns a message to show instead of the plot when
+# there's no spec to draw yet.
+function refresh_spec!(view::SpecView, plot::Plot, source::DefaultSpec)
+    store = get(state[].client.variable_data, source.variable, nothing)
+    if isnothing(store) || store.data isa ArrayMetadata
+        "Waiting for data: $(source.variable)"
+    elseif ndims(store.data) > 2
+        "$(source.variable): unsupported data shape $(typeof(store.data))"
+    else
+        key = (default_spec_key(store), displayed_parameters(source.variable))
+        if key != view.spec_key
+            spec = default_spec(source.variable, store)
+            set_spec!(view, plot, extend_spec(spec, source.variable, source.models))
+            view.spec_key = key
+        end
+        nothing
+    end
+end
+
+function refresh_spec!(view::SpecView, plot::Plot, source::CorrelationSpec)
+    variable_data = state[].client.variable_data
+    x_name, y_name = source.selected
+    if isempty(source.variable_names)
+        "No scalar or vector variables available to correlate."
+    elseif !haskey(variable_data, x_name) || !haskey(variable_data, y_name)
+        "Waiting for data: $(x_name), $(y_name)"
+    else
+        x = variable_data[x_name]
+        y = variable_data[y_name]
+        if x.type != y.type
+            "Both variables must have the same type to correlate against each other."
+        else
+            key = (x_name, y_name, x.type, x.title, y.title)
+            if key != view.spec_key
+                set_spec!(view, plot, correlation_spec(x_name, y_name, x, y))
+                view.spec_key = key
+            end
+            nothing
+        end
+    end
+end
+
+# Follows the spec as it changes from train to train, with the @display ROIs of
+# the variable advertising it. If the variable stops advertising it the view
+# keeps the last one seen.
+function refresh_spec!(view::SpecView, plot::Plot, source::AdvertisedSpec)
+    store = get(state[].client.variable_data, source.variable, nothing)
+    i = isnothing(store) ? nothing : findfirst(spec -> spec.name == source.name, store.plot_specs)
+    if !isnothing(i)
+        key = (store.plot_specs[i], displayed_parameters(source.variable))
+        if key != view.spec_key
+            set_spec!(view, plot, extend_spec(store.plot_specs[i], source.variable, ModelOverlay[]))
+            view.spec_key = key
+        end
+    end
+    isnothing(view.spec) ? "Waiting for plot spec: $(source.name)" : nothing
+end
+
+# Called once per frame before BeginPlot: brings the spec up to date and returns
+# what to draw, which is a lone Empty with a message if there's nothing yet or
+# the spec doesn't fit the data.
+function prepare!(view::SpecView, plot::Plot, updated_variables)
+    try
+        message = refresh_spec!(view, plot, view.source)
+        if isnothing(message)
+            frames = PlotType[]
+            for layer in view.layers
+                layer_frames!(frames, view, layer, updated_variables)
+            end
+            for model in view.models
+                sample_curves!(view, model, updated_variables)
+                append!(frames, model.curves)
+            end
+            frames
+        else
+            PlotType[Empty(message)]
+        end
+    catch err
+        if err isa SpecError
+            PlotType[Empty(err.msg)]
+        else
+            rethrow()
+        end
+    end
 end
 
 # Upload `data` to the GPU heatmap held by `img` and colormap it, returning the
 # Image frame to draw. Reuses cached GPU resources across frames; only re-uploads
-# and rescales when the data changed, log mode toggled, or on first use. Shared
-# by VariableLayer and SpecLayer.
+# and rescales when the data changed, log mode toggled, or on first use.
 function prepare_heatmap!(img::ImageState, data, x_axis, y_axis, was_updated)
     cb = img.colorbar
     ctx = get_heatmap_context()
@@ -1822,11 +2272,11 @@ function prepare_heatmap!(img::ImageState, data, x_axis, y_axis, was_updated)
         img.gpu_heatmap = GPUHeatmap()
     end
     gpu = img.gpu_heatmap
-    update_colormap!(ctx, TURBO_COLORMAP)
+    update_colormap!(ctx, img.colormap)
 
     log = img.log_scale[]
     log_changed = !needs_initial_upload && gpu.log_scale != log
-    if was_updated || needs_initial_upload || log_changed
+    if was_updated || needs_initial_upload || log_changed || gpu.colormap != img.colormap
         if was_updated || needs_initial_upload
             upload_data!(gpu, data)
         end
@@ -1845,8 +2295,9 @@ function prepare_heatmap!(img::ImageState, data, x_axis, y_axis, was_updated)
         end
         render_colormapped!(gpu, ctx, cb.clip_min[], cb.clip_max[], log)
         gpu.log_scale = log
+        gpu.colormap = img.colormap
     end
-    return Image(data, x_axis, y_axis)
+    return Image(data, x_axis, y_axis, gpu)
 end
 
 # Derive plot-space axis bounds for an Image frame.
@@ -1868,11 +2319,13 @@ function image_bounds(frame::Image)
     return (rows, cols, x_min, x_max, y_min, y_max)
 end
 
-# Generic line/bar drawing, shared by every layer (CorrelationLayer overrides
-# Line with its own alpha-blended scatter). `frame.color`, when set, fixes the
-# series colour — used by SpecLayer fan-out; otherwise ImPlot cycles its palette.
-function plot_frame!(::Layer, frame::Line)
-    spec = isnothing(frame.color) ? ImPlot.ImPlotSpec() : ImPlot.ImPlotSpec(; LineColor=frame.color)
+# Draws a frame with its ImPlot primitive.
+function plot_frame!(frame::Line)
+    spec = if isnothing(frame.color)
+        ImPlot.ImPlotSpec(; FillAlpha=frame.opacity)
+    else
+        ImPlot.ImPlotSpec(; LineColor=frame.color, FillAlpha=frame.opacity)
+    end
     if frame.style === :scatter
         ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec)
     else
@@ -1880,16 +2333,23 @@ function plot_frame!(::Layer, frame::Line)
     end
 end
 
-function plot_frame!(::Layer, frame::Bars)
-    # Black bar outlines; horizontal orientation via the bars flag.
-    flags = frame.horizontal ? ImPlot.ImPlotBarsFlags_Horizontal : ImPlot.ImPlotBarsFlags_None
-    spec = ImPlot.ImPlotSpec(; LineColor=ig.ImVec4(0, 0, 0, 1), Flags=Cint(flags))
+function plot_frame!(frame::Bars)
+    # Black bar outlines
+    spec = ImPlot.ImPlotSpec(; LineColor=ig.ImVec4(0, 0, 0, 1))
     ImPlot.PlotBars(frame.label, frame.xs, frame.ys; bar_size=frame.bar_size, spec)
 end
 
-function draw_image_frame(gpu, frame::Image)
-    _, _, x_min, x_max, y_min, y_max = image_bounds(frame)
-    tex_ref = ig.ImTextureRef(ig.ImTextureID(gpu.output_tex))
+function plot_frame!(frame::Band)
+    # Same label_id ties the band and line to one legend entry so ImPlot
+    # gives them matching colors.
+    ImPlot.PlotShaded(frame.label, frame.xs, frame.lower, frame.upper; spec=ImPlot.ImPlotSpec(; FillAlpha=0.5))
+    ImPlot.PlotLine(frame.label, frame.xs, frame.line_ys)
+end
+
+# The image, with a readout of the pixel under the mouse.
+function plot_frame!(frame::Image)
+    rows, cols, x_min, x_max, y_min, y_max = image_bounds(frame)
+    tex_ref = ig.ImTextureRef(ig.ImTextureID(frame.gpu.output_tex))
 
     # ImGui 1.92's GL backend binds a linear sampler for every draw, which
     # overrides our texture's GL_NEAREST filter and blurs the heatmap when
@@ -1914,17 +2374,7 @@ function draw_image_frame(gpu, frame::Image)
     if set_linear != C_NULL
         ig.AddCallback(draw_list, set_linear)
     end
-end
 
-plot_frame!(layer::Union{VariableLayer, SpecLayer}, frame::Image) = draw_image_frame(layer.image.gpu_heatmap, frame)
-
-function draw_overlay(layer::VariableLayer, ::Plot, ::Union{Line, Bars})
-    draw_fit_overlay(layer.layer_id_str, layer.fit)
-    draw_variable_overlays(layer.name)
-end
-
-function draw_overlay(layer::VariableLayer, ::Plot, frame::Image)
-    rows, cols, x_min, x_max, y_min, y_max = image_bounds(frame)
     if ImPlot.IsPlotHovered()
         mouse = ImPlot.GetPlotMousePos()
         j = floor(Int, (mouse.x - x_min) / (x_max - x_min) * cols) + 1
@@ -1936,45 +2386,61 @@ function draw_overlay(layer::VariableLayer, ::Plot, frame::Image)
     end
 end
 
-function side_panel(layer::VariableLayer, ::Plot)
+function side_panel(view::SpecView)
+    id = view.id
     client = state[].client
-    store = get(client.variable_data, layer.name, nothing)
-    isnothing(store) && return
-    is_scalar = store.data isa CircularBuffer
-    is_matrix = store.data isa AbstractMatrix
-    id = layer.layer_id_str
-    if !is_scalar && ig.CollapsingHeader("Compression##$(id)")
-        draw_compression_settings(id, layer.name, layer.k, store)
+    # The compression of the first layer's variable, unless it's paired with another
+    if !isempty(view.layers) && isnothing(view.layers[1].spec.lookup)
+        name = view.layers[1].spec.data
+        store = get(client.variable_data, name, nothing)
+        if !isnothing(store) && !(store.data isa CircularBuffer) && ig.CollapsingHeader("Compression##$(id)")
+            draw_compression_settings(id, name, Ref(Cfloat(client.subscriptions[name].k)), store)
+        end
     end
-    if is_matrix
+    # The fit follows the first layer, and there's nothing to fit on an image
+    if !isempty(view.layers) && view.layers[1].spec.mark == Mark_Rect
         ig.BeginDisabled()
         ig.CollapsingHeader("Fitting##$(id)")
         ig.EndDisabled()
     else
-        draw_fitting_settings(id, layer.fit)
+        draw_fitting_settings(id, view.fit)
     end
 end
 
-function bottom_controls(layer::VariableLayer, ::Plot)
-    client = state[].client
-    store = get(client.variable_data, layer.name, nothing)
-    isnothing(store) && return
-    data = store.data
-    id = layer.layer_id_str
-    if data isa CircularBuffer
+function bottom_controls(view::SpecView)
+    id = view.id
+    variable_data = state[].client.variable_data
+
+    # Scalar histories accumulate, along with what was paired from them
+    histories = [variable_data[name] for name in view.subscribed
+                 if haskey(variable_data, name) && variable_data[name].data isa CircularBuffer]
+    if !isempty(histories)
         ig.SameLine()
         if ig.Button("Clear##$(id)")
-            clear_variable_data(store)
+            foreach(clear_variable_data, histories)
+            clear_paired_data!(view)
         end
     end
-    if data isa AbstractMatrix && !isnothing(layer.image)
-        image_controls(layer.image, id)
+
+    if any(layer -> !isnothing(layer.matcher) && layer.spec.lookup.key == LookupKey_TrainId, view.layers)
+        ig.SameLine()
+        ig.SetNextItemWidth(135)
+        if ig.DragFloat("Binning resolution##$(id)",
+                        view.binning_resolution, 0.01f0,
+                        0.0f0, typemax(Cfloat), "%.12f",
+                        ig.ImGuiSliderFlags_AlwaysClamp)
+            view.resolution_touched = true
+        end
+    end
+
+    image = image_state(view)
+    if !isnothing(image)
+        image_controls(image, id)
     end
 end
 
-# Bottom-row image controls (fixed aspect / auto colorbar / log colormap),
-# shared by any layer that owns an ImageState. Each is prefixed with SameLine
-# so it sits alongside the shared autoscale/log buttons.
+# Bottom-row image controls (fixed aspect / auto colorbar / log colormap). Each
+# is prefixed with SameLine so it sits alongside the autoscale/log buttons.
 function image_controls(img::ImageState, id::String)
     ig.SameLine()
     ig.Checkbox("Fixed aspect##$(id)", img.fixed_aspect)
@@ -1986,18 +2452,6 @@ function image_controls(img::ImageState, id::String)
     end
     ig.SameLine()
     ig.Checkbox("Log colormap##$(id)", img.log_scale)
-end
-
-function axis_labels(layer::VariableLayer)
-    client = state[].client
-    store = get(client.variable_data, layer.name, nothing)
-    isnothing(store) ? ("", "") : (store.xlabel, store.ylabel)
-end
-
-function window_title(layer::VariableLayer)
-    client = state[].client
-    store = get(client.variable_data, layer.name, nothing)
-    isnothing(store) ? "" : store.title
 end
 
 # Begin the plot-area child, shrunk to leave room for the side panel when open.
@@ -2030,59 +2484,36 @@ function end_plot_area!(plot, side_panel_width, plot_area_h, draw_panel)
     end
 end
 
-# Locate the (at most one) image layer in this plot. Returns nothing if no
-# layer has allocated an ImageState.
-function image_layer(plot::Plot)
-    for L in plot.layers
-        if (L isa VariableLayer || L isa SpecLayer) && !isnothing(L.image)
-            return L
-        end
-    end
-    return nothing
+# The state of the first image the view draws, if any. It's the one the colorbar
+# and the image controls act on.
+function image_state(view::SpecView)
+    i = findfirst(layer -> !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap), view.layers)
+    isnothing(i) ? nothing : view.layers[i].image
 end
-
-# A layer's prepare! may return a single PlotType or several (SpecLayer fans a
-# grouped LayerSpec out into one series per slice). Normalise to a vector so the
-# draw loop can treat every layer uniformly.
-as_frames(f::PlotType) = PlotType[f]
-as_frames(fs::AbstractVector{<:PlotType}) = fs
 
 function draw_plot(plot::Plot, updated_variables)
     ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
     side_panel_width = 320f0
     colorbar_width = 100f0
 
-    # Build window title from the first layer that has an opinion.
-    title = ""
-    for L in plot.layers
-        t = window_title(L)
-        if !isempty(t)
-            title = t
-            break
-        end
-    end
+    view = plot.view
+    title = isnothing(view.spec) ? "" : view.spec.title
     win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
 
     if ig.Begin(win_id, plot.open)
         plot.dock_id = ig.GetWindowDockID()
 
-        for L in plot.layers
-            top_controls(L, plot)
-        end
+        top_controls(view.source, view.id)
 
         plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
 
-        # One frame list per layer, parallel to plot.layers.
-        layer_frames = [as_frames(prepare!(L, plot, updated_variables)) for L in plot.layers]
-        all_empty = all(f isa Empty for fs in layer_frames for f in fs)
+        frames = prepare!(view, plot, updated_variables)
+        all_empty = all(f -> f isa Empty, frames)
 
         if all_empty
-            for fs in layer_frames
-                for f in fs
-                    if f isa Empty && !isempty(f.message)
-                        ig.TextWrapped(f.message)
-                        shown_any = true
-                    end
+            for f in frames
+                if !isempty(f.message)
+                    ig.TextWrapped(f.message)
                 end
             end
         else
@@ -2091,48 +2522,33 @@ function draw_plot(plot::Plot, updated_variables)
             # Reserve room on the right for the side-panel tab button.
             tab_w = 14.0f0
             spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
-            img_layer = image_layer(plot)
-            reserved = tab_w + spacing + (isnothing(img_layer) ? 0f0 : colorbar_width + spacing)
+            img = image_state(view)
+            reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
             plot_width = max(plot_size.x - reserved, 100f0)
-            plot_flags = (!isnothing(img_layer) && img_layer.image.fixed_aspect[]) ?
+            plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
                          ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
 
-            # First non-empty axis label wins.
-            xlabel = ylabel = ""
-            for L in plot.layers
-                xl, yl = axis_labels(L)
-                if isempty(xlabel)
-                    xlabel = xl
-                end
-                if isempty(ylabel)
-                    ylabel = yl
-                end
-            end
-
             if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
-                ImPlot.SetupAxis(ImPlot.ImAxis_X1, xlabel)
-                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, ylabel)
+                ImPlot.SetupAxis(ImPlot.ImAxis_X1, axis_label(view.spec, view.spec.xlabel, :x))
+                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view.spec, view.spec.ylabel, :y))
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, "%.9g")
                 apply_log_scales(plot)
-                for (L, fs) in zip(plot.layers, layer_frames)
-                    for f in fs
-                        if !(f isa Empty)
-                            plot_frame!(L, f)
-                            draw_overlay(L, plot, f)
-                        end
+                for f in frames
+                    if !(f isa Empty)
+                        plot_frame!(f)
                     end
-                    draw_roi_overlays(L, fs)
                 end
+                draw_view_overlays(view, frames)
                 check_plot_interaction!(plot)
                 ImPlot.EndPlot()
             end
 
-            if !isnothing(img_layer)
+            if !isnothing(img)
                 ig.SameLine()
-                if interactive_colorbar(img_layer, ImVec2(colorbar_width, plot_size.y))
-                    img = img_layer.image
+                if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y))
                     cb = img.colorbar
+                    update_colormap!(get_heatmap_context(), img.colormap)
                     render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
                                         cb.clip_min[], cb.clip_max[], img.log_scale[])
                 end
@@ -2141,16 +2557,13 @@ function draw_plot(plot::Plot, updated_variables)
             side_panel_tab(plot, tab_w, plot_size.y)
         end
 
-        end_plot_area!(plot, side_panel_width, plot_area_h,
-                       () -> foreach(L -> side_panel(L, plot), plot.layers))
+        end_plot_area!(plot, side_panel_width, plot_area_h, () -> side_panel(view))
 
         if !all_empty
             autoscale_buttons(plot)
             ig.SameLine()
             log_scale_buttons(plot)
-            for L in plot.layers
-                bottom_controls(L, plot)
-            end
+            bottom_controls(view)
         end
     end
 
@@ -2170,28 +2583,20 @@ function var_type_label(store)
     end
 end
 
-function var_combo(label, selected::Ref{Cint}, var_names, variable_data)
-    n = length(var_names)
-    preview = if n > 0
-        name = var_names[selected[] + 1]
-        type_label = var_type_label(variable_data[name])
-        "$(name)  ($(type_label))"
+# A combo picking one of `var_names`. Returns the selected name.
+function var_combo(label, selected, var_names, variable_data)
+    preview = if haskey(variable_data, selected)
+        "$(selected)  ($(var_type_label(variable_data[selected])))"
     else
-        ""
+        selected
     end
     ig.SetNextItemWidth(250)
 
-    changed = false
     if ig.BeginCombo(label, preview)
-        for (i, name) in enumerate(var_names)
-            if variable_data[name].type ∉ (VariableType_Scalar, VariableType_Vector)
-                continue
-            end
-
-            is_selected = selected[] == i - 1
+        for name in var_names
+            is_selected = name == selected
             if ig.Selectable(name, is_selected)
-                selected[] = i - 1
-                changed = true
+                selected = name
             end
 
             ig.SameLine()
@@ -2205,360 +2610,42 @@ function var_combo(label, selected::Ref{Cint}, var_names, variable_data)
         ig.EndCombo()
     end
 
-    return changed
+    return selected
 end
 
-# --- CorrelationLayer methods ---
+# Widgets at the top of the plot window, above the plot area.
+top_controls(::SpecSource, id) = nothing
 
-function top_controls(layer::CorrelationLayer, ::Plot)
-    client = state[].client
-    variable_data = client.variable_data
+# The X/Y variable pickers. The view rebuilds its spec from the selection, see
+# refresh_spec!.
+function top_controls(source::CorrelationSpec, id)
+    variable_data = state[].client.variable_data
 
-    empty!(layer.variable_names)
+    empty!(source.variable_names)
     for (name, variable) in variable_data
         if variable.type in (VariableType_Scalar, VariableType_Vector)
-            push!(layer.variable_names, name)
+            push!(source.variable_names, name)
         end
     end
-    sort!(layer.variable_names)
+    sort!(source.variable_names)
 
-    n_variables = length(layer.variable_names)
-    if n_variables > 0
-        # Seed the selection on first use, then keep x_var/y_var pointing at the
-        # selected variable by name. A context reload reorders/filters
-        # variable_names, so re-derive the index every frame; if the selected
-        # variable is temporarily absent, leave the index clamped without
-        # touching `selected` so the choice is restored once it reappears.
-        if isempty(layer.selected[1])
-            layer.selected[1] = layer.variable_names[clamp(layer.x_var[], 0, n_variables - 1) + 1]
+    # Seed the selection on first use. A selected variable that goes away (e.g.
+    # over a context reload) stays selected, so it's restored once it reappears.
+    if !isempty(source.variable_names)
+        for i in eachindex(source.selected)
+            if isempty(source.selected[i])
+                source.selected[i] = source.variable_names[1]
+            end
         end
-        if isempty(layer.selected[2])
-            layer.selected[2] = layer.variable_names[clamp(layer.y_var[], 0, n_variables - 1) + 1]
-        end
-        x_idx = findfirst(==(layer.selected[1]), layer.variable_names)
-        y_idx = findfirst(==(layer.selected[2]), layer.variable_names)
-        layer.x_var[] = isnothing(x_idx) ? clamp(layer.x_var[], 0, n_variables - 1) : x_idx - 1
-        layer.y_var[] = isnothing(y_idx) ? clamp(layer.y_var[], 0, n_variables - 1) : y_idx - 1
     end
 
-    id = layer.layer_id_str
+    # The paired history follows the swap, see carry_matcher
     if ig.Button("Swap axes##$(id)")
-        layer.x_var[], layer.y_var[] = layer.y_var[], layer.x_var[]
-        layer.selected[1], layer.selected[2] = layer.selected[2], layer.selected[1]
-        swap!(layer.matcher)
-        reverse!(layer.subscribed)
+        reverse!(source.selected)
     end
 
     ig.SameLine()
-    x_changed = var_combo("X##$(id)", layer.x_var, layer.variable_names, variable_data)
+    source.selected[1] = var_combo("X##corr-x-$(id)", source.selected[1], source.variable_names, variable_data)
     ig.SameLine()
-    y_changed = var_combo("Y##$(id)", layer.y_var, layer.variable_names, variable_data)
-
-    # Record the user's choice as the new anchor.
-    if x_changed
-        layer.selected[1] = layer.variable_names[layer.x_var[] + 1]
-        layer.resolution_touched = false
-    end
-    if y_changed
-        layer.selected[2] = layer.variable_names[layer.y_var[] + 1]
-    end
-    if x_changed || y_changed
-        empty!(layer.matcher)
-    end
-end
-
-function prepare!(layer::CorrelationLayer, ::Plot, updated_variables)
-    client = state[].client
-    variable_data = client.variable_data
-    n_variables = length(layer.variable_names)
-    if n_variables == 0
-        return Empty("No scalar or vector variables available to correlate.")
-    end
-
-    x_name = layer.variable_names[layer.x_var[] + 1]
-    y_name = layer.variable_names[layer.y_var[] + 1]
-    x = variable_data[x_name]
-    y = variable_data[y_name]
-
-    if x_name != layer.subscribed[1]
-        unsubscribe_variable(state[], layer.subscribed[1])
-        subscribe_variable(state[], x_name)
-        layer.subscribed[1] = x_name
-    end
-    if y_name != layer.subscribed[2]
-        unsubscribe_variable(state[], layer.subscribed[2])
-        subscribe_variable(state[], y_name)
-        layer.subscribed[2] = y_name
-    end
-
-    if x.type != y.type
-        return Empty("Both variables must have the same type to correlate against each other.")
-    end
-
-    m = layer.matcher
-    label = "$(x_name) vs $(y_name)"
-    if x.type == VariableType_Scalar
-        data_updated = ingest_scalar!(m, x, y, updated_variables, x_name, y_name)
-        # Follow the X variable's hint (0 for none) until the user sets a resolution
-        if !layer.resolution_touched
-            layer.binning_resolution[] = Cfloat(x.bin_resolution)
-        end
-        accu_changed = set_resolution!(m, layer.binning_resolution[])
-        if fit_wanted(layer.fit, data_updated || accu_changed)
-            if isnothing(m.accu)
-                compute_fit!(layer.fit, m.y_data, m.x_data)
-            else
-                compute_fit!(layer.fit, parent(m.accu.mean), positions(m.accu, 1);
-                             sigma=1 ./ sqrt.(parent(m.accu.count)))
-            end
-        end
-        if !isnothing(m.accu)
-            half = 0.5 .* parent(m.accu.std)
-            ys = parent(m.accu.mean)
-            return Band(positions(m.accu, 1), ys .- half, ys .+ half, ys, label)
-        else
-            return Line(m.x_data, m.y_data, label, :scatter)
-        end
-    elseif x.type == VariableType_Vector
-        if fit_wanted(layer.fit, ingest_vector!(m, x, y))
-            compute_fit!(layer.fit, m.y_data, m.x_data)
-        end
-        if length(m.x_data) != length(m.y_data)
-            return Empty("Cannot correlate vectors of different lengths ($(length(m.x_data)) vs $(length(m.y_data))).")
-        end
-        return Line(m.x_data, m.y_data, label, :scatter)
-    else
-        return Empty("Unsupported correlation of data type '$(x.type)'")
-    end
-end
-
-function plot_frame!(::CorrelationLayer, frame::Line)
-    ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec=ImPlot.ImPlotSpec(; FillAlpha=0.5))
-end
-
-function plot_frame!(::CorrelationLayer, frame::Band)
-    # Same label_id ties the band and line to one legend entry so ImPlot
-    # gives them matching colors.
-    ImPlot.PlotShaded(frame.label, frame.xs, frame.lower, frame.upper; spec=ImPlot.ImPlotSpec(; FillAlpha=0.5))
-    ImPlot.PlotLine(frame.label, frame.xs, frame.line_ys)
-end
-
-draw_overlay(layer::CorrelationLayer, ::Plot, ::PlotType) = draw_fit_overlay(layer.layer_id_str, layer.fit)
-
-function axis_labels(layer::CorrelationLayer)
-    n = length(layer.variable_names)
-    if n == 0
-        return ("", "")
-    end
-    variable_data = state[].client.variable_data
-    (variable_data[layer.variable_names[layer.x_var[] + 1]].title,
-     variable_data[layer.variable_names[layer.y_var[] + 1]].title)
-end
-
-side_panel(layer::CorrelationLayer, ::Plot) = draw_fitting_settings(layer.layer_id_str, layer.fit)
-
-function bottom_controls(layer::CorrelationLayer, ::Plot)
-    n = length(layer.variable_names)
-    if n == 0
-        return
-    end
-    variable_data = state[].client.variable_data
-    x_name = layer.variable_names[layer.x_var[] + 1]
-    x = variable_data[x_name]
-    if x.type != VariableType_Scalar
-        return
-    end
-    id = layer.layer_id_str
-    y_name = layer.variable_names[layer.y_var[] + 1]
-    y = variable_data[y_name]
-
-    ig.SameLine()
-    if ig.Button("Clear##$(id)")
-        clear_variable_data(x)
-        clear_variable_data(y)
-        clear_layer_data!(layer)
-    end
-
-    ig.SameLine()
-    ig.SetNextItemWidth(135)
-    if ig.DragFloat("Binning resolution##$(id)",
-                    layer.binning_resolution, 0.01f0,
-                    0.0f0, typemax(Cfloat), "%.12f",
-                    ig.ImGuiSliderFlags_AlwaysClamp)
-        layer.resolution_touched = true
-    end
-end
-
-# --- SpecLayer methods (struct defined above with the other layers) ---
-
-# Latest spec for this layer, falling back to the last-seen one when the source
-# variable is no longer advertising it.
-function current_spec(layer::SpecLayer)
-    store = get(state[].client.variable_data, layer.source_var, nothing)
-    if !isnothing(store)
-        idx = findfirst(s -> s.name == layer.spec_name, store.plot_specs)
-        if !isnothing(idx)
-            layer.last_spec = store.plot_specs[idx]
-        end
-    end
-    return layer.last_spec
-end
-
-# Variables a spec references: each layer's primary `data`, plus any channel
-# bound to a sibling variable (a String, as opposed to a Symbol dim).
-function spec_variables(spec::PlotSpec)
-    vars = Set{String}()
-    for ls in spec.layers
-        push!(vars, ls.data)
-        for ch in (ls.x, ls.y, ls.color)
-            if ch isa String
-                push!(vars, ch)
-            end
-        end
-    end
-    return vars
-end
-
-# Subscribe to newly-referenced variables and drop ones no longer in the spec.
-function reconcile_subscriptions!(layer::SpecLayer, spec::PlotSpec)
-    desired = spec_variables(spec)
-    for name in setdiff(desired, layer.subscribed)
-        subscribe_variable(state[], name)
-    end
-    for name in setdiff(layer.subscribed, desired)
-        unsubscribe_variable(state[], name)
-    end
-    empty!(layer.subscribed)
-    union!(layer.subscribed, desired)
-end
-
-# Resolve x-axis values for a (possibly sliced) series. A String channel pulls
-# from a sibling variable, a Symbol selects a dim of `data`, and nothing infers:
-# a DimArray's first remaining dim lookup, else the integer index.
-function resolve_x(ls::LayerSpec, data)
-    if ls.x isa String
-        other = get(state[].client.variable_data, ls.x, nothing)
-        if !isnothing(other) && !(other.data isa ArrayMetadata)
-            return other.data isa DimArray ? parent(other.data) : other.data
-        end
-        return 1:length(data)
-    elseif ls.x isa Symbol && data isa DimArray && DD.hasdim(data, ls.x)
-        return parent(lookup(data, ls.x))
-    elseif data isa DimArray
-        return parent(lookup(data)[1])
-    else
-        return 1:length(data)
-    end
-end
-
-# Axis vectors for an image mark: a Symbol channel selects a dim's lookup,
-# otherwise fall back to the store's axes (which may be nothing → pixel coords).
-function image_axes(ls::LayerSpec, data, store)
-    xax = (ls.x isa Symbol && data isa DimArray && DD.hasdim(data, ls.x)) ?
-        parent(lookup(data, ls.x)) : store.x_axis
-    yax = (ls.y isa Symbol && data isa DimArray && DD.hasdim(data, ls.y)) ?
-        parent(lookup(data, ls.y)) : store.y_axis
-    return xax, yax
-end
-
-function series_frame(ls::LayerSpec, xs, ys, label, color)
-    if ls.mark === :bars
-        bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
-        return Bars(xs, ys, label, bar_size, false)
-    else
-        style = ls.mark === :scatter ? :scatter : :line
-        return Line(xs, ys, label, style, color)
-    end
-end
-
-# Append the frame(s) for one LayerSpec to `frames`.
-function layerspec_frames!(layer::SpecLayer, ls::LayerSpec, updated_variables, frames::Vector{PlotType})
-    store = get(state[].client.variable_data, ls.data, nothing)
-    if isnothing(store) || store.data isa ArrayMetadata
-        return
-    end
-    data = store.data
-    if !(eltype(data) <: Real) || isempty(data)
-        return
-    end
-
-    if ls.mark === :image || (data isa AbstractMatrix && !(ls.color isa Symbol))
-        if isnothing(layer.image)
-            layer.image = ImageState()
-            layer.image.fixed_aspect[] = store.fixed_aspect
-        end
-        was_updated = haskey(updated_variables, ls.data)
-        xax, yax = image_axes(ls, data, store)
-        push!(frames, prepare_heatmap!(layer.image, data, xax, yax, was_updated))
-        return
-    end
-
-    colordim = ls.color isa Symbol ? ls.color : nothing
-    if !isnothing(colordim) && data isa DimArray && DD.hasdim(data, colordim)
-        # coords are the grouping dim's lookup values (or its index range when
-        # the dim has no explicit lookup), so the legend reads "<dim> - <value>".
-        coords = parent(lookup(data, colordim))
-        n = length(coords)
-        for (i, slice) in enumerate(eachslice(data; dims = DD.dimnum(data, colordim)))
-            # Always set an explicit colour (gradient → Viridis sample, otherwise
-            # the discrete palette) so toggling `gradient` updates live: ImPlot
-            # caches item->Color and only refreshes it when given a non-auto
-            # colour, so handing back `nothing` would keep the stale colour.
-            # Start at 0.2, not 0: Viridis near t=0 is almost black and vanishes
-            # against the plot background.
-            color = ls.gradient ?
-                ImPlot.SampleColormap(Cfloat(0.2 + 0.8 * (i - 1) / max(n - 1, 1)), ImPlot.ImPlotColormap_Viridis) :
-                ImPlot.GetColormapColor(i - 1)
-            push!(frames, series_frame(ls, resolve_x(ls, slice), parent(slice), "$(colordim) - $(coords[i])", color))
-        end
-    else
-        ys = data isa DimArray ? parent(data) : data
-        label = isnothing(ls.label) ? ls.data : ls.label
-        push!(frames, series_frame(ls, resolve_x(ls, data), ys, label, nothing))
-    end
-end
-
-function prepare!(layer::SpecLayer, ::Plot, updated_variables)
-    spec = current_spec(layer)
-    if isnothing(spec)
-        return Empty("Waiting for plot spec: $(layer.spec_name)")
-    end
-    reconcile_subscriptions!(layer, spec)
-
-    frames = PlotType[]
-    for ls in spec.layers
-        layerspec_frames!(layer, ls, updated_variables, frames)
-    end
-    if isempty(frames)
-        return Empty("Waiting for data: $(layer.spec_name)")
-    end
-    return frames
-end
-
-function axis_labels(layer::SpecLayer)
-    spec = current_spec(layer)
-    isnothing(spec) && return ("", "")
-    return (something(spec.xlabel, ""), something(spec.ylabel, ""))
-end
-
-function window_title(layer::SpecLayer)
-    spec = current_spec(layer)
-    isnothing(spec) ? "" : something(spec.title, layer.spec_name)
-end
-
-function bottom_controls(layer::SpecLayer, ::Plot)
-    if !isnothing(layer.image)
-        image_controls(layer.image, layer.layer_id_str)
-    end
-end
-
-function Base.close(layer::SpecLayer)
-    if !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap)
-        destroy!(layer.image.gpu_heatmap)
-        layer.image.gpu_heatmap = nothing
-    end
-    for name in layer.subscribed
-        unsubscribe_variable(state[], name)
-    end
-    empty!(layer.subscribed)
+    source.selected[2] = var_combo("Y##corr-y-$(id)", source.selected[2], source.variable_names, variable_data)
 end

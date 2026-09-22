@@ -110,17 +110,6 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 # forwarded; multi-element arrays must be opted into via subscription.
 is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
 
-# Whether a variable's array is eligible for lossy compression. Extends the
-# array-level check with a plotting exception: a 2D array with a color-bound
-# plot layer is rendered as a bunch of lines, whose fine per-line detail lossy
-# compression mangles, so it's compressed losslessly instead (see client_view_for).
-function ZfpWorkspaces.should_compress(variable::VariableData)
-    data = variable.data
-    plotted_as_lines = data isa AbstractMatrix &&
-        any(s -> any(l -> !isnothing(l.color), s.layers), variable.plot_specs)
-    return should_compress(data) && !plotted_as_lines
-end
-
 # Sentinel k used to cache the metadata-only view of a non-subscribed array
 # payload. Real k values are finite (>= -1), so -Inf never collides with a real
 # client request while still comparing equal for cache hits.
@@ -143,10 +132,10 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
     elseif isnothing(requested)
         METADATA_K
     elseif should_compress(data)
-        # Compress losslessly (k=0) when the client didn't opt into lossy
-        # compression, or when the array must stay exact because it's plotted
-        # as lines.
-        (variable.compress && should_compress(variable)) ? requested : 0.0
+        # Compress losslessly (k=0) when the variable opted out of lossy
+        # compression. A client that needs exact data (e.g. to plot a matrix
+        # as lines) requests k=0 itself.
+        variable.compress ? requested : 0.0
     else
         nothing
     end
@@ -464,8 +453,8 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
-    elseif msg isa GetEngineDir
-        Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
+    elseif msg isa GetPackageDirs
+        Protocol.server_send(ws, PackageDirs(pkgdir(XfaEngine), pkgdir(Context)); reply_to)
 
     elseif msg isa GetVariables
         try

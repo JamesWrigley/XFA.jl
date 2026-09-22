@@ -442,6 +442,7 @@ end
     sftp::Maybe{ssh.SftpSession} = nothing
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
     remote_engine_dir::String = ""
+    remote_context_dir::String = ""
 
     cmd_output::String = ""
     last_error::String = ""

@@ -4,7 +4,7 @@ export AbstractMessage, Ping, Shutdown,
     GetTrainmatchers, GetInputSources, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
-    GetEngineDir, EngineDir,
+    GetPackageDirs, PackageDirs,
     GetVariables, AvailableVariables,
     GetRoutingRules, SetRoutingRules, RoutingRules,
     GetRemapRules, RemapRules,
@@ -98,7 +98,7 @@ struct GetTrainmatchers <: AbstractMessage end
 
 struct GetInputSources <: AbstractMessage end
 
-struct GetEngineDir <: AbstractMessage end
+struct GetPackageDirs <: AbstractMessage end
 
 struct GetVariables <: AbstractMessage end
 
@@ -117,8 +117,9 @@ struct RemapRules <: AbstractMessage
     rules::Vector{RemapRule}
 end
 
-struct EngineDir <: AbstractMessage
-    path::String
+struct PackageDirs <: AbstractMessage
+    engine::String
+    context::String
 end
 
 struct AvailableVariables <: AbstractMessage
