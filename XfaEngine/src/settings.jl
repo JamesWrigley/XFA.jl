@@ -79,6 +79,10 @@ const BUILTIN_REMAP_RULES = RemapRule[
               ""),
     RemapRule(RemapKind_Proxy,
               raw"^.+:dataOutput\[.+\]$",
+              "AgipdCorrection",
+              ""),
+    RemapRule(RemapKind_Proxy,
+              raw"^.+:dataOutput\[.+\]$",
               "Epix100Correction",
               "")
 ]
