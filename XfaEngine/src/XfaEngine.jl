@@ -537,6 +537,15 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Failed to change parameter '$(param.name)'" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
+    elseif msg isa InvokeCallback
+        try
+            Context.invoke_callback(state.ctx, msg.name)
+            @info "Invoked callback $(msg.name)"
+            Protocol.server_send(ws, Ack(); reply_to)
+        catch ex
+            @error "Callback '$(msg.name)' failed" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
     elseif msg isa Start
         @info "Starting pipeline..."
         try

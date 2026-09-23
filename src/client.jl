@@ -505,6 +505,9 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["displayables"] = Dict{String, Any}(chopprefix(d_name, "$(name).") => d
                                                             for (d_name, d) in ctx_info["displayables"]
                                                             if group_filter(d_name))
+        ctx_state[name]["callbacks"] = OrderedDict{String, String}(cb_name => title
+                                                                   for (cb_name, title) in ctx_info["callbacks"]
+                                                                   if group_filter(cb_name))
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
@@ -1141,7 +1144,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
-        if !isnothing(msg.error)
+        # Callback errors are logged with the callback's name by invoke_callback
+        is_callback = !isnothing(replied_to) && replied_to.msg_type == InvokeCallback
+        if !isnothing(msg.error) && !is_callback
             @error "Server reported an error" exception=msg.error.text
             log_engine_error(state, "Server reported an error", msg.error.text)
         end
@@ -1415,6 +1420,17 @@ function change_parameter(param::Parameter)
     client = state[].client
     send(client, ChangeParameter(param))
     client.pending_parameter_change = param.name
+end
+
+function invoke_callback(name::String)
+    gui_state = state[]
+    on_reply = msg -> begin
+        if !isnothing(msg.error)
+            @error "Callback '$(name)' failed" exception=msg.error.text
+            log_engine_error(gui_state, "Callback '$(name)' failed", msg.error.text)
+        end
+    end
+    gui_state.client.callback_requests[name] = send_with_callback(gui_state.client, InvokeCallback(name), on_reply)
 end
 
 function start(state)

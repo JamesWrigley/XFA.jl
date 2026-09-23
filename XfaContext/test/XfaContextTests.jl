@@ -697,6 +697,20 @@ end
     @test d[] == 3 && changed == [("counter.count", 3)]
 end
 
+@testset "Callback" begin
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Counter
+        count::Int = 0
+        increment::Callback = Callback("Increment", g -> g.count += 1)
+    end
+    counter = Counter()
+    """)
+    @test Context.to_dict(ctx)["callbacks"] == Dict("counter.increment" => "Increment")
+
+    Context.invoke_callback(ctx, "counter.increment")
+    @test ctx.groups["counter"].count == 1
+end
+
 @testset "Parameter" begin
     # Smoke tests for constructors
     @test Parameter(0) isa Parameter

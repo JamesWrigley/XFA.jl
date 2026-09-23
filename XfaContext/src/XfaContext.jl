@@ -1,6 +1,6 @@
 module XfaContext
 
-export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, tryset, KaraboDevice, SourceInfo,
+export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, Callback, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
     RectROI, LinearROI, Context
@@ -154,6 +154,7 @@ end
     postprocessors::Dict{String, AbstractPostprocessor} = Dict()
     parameters::Dict{String, Parameter} = Dict()
     displayables::Dict{String, Displayable} = Dict()
+    callbacks::OrderedDict{String, Callback} = OrderedDict()
     exprs::Vector{Expr} = Expr[]
 
     inputs::Dict{String, Any} = Dict()
@@ -478,6 +479,8 @@ function to_dict(ctx::ContextState)
 
     displayables = Dict{String, Displayable}(name => typeof(d)(; name, value=d.value)
                                             for (name, d) in ctx.displayables)
+    # Only the titles, the functions live in the context module
+    callbacks = OrderedDict{String, String}(name => cb.title for (name, cb) in ctx.callbacks)
 
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
@@ -486,6 +489,7 @@ function to_dict(ctx::ContextState)
                 "displays" => ctx.displays,
                 "parameters" => parameters,
                 "displayables" => displayables,
+                "callbacks" => callbacks,
                 "inputs" => inputs,
                 "groups" => groups,
                 "origins" => origins,
@@ -633,6 +637,14 @@ function change_parameter(ctx::ContextState, new_param::Parameter)
                 ctx_param.update_handler(new_param.value)
             end
         end
+    end
+end
+
+function invoke_callback(ctx::ContextState, name::String)
+    callback = ctx.callbacks[name]
+    group = ctx.groups[group_prefix(name)]
+    pause_pipeline() do
+        @invokelatest callback.f(group)
     end
 end
 
@@ -1445,7 +1457,7 @@ function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), 
         using XfaContext.DimensionalData
 
         using XfaContext
-        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta
+        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta, @pysafe
     end
     @eval ctx_module $init_expr
 
@@ -1466,8 +1478,10 @@ function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), 
     end
 
     # Evaluate all exprs
-    for expr in exprs
-        @eval ctx_module $expr
+    guard_pythoncall_import() do
+        for expr in exprs
+            @eval ctx_module $expr
+        end
     end
 
     @invokelatest load_from_module(ctx_module, exprs; dep_router, prelude)
@@ -1476,6 +1490,7 @@ end
 function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Returns(nothing), prelude=Expr[])
     parameters = Dict{String, Parameter}()
     displayables = Dict{String, Displayable}()
+    callbacks = OrderedDict{String, Callback}()
 
     # Discover all variables, inputs, group types, and parameters defined
     # in ctx_module by scanning its names and checking for trait methods.
@@ -1593,7 +1608,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
             # "$group_name.$field", and GroupType.<name> would silently mean the
             # field.
             field = Symbol(nameof(variable_func))
-            if hasfield(group_type, field) && fieldtype(group_type, field) <: Union{Parameter, Displayable}
+            if hasfield(group_type, field) && fieldtype(group_type, field) <: Union{Parameter, Displayable, Callback}
                 throw(XfaContextException("'$(field)' is both a field and a @Variable of $(nameof(group_type))"))
             end
 
@@ -1633,6 +1648,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 displayable = getproperty(object, field)
                 displayable.name = "$(group_name).$(field)"
                 displayables[displayable.name] = displayable
+            elseif fieldtype(group_type, field) <: Callback
+                callbacks["$(group_name).$(field)"] = getproperty(object, field)
             end
         end
 
@@ -1753,7 +1770,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                      variable_postprocessors=ctx_variable_postprocessors,
                      postprocessors=ctx_postprocessors,
                      displays=ctx_displays,
-                     parameters, displayables, exprs, inputs, prelude, dep_router)
+                     parameters, displayables, callbacks, exprs, inputs, prelude, dep_router)
     ctx.dep_to_input = build_dep_routing(ctx, dep_router)
     global current_ctx = ctx
     return ctx
