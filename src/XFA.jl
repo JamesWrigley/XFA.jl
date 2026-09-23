@@ -14,6 +14,11 @@ include("util.jl")
 include("gui.jl")
 include("settings.jl")
 
-# using PrecompileTools: @compile_workload
+using PrecompileTools: @compile_workload
+
+@compile_workload begin
+    precompile(main, ())
+    precompile(draw_gui, ())
+end
 
 end

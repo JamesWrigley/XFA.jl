@@ -2221,6 +2221,3 @@ function main(; test_engine=nothing)
 
     return t, gui_state
 end
-
-# precompile(main, ())
-# precompile(draw_gui, ())
