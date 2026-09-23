@@ -1540,14 +1540,23 @@ end
         @Variable function foo(data -> karabo"motor1.pos")
             scratch = Meta.scratch[]
 
-            return (; tid=Meta.tid[], scratch_dict=scratch isa Dict)
+            return (; tid=Meta.tid[], scratch_dict=scratch isa Dict, group_name=Meta.group_name[])
         end
+
+        @Group mutable struct MetaGroup
+            upstream::Parameter{Dependency}
+        end
+        @Variable function bar(::MetaGroup, data -> MetaGroup.upstream)
+            Meta.group_name[]
+        end
+        meta_group = MetaGroup(; upstream=Dependency("foo"))
         """)
         Context.run(ctx) do
             @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
         end
-        result = take!(ctx.stream_output)
-        @test result == VariableData(42, "foo", (; tid=42, scratch_dict=true))
+        results = Dict(vd.name => vd for vd in ctx.stream_output)
+        @test results["foo"] == VariableData(42, "foo", (; tid=42, scratch_dict=true, group_name=""))
+        @test results["meta_group.bar"].data == "meta_group"
 
         # Test changing parameters
         ctx = Context.load_from_string(raw"""

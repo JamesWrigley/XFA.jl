@@ -117,6 +117,7 @@ const tid = ScopedValue{Int}()
 const run_number = ScopedValue{Int}()
 const proposal = ScopedValue{Int}()
 const name = ScopedValue{String}()
+const group_name = ScopedValue("")
 
 const scratch = ScopedValue(Dict{String, Any}())
 const subvariables = ScopedValue(Dict{String, Any}())
@@ -649,6 +650,16 @@ function find_parameter_owner(ctx::ContextState, param_name::String)
     return nothing
 end
 
+# Group members are named "$group_name.$func_name", top-level names have no dot.
+function group_prefix(name)
+    dot_idx = findfirst('.', name)
+    if isnothing(dot_idx)
+        return ""
+    else
+        return name[1:dot_idx-1]
+    end
+end
+
 function input_wrapper(name, group, channel)
     f = worker_state.dag_functions[name]
 
@@ -656,7 +667,7 @@ function input_wrapper(name, group, channel)
         if isnothing(group)
             @with Meta.name => name @invokelatest f(channel)
         else
-            @with Meta.name => name @invokelatest f(group, channel)
+            @with Meta.name => name Meta.group_name => group_prefix(name) @invokelatest f(group, channel)
         end
     catch ex
         if !(ex isa InvalidStateException)
@@ -741,7 +752,7 @@ function stream_input(ctx, name, channel, downstream_neighbours, rates, monitors
                 pause_pipeline() do
                     for (group_name, group, changed) in updates
                         try
-                            deps_changed = @with Meta.name => group_name @invokelatest on_properties_changed(group, changed)
+                            deps_changed = @with Meta.name => group_name Meta.group_name => group_name @invokelatest on_properties_changed(group, changed)
                             if deps_changed == true
                                 rewire = true
                             end
@@ -813,6 +824,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                          max_train_latency::Integer=20)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
+    group_name = group_prefix(name)
 
     matcher = Trainmatcher((k for (k, v) in upstream if v isa Union{RemoteChannel, Channel}), max_train_latency)
     matched_trains = Dict{Int, Any}()
@@ -898,6 +910,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 try
                     out = @with(Meta.tid => tid,
                                 Meta.name => name,
+                                Meta.group_name => group_name,
                                 Meta.scratch => scratch,
                                 Meta.subvariables => subvar_values,
                                 @invokelatest f(args...))
@@ -919,6 +932,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                         try
                             subvar_values[pp_name] = @with(Meta.tid => tid,
                                                            Meta.name => pp_name,
+                                                           Meta.group_name => group_name,
                                                            Meta.scratch => scratch,
                                                            Meta.subvariables => subvar_values,
                                                            pp(raw_out))
