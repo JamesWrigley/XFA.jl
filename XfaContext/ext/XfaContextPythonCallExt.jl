@@ -13,7 +13,7 @@ using PythonCall
 # Run `expr` holding the GIL with the task pinned to its OS thread, since
 # releasing the GIL from another thread than the one that took it crashes.
 # Keep Julia blocking primitives (`put!`, `wait`) outside it.
-macro pysafe(expr)
+macro pysafe_impl(expr)
     quote
         task = current_task()
         was_sticky = task.sticky
@@ -68,15 +68,27 @@ function pyguard(f)
         f()
     catch ex
         if ex isa PyException
-            throw(ErrorException(@pysafe sprint(showerror, ex)))
+            throw(ErrorException(@pysafe_impl sprint(showerror, ex)))
         end
         rethrow()
     end
 end
 
+# Also frees Python objects finalized off the GIL since the last call, which
+# would otherwise pile up while the pipeline runs.
+function XfaContext.pysafe(f)
+    pyguard() do
+        @pysafe_impl try
+            f()
+        finally
+            PythonCall.GC.gc()
+        end
+    end
+end
+
 function XfaContext.open_data_collection(proposal::Integer, run::Integer, directory::AbstractString)
     pyguard() do
-        @pysafe begin
+        @pysafe_impl begin
             extra_data = pyimport("extra_data")
             if isempty(directory)
                 extra_data.open_run(proposal, run)
@@ -91,7 +103,7 @@ end
 # `DEV:pipe` collapse to their device.
 function XfaContext.data_collection_devices(dc::Py)
     pyguard() do
-        @pysafe begin
+        @pysafe_impl begin
             devices = Dict{String, String}()
             for src in dc.control_sources
                 class_id = dc[src].device_class
@@ -117,7 +129,7 @@ end
 # `schema_property_names` parses.
 function XfaContext.data_collection_schema(dc::Py, device::AbstractString)
     pyguard() do
-        @pysafe begin
+        @pysafe_impl begin
             schema = Dict{String, Any}()
             if pyconvert(Bool, device in dc.control_sources)
                 for key in dc[device].keys(; inc_timestamps=false)
@@ -140,11 +152,15 @@ function XfaContext.data_collection_schema(dc::Py, device::AbstractString)
     end
 end
 
-function XfaContext.unwrap_python(array::PyArray{T, N, M, L, T}) where {T, N, M, L}
-    if strides(array) != Base.size_to_strides(1, size(array)...)
+# Only arrays whose raw element type is `T` itself (not e.g. Python objects)
+# can be wrapped as a plain Array.
+function XfaContext.unwrap_python(array::PyArray{T}) where {T}
+    if PythonCall.Wrap.pyarray_get_R(T) != T
+        throw(ArgumentError("Cannot unwrap a PyArray of $T"))
+    elseif strides(array) != Base.size_to_strides(1, size(array)...)
         throw(ArgumentError("Cannot unwrap a non-contiguous PyArray"))
     end
-    return unsafe_wrap(Array, array.ptr, size(array))
+    return unsafe_wrap(Array, Ptr{T}(array.ptr), size(array))
 end
 python_backed(array::PyArray) = true
 python_backed(array::AbstractArray) = parent(array) !== array && python_backed(parent(array))
@@ -203,7 +219,7 @@ end
 function XfaContext.open_stream(dc::Py, deps::Vector{Dependency}, monitored::Vector{Dependency}=Dependency[];
                                 trains_per_chunk=2, buffer_slots=8)
     pyguard() do
-        @pysafe begin
+        @pysafe_impl begin
             if isempty(deps)
                 train_ids = pyconvert(Vector{Int}, dc.train_ids)
                 return TrainStream(nothing, nothing, deps, monitored, Dict{String, Symbol}(), train_ids,
@@ -267,7 +283,7 @@ function XfaContext.feed!(stream::TrainStream, channel, rate=Ref(Inf))
 
     pyguard() do
         iterator = stream.iterator
-        fd = @pysafe pyconvert(Int, iterator.fd)
+        fd = @pysafe_impl pyconvert(Int, iterator.fd)
         watcher = FDWatcher(RawFD(fd), true, false)
 
         try
@@ -275,7 +291,7 @@ function XfaContext.feed!(stream::TrainStream, channel, rate=Ref(Inf))
                 wait(watcher)
 
                 while true
-                    train = @pysafe begin
+                    train = @pysafe_impl begin
                         td = iterator.get()
                         pyis(td, pybuiltins.None) ? nothing : (train_data(stream, td)..., td)
                     end
@@ -294,7 +310,7 @@ function XfaContext.feed!(stream::TrainStream, channel, rate=Ref(Inf))
                     put!(channel, (tid, data))
                 end
 
-                if @pysafe pyconvert(Bool, iterator.ended)
+                if @pysafe_impl pyconvert(Bool, iterator.ended)
                     break
                 end
             end
@@ -312,7 +328,7 @@ function XfaContext.release!(stream::TrainStream, tid::Integer)
     if !isnothing(stream.iterator)
         td = @lock stream.pending pop!(stream.pending[], tid)
         pyguard() do
-            @pysafe stream.iterator.done(td)
+            @pysafe_impl stream.iterator.done(td)
         end
     end
 end
@@ -320,7 +336,7 @@ end
 function Base.close(stream::TrainStream)
     if !isnothing(stream.iterator)
         pyguard() do
-            @pysafe begin
+            @pysafe_impl begin
                 try
                     stream.iterator.close()
                 finally
@@ -345,7 +361,7 @@ end
 function XfaContext.run(ctx::ContextState, dc::Py;
                         select=String[], override=Dict{String, Any}(),
                         trains_per_chunk=2, buffer_slots=8)
-    @pysafe begin
+    @pysafe_impl begin
         if !is_data_collection(dc)
             throw(ArgumentError("Expected an extra_data DataCollection, got a $(pytype(dc))"))
         end
