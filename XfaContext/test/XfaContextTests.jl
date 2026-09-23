@@ -24,7 +24,7 @@ using ReTest: @testset, @test, @test_throws, @test_logs
 using OrderedCollections: OrderedDict as OD
 using DataStructures: CircularBuffer, capacity, isfull
 using FHist: bincounts, bincenters, binedges
-using DimensionalData: DimArray, lookup, hasdim
+using DimensionalData: DimArray, Dim, lookup, hasdim
 
 using PythonCall
 
@@ -2371,6 +2371,25 @@ end
             @test schema["xtdf"]["schema"]["image"]["data"] == Dict("nodeType" => "Leaf")
         end
     end
+end
+
+@testset "@pysafe" begin
+    ctx = Context.load_from_string(raw"""
+    using PythonCall
+
+    @Variable foo -> karabo"camera.data"
+    @Variable function root(x -> foo)
+        @pysafe pyconvert(Float64, pyimport("math").sqrt(x))
+    end
+    """)
+    vals = Dict("camera.data" => DimArray([1, 4, 9], (Dim{:trainId}([10, 11, 12]),)))
+
+    # The test thread holds the GIL, which the pipeline's tasks need
+    r = PythonCall.GIL.unlock(() -> Context.run(ctx, vals))
+    @test collect(r["root"]) == [1.0, 2.0, 3.0]
+
+    # Python exceptions are rendered as plain errors
+    @test_throws "math domain error" Context.@pysafe pyimport("math").sqrt(-1)
 end
 
 end

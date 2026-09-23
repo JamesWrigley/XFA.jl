@@ -48,8 +48,8 @@ end
 
 # Assemble one or more frames into `out`. `frames` holds whole-detector module
 # data with the frame index as the trailing axis, in the flat ordering the LUT
-# was built against; out is indexed [ny, nx] for a single frame or [ny, nx,
-# frame].
+# was built against; out is indexed [nx, ny] for a single frame or [nx, ny,
+# frame], so it must be transposed to plot as an [row, col] image.
 function assemble!(out::AbstractArray{<:AbstractFloat}, asm::AssemblerLUT, frames::AbstractArray)
     n = nframes(asm, frames)
     out_flat = prepare_output!(out, asm, n)
