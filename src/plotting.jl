@@ -999,9 +999,10 @@ function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     if !enabled
         ig.EndDisabled()
     end
-    if !store.compress
-        ig.TextDisabled("Compression disabled for this variable")
-    elseif compressed
+    if compressed
+        if !store.compress
+            ig.TextDisabled("Lossless compression is used")
+        end
         ig.TextDisabled(@sprintf("zfp: %.1fx", store.compression_ratio))
     elseif store.received_bytes > 0
         ig.TextDisabled("Variable is not compressed")
