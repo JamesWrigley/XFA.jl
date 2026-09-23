@@ -522,6 +522,18 @@ function draw_parameters(var_data; pending=false)
     end
 end
 
+function draw_callbacks(var_data)
+    client = state[].client
+    for (name, title) in var_data["callbacks"]
+        running = haskey(client.callback_requests, name) && is_pending(client, client.callback_requests[name])
+        @Disabled running begin
+            if ig.Button("$(title)###callback-$(name)")
+                invoke_callback(name)
+            end
+        end
+    end
+end
+
 # Specialize on Val{Symbol("ModulePath.function_name")} to draw custom content
 # inside a variable node. Called after the titlebar and before parameters.
 # Return a gui state object to persist custom state across frames, or nothing.
@@ -745,6 +757,9 @@ function draw_variable(name, var_data)
 
         if var_data["draw_parameters"]
             draw_parameters(var_data; pending=!isnothing(pending))
+        end
+        if haskey(var_data, "callbacks")
+            draw_callbacks(var_data)
         end
         ig.EndGroup()
         content_measured = max(content_measured, ig.GetItemRectSize().x)

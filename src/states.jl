@@ -809,6 +809,8 @@ end
     # matching ParameterChanged echo, dropped on error.
     pending_source_edit::Maybe{String} = nothing
 
+    callback_requests::Dict{String, Int} = Dict()
+
     lock::ReentrantLock = ReentrantLock()
 end
 

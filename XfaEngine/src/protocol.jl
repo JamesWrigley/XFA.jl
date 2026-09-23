@@ -9,7 +9,7 @@ export AbstractMessage, Ping, Shutdown,
     GetRoutingRules, SetRoutingRules, RoutingRules,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
-    ChangeParameter, Start, Stop,
+    ChangeParameter, InvokeCallback, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
     Started, Stopped, InputSources,
@@ -63,6 +63,10 @@ struct ReviseCode <: AbstractMessage end
 
 struct ChangeParameter <: AbstractMessage
     parameter::Parameter
+end
+
+struct InvokeCallback <: AbstractMessage
+    name::String
 end
 
 struct GetRoutingRules <: AbstractMessage end

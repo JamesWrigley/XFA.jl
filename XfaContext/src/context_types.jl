@@ -725,6 +725,13 @@ function Base.setindex!(d::Displayable, value)
     end
 end
 
+# A group field drawn as a button in the GUI. Clicking it calls `f(group)` on
+# proc 1 with the pipeline paused, like a parameter update handler.
+struct Callback
+    title::String
+    f::Function
+end
+
 # Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
 # into the coordinator's parameter dict and notifies the context's
 # `on_parameter_changed` hook so the engine can broadcast it to clients.

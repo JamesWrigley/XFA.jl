@@ -1014,6 +1014,11 @@ end
         period = Parameter(2π)
         roi = Parameter(Context.RectROI())
 
+        @Group struct Resettable
+            reset::Callback = Callback("Reset", Returns(nothing))
+        end
+        resettable = Resettable()
+
         @Variable xgm -> karabo"xgm.intensity"
 
         @Variable function foo() 42 end
@@ -1027,7 +1032,7 @@ end
         """; prelude=KARABO_PRELUDE)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
-                                       "groups" => ["bridge"],
+                                       "groups" => ["bridge", "resettable"],
                                        "dag" =>          Dict("xgm" => OD("data" => karabo"xgm.intensity"),
                                                               "foo" => OD(),
                                                               "bar" => OD("data" => Dependency("xgm"))),
@@ -1041,7 +1046,8 @@ end
                                                          "foo" => "foo",
                                                          "bar" => "bar",
                                                          "bridge" => "XfaEngine.KaraboInput",
-                                                         "bridge.stream" => "XfaEngine.stream"),
+                                                         "bridge.stream" => "XfaEngine.stream",
+                                                         "resettable" => "Resettable"),
                                        "parameters" => Dict("period" => Parameter("period", 2π),
                                                             "roi" => Parameter("roi", Context.RectROI()),
                                                             "bar.window.size" => Parameter("bar.window.size", 5),
@@ -1054,6 +1060,7 @@ end
                                                             "bridge.run_directory" => Parameter("bridge.run_directory", ""),
                                                             "bridge.rate" => Parameter("bridge.rate", 10.0)),
                                        "displayables" => Dict("bridge.progress" => Context.Displayable(; name="bridge.progress", value=(0, 0))),
+                                       "callbacks" => OD("resettable.reset" => "Reset"),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "group_parameter_args" => Dict(),
                                        "path" => "")
