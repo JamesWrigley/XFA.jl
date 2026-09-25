@@ -136,44 +136,47 @@ function compile_mark(unit, path)
            mark, "$(path).mark"), opacity
 end
 
-# Only a single lookup is supported, keyed on `trainId` or `index` on both
-# sides and pulling one field.
-function compile_lookup(unit, path)
+# Up to two lookups are supported, sharing a key of `trainId` or `index` on both
+# sides and each pulling one field.
+function compile_lookups(unit, path)
     transforms = objects(unit, "transform", path)
-    if isempty(transforms)
-        nothing
-    else
-        if length(transforms) > 1
-            throw(SpecError("$(path).transform: only a single lookup transform is supported"))
-        end
-        tpath, transform = transforms[1]
-        if !haskey(transform, "lookup")
-            throw(SpecError("$(tpath): only lookup transforms are supported"))
-        end
-        check_keys(transform, ("lookup", "from", "as"), tpath)
-        key_name = property(transform, "lookup", AbstractString, tpath)
-        key = choice(("trainId" => LookupKey_TrainId, "index" => LookupKey_Index), key_name, "$(tpath).lookup")
-
-        from = property(transform, "from", AbstractDict, tpath)
-        check_keys(from, ("data", "key", "fields"), "$(tpath).from")
-        if property(from, "key", AbstractString, "$(tpath).from") != key_name
-            throw(SpecError("$(tpath).from.key: must be the same as lookup (\"$(key_name)\")"))
-        end
-        from_data = property(from, "data", AbstractDict, "$(tpath).from")
-        check_keys(from_data, ("name",), "$(tpath).from.data")
-        dataset = property(from_data, "name", AbstractString, "$(tpath).from.data")
-
-        fields = property(from, "fields", AbstractVector, "$(tpath).from")
-        as = property(transform, "as", Any, tpath)
-        if as isa AbstractVector && length(as) == 1
-            as = as[1]
-        end
-        if length(fields) != 1 || !(fields[1] isa AbstractString) || !(as isa AbstractString)
-            throw(SpecError("$(tpath): exactly one field must be pulled, with one \"as\" name"))
-        end
-
-        LookupTransform(key, String(dataset), String(fields[1]), String(as))
+    if length(transforms) > 2
+        throw(SpecError("$(path).transform: at most two lookup transforms are supported"))
     end
+    lookups = LookupTransform[compile_lookup(tpath, transform) for (tpath, transform) in transforms]
+    if length(lookups) == 2 && lookups[1].key != lookups[2].key
+        throw(SpecError("$(path).transform: the lookups must share a key"))
+    end
+    lookups
+end
+
+function compile_lookup(tpath, transform)
+    if !haskey(transform, "lookup")
+        throw(SpecError("$(tpath): only lookup transforms are supported"))
+    end
+    check_keys(transform, ("lookup", "from", "as"), tpath)
+    key_name = property(transform, "lookup", AbstractString, tpath)
+    key = choice(("trainId" => LookupKey_TrainId, "index" => LookupKey_Index), key_name, "$(tpath).lookup")
+
+    from = property(transform, "from", AbstractDict, tpath)
+    check_keys(from, ("data", "key", "fields"), "$(tpath).from")
+    if property(from, "key", AbstractString, "$(tpath).from") != key_name
+        throw(SpecError("$(tpath).from.key: must be the same as lookup (\"$(key_name)\")"))
+    end
+    from_data = property(from, "data", AbstractDict, "$(tpath).from")
+    check_keys(from_data, ("name",), "$(tpath).from.data")
+    dataset = property(from_data, "name", AbstractString, "$(tpath).from.data")
+
+    fields = property(from, "fields", AbstractVector, "$(tpath).from")
+    as = property(transform, "as", Any, tpath)
+    if as isa AbstractVector && length(as) == 1
+        as = as[1]
+    end
+    if length(fields) != 1 || !(fields[1] isa AbstractString) || !(as isa AbstractString)
+        throw(SpecError("$(tpath): exactly one field must be pulled, with one \"as\" name"))
+    end
+
+    LookupTransform(key, String(dataset), String(fields[1]), String(as))
 end
 
 # Validates the channels against what each mark can draw: images are a rect
@@ -183,7 +186,7 @@ function compile_layer(unit, path)
     check_keys(data, ("name",), "$(path).data")
     name = property(data, "name", AbstractString, "$(path).data")
     mark, opacity = compile_mark(unit, path)
-    lookup = compile_lookup(unit, path)
+    lookups = compile_lookups(unit, path)
 
     epath = "$(path).encoding"
     encoding = property(unit, "encoding", AbstractDict, path)
@@ -196,13 +199,22 @@ function compile_layer(unit, path)
         nothing
     end
 
-    # A lookup pairs the other variable's values with the layer's own
-    if !isnothing(lookup)
-        fields = (x.field, y.field)
-        if mark == Mark_Rect || lookup.field != "value" || lookup.as == "value" ||
-           (fields != (lookup.as, "value") && fields != ("value", lookup.as))
-            throw(SpecError("$(path): a lookup must pull \"value\" under another name, to plot against " *
-                            "the layer's own \"value\" on x/y"))
+    # One lookup pairs the other variable's values with the layer's own, two
+    # place the layer's values at the points they give, coloured by value.
+    fields = (x.field, y.field)
+    if any(lookup -> lookup.field != "value" || lookup.as == "value", lookups)
+        throw(SpecError("$(path): a lookup must pull \"value\" under another name"))
+    elseif length(lookups) == 1
+        as = lookups[1].as
+        if mark == Mark_Rect || (fields != (as, "value") && fields != ("value", as))
+            throw(SpecError("$(path): a lookup must plot against the layer's own \"value\" on x/y"))
+        end
+    elseif length(lookups) == 2
+        as = (lookups[1].as, lookups[2].as)
+        if mark != Mark_Point || as[1] == as[2] || (fields != as && fields != reverse(as)) ||
+           isnothing(color) || color.field != "value" || color.type != FieldType_Quantitative
+            throw(SpecError("$(path): two lookups must be points with x/y on the pulled fields, " *
+                            "and a quantitative color on the layer's own \"value\""))
         end
     end
 
@@ -221,12 +233,13 @@ function compile_layer(unit, path)
                 throw(SpecError("$(epath).$(axis): only quantitative axes are supported, add \"type\": \"quantitative\""))
             end
         end
-        if !isnothing(color) && color.log
-            throw(SpecError("$(epath).color.scale.type: a log color scale is only supported on a rect"))
+        if !isnothing(color) && color.log && length(lookups) != 2
+            throw(SpecError("$(epath).color.scale.type: a log color scale is only supported on a rect " *
+                            "or points coloured by value"))
         end
     end
 
-    LayerSpec(String(name), mark, opacity, x, y, color, lookup)
+    LayerSpec(String(name), mark, opacity, x, y, color, lookups)
 end
 
 # The (lo, hi) of value[encoding].
@@ -331,8 +344,8 @@ function datasets(spec::PlotSpec)
     names = Set{String}()
     for layer in spec.layers
         push!(names, layer.data)
-        if !isnothing(layer.lookup)
-            push!(names, layer.lookup.dataset)
+        for lookup in layer.lookups
+            push!(names, lookup.dataset)
         end
     end
     for model in spec.models

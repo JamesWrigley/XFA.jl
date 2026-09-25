@@ -177,7 +177,7 @@ end
     # Another variable on x is an elementwise lookup
     paired = LayerSpec(; data="intensity", mark=:scatter, x="motor")
     @test (paired.mark, paired.x.field) == (Context.Mark_Point, "motor")
-    @test paired.lookup == Context.LookupTransform(Context.LookupKey_Index, "motor", "value", "motor")
+    @test paired.lookups == [Context.LookupTransform(Context.LookupKey_Index, "motor", "value", "motor")]
 
     image = LayerSpec(; data="detector", mark=:image)
     @test (image.mark, image.x.field, image.y.field, image.color.field) == (Context.Mark_Rect, "col", "row", "value")
@@ -2379,7 +2379,12 @@ end
 
     @Variable foo -> karabo"camera.data"
     @Variable function root(x -> foo)
-        @pysafe pyconvert(Float64, pyimport("math").sqrt(x))
+        @pysafe begin
+            math = pyimport("math")
+            y = pyconvert(Float64, math.sqrt(x))
+        end
+        # Assignments stay in the enclosing scope
+        y + (@pysafe pyconvert(Float64, math.floor(0.5)))
     end
     """)
     vals = Dict("camera.data" => DimArray([1, 4, 9], (Dim{:trainId}([10, 11, 12]),)))

@@ -67,7 +67,18 @@ struct LayerSpec
     x::ChannelDef
     y::ChannelDef
     color::Union{ChannelDef, Nothing}
-    lookup::Union{LookupTransform, Nothing}
+    lookups::Vector{LookupTransform}
+end
+
+function Base.:(==)(a::LayerSpec, b::LayerSpec)
+    all(f -> getfield(a, f) == getfield(b, f), fieldnames(LayerSpec))
+end
+
+function Base.hash(layer::LayerSpec, h::UInt)
+    for f in fieldnames(LayerSpec)
+        h = hash(getfield(layer, f), h)
+    end
+    return h
 end
 
 # An interval selection named after the parameter it edits. `initial` is
@@ -182,7 +193,7 @@ function LayerSpec(; data::AbstractString="", mark::Symbol=:line,
             throw(ArgumentError("an image takes a dim for x and y, and no color"))
         end
         LayerSpec(String(data), Mark_Rect, 1.0, axis(something(x, "col")), axis(something(y, "row")),
-                  colored("value", FieldType_Quantitative, "turbo"), nothing)
+                  colored("value", FieldType_Quantitative, "turbo"), LookupTransform[])
     else
         if !isnothing(y)
             throw(ArgumentError("y is only supported for images"))
@@ -196,9 +207,10 @@ function LayerSpec(; data::AbstractString="", mark::Symbol=:line,
         else
             colored(color, FieldType_Nominal, nothing)
         end
-        lookup = x isa AbstractString ? LookupTransform(LookupKey_Index, String(x), "value", String(x)) : nothing
+        lookups = x isa AbstractString ? [LookupTransform(LookupKey_Index, String(x), "value", String(x))] :
+                  LookupTransform[]
         LayerSpec(String(data), marks[mark], 1.0, axis(something(x, "index")), axis("value"),
-                  color_channel, lookup)
+                  color_channel, lookups)
     end
 end
 

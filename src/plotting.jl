@@ -455,7 +455,7 @@ const PCTILE_NBINS = 2048
 # Min/max over the strided sample, dropping non-finite values (and non-positive
 # ones in log mode, which have no real log). Returns (Inf, -Inf) if nothing
 # qualifies.
-function finite_extrema(data::AbstractMatrix, stride::Int, log::Bool)
+function finite_extrema(data::AbstractArray, stride::Int, log::Bool)
     lo = Inf
     hi = -Inf
     n = length(data)
@@ -471,7 +471,7 @@ function finite_extrema(data::AbstractMatrix, stride::Int, log::Bool)
     return (lo, hi)
 end
 
-function sampled_pctile!(buf::Vector{Int32}, data::AbstractMatrix, log::Bool=false)
+function sampled_pctile!(buf::Vector{Int32}, data::AbstractArray, log::Bool=false)
     n = length(data)
     if n == 0
         return (0.0, 1.0)
@@ -740,66 +740,71 @@ function draw_fit_overlay(view_id, fit::FitSettings)
     end
 end
 
-# Walk updated_variables for x_name/y_name and append pairs for any tid present
-# in both x.scalar_tids and y.scalar_tids. Routes through accu if active.
-# Returns true if any pair was appended.
-function ingest_scalar!(m::VariableTrainmatcher, x_store, y_store,
-                        updated_variables, x_name, y_name)
-    if !haskey(updated_variables, x_name) && !haskey(updated_variables, y_name)
+VariableTrainmatcher(n::Integer) = VariableTrainmatcher(; data = [Float64[] for _ in 1:n])
+
+# Fold matched sample `i` into accu, its value binned over its positions.
+function bin_sample!(accu::BinnedSequence{0, D}, data, i) where {D}
+    append!(accu, ntuple(d -> data[d][i], D), data[end][i])
+end
+
+# Walk updated_variables for `names` and append the values of any tid present
+# in the scalar_tids of all `stores`. Routes through accu if active. Returns
+# true if anything was appended.
+function ingest_scalar!(m::VariableTrainmatcher, stores, updated_variables, names)
+    if !any(name -> haskey(updated_variables, name), names)
         return false
     end
-    new_tids = union(get(updated_variables, x_name, Set{Int}()),
-                     get(updated_variables, y_name, Set{Int}()))
+    new_tids = union((get(updated_variables, name, Set{Int}()) for name in names)...)
 
     appended = false
     for tid in new_tids
-        xi = findfirst(==(tid), x_store.scalar_tids)
-        yi = findfirst(==(tid), y_store.scalar_tids)
-        if !isnothing(xi) && !isnothing(yi)
-            xv = x_store.data[xi]
-            yv = y_store.data[yi]
-            if !isfinite(xv) || !isfinite(yv)
-                continue
-            end
-            push!(m.x_data, xv)
-            push!(m.y_data, yv)
-            if !isnothing(m.accu)
-                append!(m.accu, xv, yv)
-            end
-            appended = true
+        indices = [findfirst(==(tid), store.scalar_tids) for store in stores]
+        if any(isnothing, indices)
+            continue
         end
+        values = [store.data[i] for (store, i) in zip(stores, indices)]
+        if !all(isfinite, values)
+            continue
+        end
+        foreach(push!, m.data, values)
+        if !isnothing(m.accu)
+            bin_sample!(m.accu, m.data, lastindex(m.data[end]))
+        end
+        appended = true
     end
     return appended
 end
 
-# Copy both vector buffers when both stores share a fresh trainId. Returns
+# Copy all the vector buffers when the stores share a fresh trainId. Returns
 # true if a copy happened.
-function ingest_vector!(m::VariableTrainmatcher, x_store, y_store)
-    if !(x_store.data isa AbstractVector) || !(y_store.data isa AbstractVector)
+function ingest_vector!(m::VariableTrainmatcher, stores)
+    tid = stores[1].trainId
+    if !all(store -> store.data isa AbstractVector && store.trainId == tid, stores) ||
+       tid == m.last_vector_tid
         return false
     end
-    if x_store.trainId != y_store.trainId || x_store.trainId == m.last_vector_tid
-        return false
+    for (buffer, store) in zip(m.data, stores)
+        resize!(buffer, length(store.data))
+        copyto!(buffer, store.data)
     end
-    resize!(m.x_data, length(x_store.data))
-    resize!(m.y_data, length(y_store.data))
-    copyto!(m.x_data, x_store.data)
-    copyto!(m.y_data, y_store.data)
-    m.last_vector_tid = x_store.trainId
+    m.last_vector_tid = tid
     return true
 end
 
-# Reconcile accu with the requested resolution; rebuild from raw history when
-# the resolution changes (covers initial creation, widget edits, swaps, var
-# changes). Returns true if the binned series changed.
-function set_resolution!(m::VariableTrainmatcher, res::Cfloat)
-    if res > 0 && (isnothing(m.accu) || m.accu.axes[1].resolution != res)
-        m.accu = Scalar1dScan(Float64(res))
-        for i in eachindex(m.x_data, m.y_data)
-            append!(m.accu, m.x_data[i], m.y_data[i])
+# Reconcile accu with the requested resolution of each position axis; rebuild
+# from raw history when one changes (covers initial creation, widget edits,
+# swaps, var changes). Returns true if the binned series changed.
+function set_resolution!(m::VariableTrainmatcher, res)
+    D = length(m.data) - 1
+    if all(d -> res[d] > 0, 1:D)
+        if isnothing(m.accu) || any(d -> m.accu.axes[d].resolution != res[d], 1:D)
+            m.accu = D == 1 ? Scalar1dScan(Float64(res[1])) : Scalar2dScan(Float64(res[1]), Float64(res[2]))
+            for i in eachindex(m.data[end])
+                bin_sample!(m.accu, m.data, i)
+            end
+            return true
         end
-        return true
-    elseif res <= 0 && !isnothing(m.accu)
+    elseif !isnothing(m.accu)
         m.accu = nothing
         return true
     end
@@ -807,17 +812,15 @@ function set_resolution!(m::VariableTrainmatcher, res::Cfloat)
 end
 
 function Base.empty!(m::VariableTrainmatcher)
-    empty!(m.x_data)
-    empty!(m.y_data)
+    foreach(empty!, m.data)
     m.accu = nothing
     m.last_vector_tid = -1
 end
 
-# In-place x↔y swap; the accu is rebuilt on the next set_resolution! call.
+# Swap the first two variables; the accu is rebuilt on the next set_resolution!
+# call.
 function swap!(m::VariableTrainmatcher)
-    for i in eachindex(m.x_data, m.y_data)
-        m.x_data[i], m.y_data[i] = m.y_data[i], m.x_data[i]
-    end
+    m.data[1], m.data[2] = m.data[2], m.data[1]
     m.accu = nothing
 end
 
@@ -871,6 +874,7 @@ function clear_paired_data!(view::SpecView)
     for layer in view.layers
         if !isnothing(layer.matcher)
             empty!(layer.matcher)
+            empty!(layer.colors)
         end
     end
 end
@@ -1490,13 +1494,13 @@ function default_spec(name, store)
     layer = if data isa AbstractMatrix
         color = ChannelDef("value", FieldType_Quantitative, "value", false, "turbo", false)
         LayerSpec(String(name), Mark_Rect, 1.0, axis_channel(dim_field(2, "col"), store.xlabel),
-                  axis_channel(dim_field(1, "row"), store.ylabel), color, nothing)
+                  axis_channel(dim_field(1, "row"), store.ylabel), color, LookupTransform[])
     else
         histogram = store.plot_type == :histogram
         x_field = data isa CircularBuffer ? "trainId" : dim_field(1, "index")
         LayerSpec(String(name), histogram ? Mark_Bar : Mark_Line, 1.0,
                   axis_channel(x_field, store.xlabel, histogram), axis_channel("value", store.ylabel),
-                  nothing, nothing)
+                  nothing, LookupTransform[])
     end
     PlotSpec(name, [layer]; title = store.title, fixed_aspect = store.fixed_aspect)
 end
@@ -1510,8 +1514,19 @@ axis_channel(field, label, binned = false) = ChannelDef(field, FieldType_Quantit
 function correlation_spec(x_name, y_name, x, y)
     key = x.type == VariableType_Scalar ? LookupKey_TrainId : LookupKey_Index
     layer = LayerSpec(String(y_name), Mark_Point, 0.5, axis_channel("x", x.title), axis_channel("value", y.title),
-                      nothing, LookupTransform(key, String(x_name), "value", "x"))
+                      nothing, [LookupTransform(key, String(x_name), "value", "x")])
     PlotSpec("", [layer])
+end
+
+# The spec of a mesh scan: Z's values at the (X, Y) positions of their trains,
+# coloured by value.
+function mesh_spec(x_name, y_name, z_name, x, y, z)
+    color = ChannelDef("value", FieldType_Quantitative, z.title, false, "viridis", false)
+    lookups = [LookupTransform(LookupKey_TrainId, String(x_name), "value", "x"),
+               LookupTransform(LookupKey_TrainId, String(y_name), "value", "y")]
+    layer = LayerSpec(String(z_name), Mark_Point, 1.0, axis_channel("x", x.title), axis_channel("y", y.title),
+                      color, lookups)
+    PlotSpec("", [layer]; fixed_aspect = false)
 end
 
 # The number of the dim a field names: a DimArray's dim by name, or any array's
@@ -1632,57 +1647,107 @@ function image_axis(explicit, data, dim)
     end
 end
 
-# The (x, y) variables a lookup layer pairs.
-function lookup_pair(spec::LayerSpec)
-    if spec.x.field == spec.lookup.as
-        spec.lookup.dataset, spec.data
-    else
-        spec.data, spec.lookup.dataset
+# The variables a lookup layer matches: those on x and y, then the coloured one
+# if there are two lookups.
+function lookup_names(spec::LayerSpec)
+    function channel_name(channel)
+        i = findfirst(lookup -> lookup.as == channel.field, spec.lookups)
+        isnothing(i) ? spec.data : spec.lookups[i].dataset
+    end
+    names = [channel_name(spec.x), channel_name(spec.y)]
+    if length(spec.lookups) == 2
+        push!(names, spec.data)
+    end
+    names
+end
+
+# Append the colour of each value on `scale`.
+function colormap_colors!(colors, values, scale::ColorScale)
+    lut = [ig.ColorConvertFloat4ToU32(ImPlot.SampleColormap(t, scale.colormap)) for t in range(0, 1; length = 256)]
+    span = scale.clip_max - scale.clip_min
+    for value in values
+        v = scale.log ? log10(value) : value
+        t = if !isfinite(v)
+            0.0
+        elseif span > 0
+            clamp((v - scale.clip_min) / span, 0.0, 1.0)
+        else
+            0.5
+        end
+        push!(colors, lut[round(Int, t * 255) + 1])
     end
 end
 
-# What to draw for a layer pairing two variables: their matched samples, or for
-# scalars a band around the binned means once there's a binning resolution.
+# Points coloured by value, all recoloured when the colour scale changes.
+function colored_points!(layer::ViewLayer, xs, ys, zs, data_updated, label)
+    img = layer.image
+    log = img.log_scale[]
+    reset = isnothing(layer.color_scale) || layer.color_scale.log != log
+    if reset || (data_updated && img.colorbar.autoscale[])
+        fit_colorbar!(img.colorbar, layer.hist_buf, zs, log, reset)
+    end
+
+    cb = img.colorbar
+    scale = ColorScale(cb.clip_min[], cb.clip_max[], log, img.colormap)
+    if scale != layer.color_scale || length(layer.colors) > length(zs)
+        empty!(layer.colors)
+        layer.color_scale = scale
+    end
+    colormap_colors!(layer.colors, @view(zs[length(layer.colors) + 1:end]), scale)
+    ColoredPoints(xs, ys, layer.colors, label)
+end
+
+# What to draw for a lookup layer: for two variables their matched samples, or a
+# band around the binned means. For three, the third coloured at the positions
+# of the first two, or an image of the binned means.
 function lookup_frame(view::SpecView, layer::ViewLayer, updated_variables)
     spec = layer.spec
-    x_name, y_name = lookup_pair(spec)
+    names = lookup_names(spec)
     variable_data = state[].client.variable_data
-    if !haskey(variable_data, x_name) || !haskey(variable_data, y_name)
-        Empty("Waiting for data: $(x_name), $(y_name)")
+    if !all(name -> haskey(variable_data, name), names)
+        Empty("Waiting for data: $(join(names, ", "))")
     else
-        x = variable_data[x_name]
-        y = variable_data[y_name]
-        by_train = spec.lookup.key == LookupKey_TrainId
-        if x.type != y.type || x.type != (by_train ? VariableType_Scalar : VariableType_Vector)
-            throw(SpecError("$(y_name): a lookup on $(by_train ? "trainId pairs scalars" : "index pairs vectors"), " *
-                            "got a $(var_type_label(x)) and a $(var_type_label(y))"))
+        stores = [variable_data[name] for name in names]
+        by_train = spec.lookups[1].key == LookupKey_TrainId
+        wanted = by_train ? VariableType_Scalar : VariableType_Vector
+        if any(store -> store.type != wanted, stores)
+            throw(SpecError("$(spec.data): a lookup on $(by_train ? "trainId matches scalars" : "index matches vectors"), " *
+                            "got $(join(var_type_label.(stores), ", "))"))
         end
 
         m = layer.matcher
         data_updated = if by_train
-            appended = ingest_scalar!(m, x, y, updated_variables, x_name, y_name)
-            # Follow the X variable's hint (0 for none) until the user sets a resolution
-            if !view.resolution_touched
-                view.binning_resolution[] = Cfloat(x.bin_resolution)
+            appended = ingest_scalar!(m, stores, updated_variables, names)
+            # Follow each position's hint (0 for none) until the user sets a resolution
+            for d in 1:length(names) - 1
+                if !view.resolution_touched[d]
+                    view.binning_resolution[d] = Cfloat(stores[d].bin_resolution)
+                end
             end
-            rebinned = set_resolution!(m, view.binning_resolution[])
+            rebinned = set_resolution!(m, view.binning_resolution)
             appended || rebinned
         else
-            ingest_vector!(m, x, y)
+            ingest_vector!(m, stores)
         end
 
-        if length(m.x_data) != length(m.y_data)
-            Empty("Cannot correlate vectors of different lengths ($(length(m.x_data)) vs $(length(m.y_data))).")
+        label = join(names, " vs ")
+        binned = !isnothing(m.accu)
+        if !allequal(length, m.data)
+            Empty("Cannot correlate vectors of different lengths ($(join(length.(m.data), " vs "))).")
+        elseif length(m.data) == 3 && binned && length(m.accu) > 0
+            # Rows run along Y and columns along X
+            prepare_heatmap!(layer.image, transpose(parent(m.accu.mean)), positions(m.accu, 1),
+                             positions(m.accu, 2), data_updated)
+        elseif length(m.data) == 3
+            colored_points!(layer, m.data[1], m.data[2], m.data[3], data_updated, label)
         else
             # Only scalars are ever binned
-            binned = !isnothing(m.accu)
-            xs = binned ? positions(m.accu, 1) : m.x_data
-            ys = binned ? parent(m.accu.mean) : m.y_data
+            xs = binned ? positions(m.accu, 1) : m.data[1]
+            ys = binned ? parent(m.accu.mean) : m.data[2]
             if layer === view.layers[1] && fit_wanted(view.fit, data_updated)
                 compute_fit!(view.fit, ys, xs; sigma = binned ? 1 ./ sqrt.(parent(m.accu.count)) : nothing)
             end
 
-            label = "$(x_name) vs $(y_name)"
             if binned
                 half = 0.5 .* parent(m.accu.std)
                 Band(xs, ys .- half, ys .+ half, ys, label)
@@ -1705,7 +1770,7 @@ end
 # reuse their buffers. Returns `updated_variables` as the view sees it.
 function sync_arrays!(view::SpecView, variable_data, updated_variables)
     arrays = Set(layer.spec.data for layer in view.layers
-                 if isnothing(layer.spec.lookup) && holds_array(variable_data, layer.spec.data))
+                 if isempty(layer.spec.lookups) && holds_array(variable_data, layer.spec.data))
     snapshots = view.snapshots
     if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1)
         empty!(snapshots)
@@ -1780,7 +1845,7 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
     spec = layer.spec
     name = spec.data
     store = view_store(view, name)
-    if !isnothing(spec.lookup)
+    if !isempty(spec.lookups)
         push!(frames, lookup_frame(view, layer, updated_variables))
     elseif isnothing(store) || store.data isa ArrayMetadata
         push!(frames, Empty("Waiting for data: $(name)"))
@@ -1882,14 +1947,17 @@ function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
 end
 
 # The matcher for a lookup layer replacing `previous`. It keeps the history when
-# it still pairs the same two variables, swapped over if they traded places.
+# it still matches the same variables, swapped over if x and y traded places.
 function carry_matcher(previous::Maybe{ViewLayer}, spec::LayerSpec)
     if isnothing(previous) || isnothing(previous.matcher) ||
-       previous.spec.lookup.key != spec.lookup.key
-        nothing
-    elseif lookup_pair(previous.spec) == lookup_pair(spec)
+       previous.spec.lookups[1].key != spec.lookups[1].key
+        return nothing
+    end
+    old = lookup_names(previous.spec)
+    new = lookup_names(spec)
+    if old == new
         previous.matcher
-    elseif reverse(lookup_pair(previous.spec)) == lookup_pair(spec)
+    elseif [old[2], old[1], old[3:end]...] == new
         swap!(previous.matcher)
         previous.matcher
     else
@@ -1919,7 +1987,7 @@ function set_spec!(view::SpecView, plot::Plot, spec::PlotSpec)
     for (i, layer_spec) in enumerate(spec.layers)
         previous = i <= length(old) ? old[i] : nothing
         image = nothing
-        if layer_spec.mark == Mark_Rect
+        if layer_spec.mark == Mark_Rect || length(layer_spec.lookups) == 2
             if isnothing(previous) || isnothing(previous.image)
                 # The spec only seeds the toggles
                 image = ImageState(; fixed_aspect = Ref(spec.fixed_aspect), log_scale = Ref(layer_spec.color.log))
@@ -1931,14 +1999,18 @@ function set_spec!(view::SpecView, plot::Plot, spec::PlotSpec)
             image.colormap = scheme_colormap(something(layer_spec.color.scheme, "viridis"))
         end
         matcher = nothing
-        if !isnothing(layer_spec.lookup)
+        if !isempty(layer_spec.lookups)
             matcher = carry_matcher(previous, layer_spec)
             if isnothing(matcher)
-                matcher = VariableTrainmatcher()
-                # A new X variable goes back to following its resolution hint
-                if isnothing(previous) || isnothing(previous.matcher) ||
-                   lookup_pair(previous.spec)[1] != lookup_pair(layer_spec)[1]
-                    view.resolution_touched = false
+                names = lookup_names(layer_spec)
+                matcher = VariableTrainmatcher(length(names))
+                # A new position variable goes back to following its resolution hint
+                old_names = isnothing(previous) || isnothing(previous.matcher) ? String[] :
+                            lookup_names(previous.spec)
+                for d in 1:length(names) - 1
+                    if d > length(old_names) - 1 || old_names[d] != names[d]
+                        view.resolution_touched[d] = false
+                    end
                 end
             end
         end
@@ -1966,8 +2038,9 @@ end
 # The label the data gives a channel whose title the spec leaves open: what the
 # variable's default plot shows along it, or the title of a paired variable.
 function data_label(layer::LayerSpec, channel::ChannelDef)
-    paired = !isnothing(layer.lookup)
-    name = paired && channel.field == layer.lookup.as ? layer.lookup.dataset : layer.data
+    paired = !isempty(layer.lookups)
+    i = findfirst(lookup -> lookup.as == channel.field, layer.lookups)
+    name = isnothing(i) ? layer.data : layer.lookups[i].dataset
     store = get(state[].client.variable_data, name, nothing)
     if isnothing(store) || store.data isa ArrayMetadata
         ""
@@ -2033,20 +2106,22 @@ end
 
 function refresh_spec!(view::SpecView, plot::Plot, source::CorrelationSpec)
     variable_data = state[].client.variable_data
-    x_name, y_name = source.selected
+    names = filter(!isempty, source.selected)
     if isempty(source.variable_names)
         "No scalar or vector variables available to correlate."
-    elseif !haskey(variable_data, x_name) || !haskey(variable_data, y_name)
-        "Waiting for data: $(x_name), $(y_name)"
+    elseif !all(name -> haskey(variable_data, name), names)
+        "Waiting for data: $(join(names, ", "))"
     else
-        x = variable_data[x_name]
-        y = variable_data[y_name]
-        if x.type != y.type
+        stores = [variable_data[name] for name in names]
+        if length(names) == 2 && stores[1].type != stores[2].type
             "Both variables must have the same type to correlate against each other."
+        elseif length(names) == 3 && any(store -> store.type != VariableType_Scalar, stores)
+            "A mesh scan needs scalar X, Y and Z variables."
         else
-            key = (x_name, y_name, x.type, x.title, y.title)
+            key = (names, [store.type for store in stores], [store.title for store in stores])
             if key != view.spec_key
-                set_spec!(view, plot, correlation_spec(x_name, y_name, x, y))
+                spec = length(names) == 2 ? correlation_spec(names..., stores...) : mesh_spec(names..., stores...)
+                set_spec!(view, plot, spec)
                 view.spec_key = key
             end
             nothing
@@ -2099,6 +2174,19 @@ function prepare!(view::SpecView, plot::Plot, updated_variables)
     end
 end
 
+# Clip the colorbar to the (p1, p99) of `data`. The visible range follows unless
+# the user zoomed it, or on a `reset`.
+function fit_colorbar!(cb::ColorbarState, hist_buf, data, log, reset)
+    dmin, dmax = sampled_pctile!(hist_buf, data, log)
+    cb.clip_min[] = dmin
+    cb.clip_max[] = dmax
+    if reset || !cb.display_zoomed
+        margin = 0.1 * (dmax - dmin)
+        cb.display_min[] = dmin - margin
+        cb.display_max[] = dmax + margin
+    end
+end
+
 # Upload `data` to the GPU heatmap held by `img` and colormap it, returning the
 # Image frame to draw. Reuses cached GPU resources across frames; only re-uploads
 # and rescales when the data changed, log mode toggled, or on first use.
@@ -2119,17 +2207,7 @@ function prepare_heatmap!(img::ImageState, data, x_axis, y_axis, was_updated)
             upload_data!(gpu, data)
         end
         if needs_initial_upload || log_changed || cb.autoscale[]
-            dmin, dmax = sampled_pctile!(gpu.hist_buf, data, log)
-            cb.clip_min[] = dmin
-            cb.clip_max[] = dmax
-            # Don't stomp a manual zoom — only reset the visible range
-            # if the user has not adjusted it themselves (or just
-            # toggled log mode, which makes the old range meaningless).
-            if needs_initial_upload || log_changed || !cb.display_zoomed
-                margin = 0.1 * (dmax - dmin)
-                cb.display_min[] = dmin - margin
-                cb.display_max[] = dmax + margin
-            end
+            fit_colorbar!(cb, gpu.hist_buf, data, log, needs_initial_upload || log_changed)
         end
         render_colormapped!(gpu, ctx, cb.clip_min[], cb.clip_max[], log)
         gpu.log_scale = log
@@ -2168,6 +2246,14 @@ function plot_frame!(frame::Line)
         ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec)
     else
         ImPlot.PlotLine(frame.label, frame.xs, frame.ys; spec)
+    end
+end
+
+function plot_frame!(frame::ColoredPoints)
+    GC.@preserve frame begin
+        colors = pointer(frame.colors)
+        spec = ImPlot.ImPlotSpec(; MarkerFillColors = colors, MarkerLineColors = colors)
+        ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec)
     end
 end
 
@@ -2235,7 +2321,7 @@ function side_panel(view::SpecView)
                ig.ImGuiSliderFlags_AlwaysClamp)
 
     # The compression of the first layer's variable, unless it's paired with another
-    if !isempty(view.layers) && isnothing(view.layers[1].spec.lookup)
+    if !isempty(view.layers) && isempty(view.layers[1].spec.lookups)
         name = view.layers[1].spec.data
         store = get(client.variable_data, name, nothing)
         if !isnothing(store) && !(store.data isa CircularBuffer) && ig.CollapsingHeader("Compression##$(id)")
@@ -2243,7 +2329,7 @@ function side_panel(view::SpecView)
         end
     end
     # The fit follows the first layer, and there's nothing to fit on an image
-    if !isempty(view.layers) && view.layers[1].spec.mark == Mark_Rect
+    if !isempty(view.layers) && !isnothing(view.layers[1].image)
         ig.BeginDisabled()
         ig.CollapsingHeader("Fitting##$(id)")
         ig.EndDisabled()
@@ -2267,14 +2353,19 @@ function bottom_controls(view::SpecView)
         end
     end
 
-    if any(layer -> !isnothing(layer.matcher) && layer.spec.lookup.key == LookupKey_TrainId, view.layers)
-        ig.SameLine()
-        ig.SetNextItemWidth(135)
-        if ig.DragFloat("Binning resolution##$(id)",
-                        view.binning_resolution, 0.01f0,
-                        0.0f0, typemax(Cfloat), "%.12f",
-                        ig.ImGuiSliderFlags_AlwaysClamp)
-            view.resolution_touched = true
+    i = findfirst(layer -> !isnothing(layer.matcher) && layer.spec.lookups[1].key == LookupKey_TrainId, view.layers)
+    if !isnothing(i)
+        D = length(view.layers[i].matcher.data) - 1
+        labels = D == 1 ? ("Binning resolution",) : ("X resolution", "Y resolution")
+        for d in 1:D
+            ig.SameLine()
+            ig.SetNextItemWidth(135)
+            if ig.DragFloat("$(labels[d])##$(id)",
+                            Ref(view.binning_resolution, d), 0.01f0,
+                            0.0f0, typemax(Cfloat), "%.12f",
+                            ig.ImGuiSliderFlags_AlwaysClamp)
+                view.resolution_touched[d] = true
+            end
         end
     end
 
@@ -2332,7 +2423,8 @@ end
 # The state of the first image the view draws, if any. It's the one the colorbar
 # and the image controls act on.
 function image_state(view::SpecView)
-    i = findfirst(layer -> !isnothing(layer.image) && !isnothing(layer.image.gpu_heatmap), view.layers)
+    i = findfirst(layer -> !isnothing(layer.image) &&
+                           (!isnothing(layer.image.gpu_heatmap) || !isnothing(layer.color_scale)), view.layers)
     isnothing(i) ? nothing : view.layers[i].image
 end
 
@@ -2355,7 +2447,7 @@ function draw_plot(plot::Plot, updated_variables)
         frames = prepare!(view, plot, updated_variables)
         all_empty = all(f -> f isa Empty, frames)
         # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
-        has_image = any(layer -> !isnothing(layer.image), view.layers)
+        has_image = any(f -> f isa Image, frames)
 
         if all_empty
             for f in frames
@@ -2395,7 +2487,8 @@ function draw_plot(plot::Plot, updated_variables)
 
             if !isnothing(img)
                 ig.SameLine()
-                if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y))
+                if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
+                   !isnothing(img.gpu_heatmap)
                     cb = img.colorbar
                     update_colormap!(get_heatmap_context(), img.colormap)
                     render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
@@ -2434,16 +2527,22 @@ function var_type_label(store)
     end
 end
 
-# A combo picking one of `var_names`. Returns the selected name.
-function var_combo(label, selected, var_names, variable_data)
+# A combo picking one of `var_names`, or "" for None if `optional`. Returns the
+# selected name.
+function var_combo(label, selected, var_names, variable_data, optional = false)
     preview = if haskey(variable_data, selected)
         "$(selected)  ($(var_type_label(variable_data[selected])))"
+    elseif optional && isempty(selected)
+        "None"
     else
         selected
     end
     ig.SetNextItemWidth(250)
 
     if ig.BeginCombo(label, preview)
+        if optional && ig.Selectable("None", isempty(selected))
+            selected = ""
+        end
         for name in var_names
             is_selected = name == selected
             if ig.Selectable(name, is_selected)
@@ -2467,7 +2566,7 @@ end
 # Widgets at the top of the plot window, above the plot area.
 top_controls(::SpecSource, id) = nothing
 
-# The X/Y variable pickers. The view rebuilds its spec from the selection, see
+# The X/Y/Z variable pickers. The view rebuilds its spec from the selection, see
 # refresh_spec!.
 function top_controls(source::CorrelationSpec, id)
     variable_data = state[].client.variable_data
@@ -2483,7 +2582,8 @@ function top_controls(source::CorrelationSpec, id)
     # Seed the selection on first use. A selected variable that goes away (e.g.
     # over a context reload) stays selected, so it's restored once it reappears.
     if !isempty(source.variable_names)
-        for i in eachindex(source.selected)
+        # Only X and Y, Z is optional
+        for i in 1:2
             if isempty(source.selected[i])
                 source.selected[i] = source.variable_names[1]
             end
@@ -2492,11 +2592,13 @@ function top_controls(source::CorrelationSpec, id)
 
     # The paired history follows the swap, see carry_matcher
     if ig.Button("Swap axes##$(id)")
-        reverse!(source.selected)
+        source.selected[1], source.selected[2] = source.selected[2], source.selected[1]
     end
 
     ig.SameLine()
     source.selected[1] = var_combo("X##corr-x-$(id)", source.selected[1], source.variable_names, variable_data)
     ig.SameLine()
     source.selected[2] = var_combo("Y##corr-y-$(id)", source.selected[2], source.variable_names, variable_data)
+    ig.SameLine()
+    source.selected[3] = var_combo("Z##corr-z-$(id)", source.selected[3], source.variable_names, variable_data, true)
 end

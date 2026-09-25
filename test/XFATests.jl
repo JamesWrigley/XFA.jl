@@ -913,9 +913,9 @@ end
     # otherwise an untyped field is nominal.
     @test spectra.y.type == XFA.FieldType_Quantitative
     @test spectra.color.type == XFA.FieldType_Nominal
-    @test isnothing(spectra.lookup)
+    @test isempty(spectra.lookups)
     @test correlation.mark == XFA.Mark_Point
-    @test correlation.lookup == XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "motor")
+    @test correlation.lookups == [XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "motor")]
     @test compiled.rois == [XFA.RoiParam("grp.roi", XFA.RectROI()),
                             XFA.RoiParam("grp.band", XFA.LinearROI(2.0, 3.0; axis=:x))]
     @test compiled.models == [XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "spectra.fit", nothing)]
@@ -955,9 +955,22 @@ end
     paired(x, y) = base("transform" => lookup("index"), "mark" => Dict("type" => "point", "opacity" => 0.5),
                         "encoding" => Dict("x" => quantitative(x), "y" => quantitative(y)))
     layer = only(XFA.compile_spec("a", paired("b", "value")).layers)
-    @test (layer.lookup.key, layer.opacity) == (XFA.LookupKey_Index, 0.5)
-    @test XFA.lookup_pair(layer) == ("b", "a")
-    @test XFA.lookup_pair(only(XFA.compile_spec("a", paired("value", "b")).layers)) == ("a", "b")
+    @test (only(layer.lookups).key, layer.opacity) == (XFA.LookupKey_Index, 0.5)
+    @test XFA.lookup_names(layer) == ["b", "a"]
+    @test XFA.lookup_names(only(XFA.compile_spec("a", paired("value", "b")).layers)) == ["a", "b"]
+
+    # Two lookups place the layer's own value at the points they give, coloured by it
+    pull(name, as, key = "trainId") = Dict("lookup" => key, "as" => as,
+                                           "from" => Dict("data" => Dict("name" => name), "key" => key,
+                                                          "fields" => ["value"]))
+    colored = Dict("field" => "value", "type" => "quantitative", "scale" => Dict("type" => "log"))
+    mesh(pairs...) = base("transform" => [pull("m1", "x"), pull("m2", "y")], "mark" => "point",
+                          "encoding" => Dict("x" => quantitative("x"), "y" => quantitative("y"), "color" => colored),
+                          pairs...)
+    layer = only(XFA.compile_spec("a", mesh()).layers)
+    @test length(layer.lookups) == 2 && layer.color.log
+    @test XFA.lookup_names(layer) == ["m1", "m2", "a"]
+    @test XFA.datasets(XFA.compile_spec("a", mesh())) == Set(["a", "m1", "m2"])
 
     # Anything outside the subset is rejected with a message
     rejected = [
@@ -971,7 +984,11 @@ end
         base("mark" => "rect") => "a rect needs a quantitative color",
         base("transform" => [Dict("filter" => "datum.value > 1")]) => "only lookup transforms",
         base("transform" => lookup("trainId")) => "from.key: must be the same as lookup",
-        paired("index", "value") => "a lookup must pull",
+        paired("index", "value") => "a lookup must plot against",
+        mesh("mark" => "line") => "two lookups must be points",
+        mesh("encoding" => Dict("x" => quantitative("x"), "y" => quantitative("y"))) => "two lookups must be points",
+        mesh("transform" => [pull("m1", "x"), pull("m2", "y", "index")]) => "must share a key",
+        mesh("transform" => [pull("m1", "x"), pull("m2", "y"), pull("m3", "z")]) => "at most two lookup transforms",
         base("params" => [Dict("name" => "p", "select" => "point")]) => "only interval selections",
     ]
     for (bad, message) in rejected
@@ -984,20 +1001,20 @@ end
         spec = XFA.correlation_spec("motor", "intensity", motor, intensity)
         layer = only(spec.layers)
         @test (layer.mark, layer.opacity) == (XFA.Mark_Point, 0.5)
-        @test layer.lookup == XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "x")
-        @test XFA.lookup_pair(layer) == ("motor", "intensity")
+        @test layer.lookups == [XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "x")]
+        @test XFA.lookup_names(layer) == ["motor", "intensity"]
         @test (spec.xlabel, spec.ylabel) == ("Motor", "")
         @test XFA.datasets(spec) == Set(["motor", "intensity"])
         # Vectors are paired per element instead
         motor.type = intensity.type = XFA.VariableType_Vector
         vectors = only(XFA.correlation_spec("motor", "intensity", motor, intensity).layers)
-        @test vectors.lookup.key == XFA.LookupKey_Index
+        @test only(vectors.lookups).key == XFA.LookupKey_Index
 
         # A new spec keeps the paired history if the same two variables are
         # still paired, following a swap of the axes
-        matcher = XFA.VariableTrainmatcher()
-        append!(matcher.x_data, [1.0, 2.0])
-        append!(matcher.y_data, [10.0, 20.0])
+        matcher = XFA.VariableTrainmatcher(2)
+        append!(matcher.data[1], [1.0, 2.0])
+        append!(matcher.data[2], [10.0, 20.0])
         previous = XFA.ViewLayer(; spec=layer, matcher)
         @test XFA.carry_matcher(previous, layer) === matcher
         swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
@@ -1005,10 +1022,56 @@ end
         motor.type = intensity.type = XFA.VariableType_Scalar
         swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
         @test XFA.carry_matcher(previous, swapped) === matcher
-        @test (matcher.x_data, matcher.y_data) == ([10.0, 20.0], [1.0, 2.0])
+        @test matcher.data == [[10.0, 20.0], [1.0, 2.0]]
         other = only(XFA.correlation_spec("other", "motor", intensity, motor).layers)
         @test isnothing(XFA.carry_matcher(previous, other))
         @test isnothing(XFA.carry_matcher(nothing, layer))
+
+        # A mesh scan colours Z at the X/Y positions, and swapping keeps Z
+        mesh = only(XFA.mesh_spec("motor", "intensity", "z", motor, intensity, intensity).layers)
+        @test (mesh.data, mesh.color.field) == ("z", "value")
+        @test XFA.lookup_names(mesh) == ["motor", "intensity", "z"]
+        matcher = XFA.VariableTrainmatcher(3)
+        append!.(matcher.data, [[1.0], [2.0], [3.0]])
+        swapped = only(XFA.mesh_spec("intensity", "motor", "z", intensity, motor, intensity).layers)
+        @test XFA.carry_matcher(XFA.ViewLayer(; spec=mesh, matcher), swapped) === matcher
+        @test matcher.data == [[2.0], [1.0], [3.0]]
+    end
+
+    @testset "Train matching" begin
+        function scalar_store(pairs...)
+            store = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar,
+                                      scalar_tids=XFA.CircularBuffer{Int}(10))
+            for (tid, value) in pairs
+                push!(store.scalar_tids, tid)
+                push!(store.data, value)
+            end
+            store
+        end
+        # Train 3 is missing Y and train 4's Z isn't finite
+        stores = [scalar_store(1 => 0.0, 2 => 0.0, 3 => 1.0, 4 => 1.0),
+                  scalar_store(1 => 0.0, 2 => 1.0, 4 => 1.0),
+                  scalar_store(1 => 5.0, 2 => 7.0, 3 => 1.0, 4 => NaN)]
+        names = ["x", "y", "z"]
+        m = XFA.VariableTrainmatcher(3)
+        @test XFA.ingest_scalar!(m, stores, Dict("z" => Set(1:4)), names)
+        @test sort(m.data[3]) == [5.0, 7.0]
+        @test !XFA.ingest_scalar!(m, stores, Dict("other" => Set([1])), names)
+
+        # Binning needs a resolution for both positions, and rebuilds when one changes
+        @test !XFA.set_resolution!(m, Cfloat[0.5, 0])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0.5])
+        @test m.accu isa XFA.Scalar2dScan
+        @test XFA.positions(m.accu, 2) == [0.0, 1.0]
+        @test !XFA.set_resolution!(m, Cfloat[0.5, 0.5])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0.25])
+        @test XFA.set_resolution!(m, Cfloat[0, 0.25]) && isnothing(m.accu)
+
+        # Two variables bin over one position
+        m = XFA.VariableTrainmatcher(2)
+        XFA.ingest_scalar!(m, stores[[1, 3]], Dict("x" => Set(1:4)), ["x", "z"])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0]) && m.accu isa XFA.Scalar1dScan
+        @test parent(m.accu.mean) == [6.0, 1.0]
     end
 
     @testset "Default specs" begin

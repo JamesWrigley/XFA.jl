@@ -150,6 +150,14 @@ struct Band <: PlotType
     label::String
 end
 
+# Scatter points, each with its own colour.
+struct ColoredPoints <: PlotType
+    xs::Vector{Float64}
+    ys::Vector{Float64}
+    colors::Vector{UInt32}
+    label::String
+end
+
 # Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
 # may be nothing (defaults to pixel coords).
 struct Image <: PlotType
@@ -189,13 +197,13 @@ end
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
 end
 
-# Pairs samples from two VariableData stores on matching train IDs. Owns the
-# paired history buffers and an optional binning accumulator. Pure data
-# plumbing — no ImGui state.
+# Matches samples from several VariableData stores on train IDs, one history
+# buffer per store in lookup_names order. The last is the value, binned over the
+# others as positions once there's a resolution. Pure data plumbing — no ImGui
+# state.
 @kwdef mutable struct VariableTrainmatcher
-    const x_data::Vector{Float64} = Float64[]
-    const y_data::Vector{Float64} = Float64[]
-    accu::Maybe{Scalar1dScan} = nothing
+    const data::Vector{Vector{Float64}}
+    accu::Union{Nothing, Scalar1dScan, Scalar2dScan} = nothing
     # Last vector-mode tid consumed, so we only copy once per matched train.
     last_vector_tid::Int = -1
 end
@@ -209,11 +217,11 @@ struct DefaultSpec <: SpecSource
     models::Vector{ModelOverlay}
 end
 
-# A correlation of two variables picked in the plot window, authored as a
-# lookup spec (see correlation_spec).
+# A correlation of variables picked in the plot window, authored as a lookup
+# spec (see correlation_spec).
 @kwdef struct CorrelationSpec <: SpecSource
-    # The X and Y variables, "" until there's one to pick.
-    selected::Vector{String} = ["", ""]
+    # The X, Y and optional Z variables, "" until there's one to pick (or for no Z).
+    selected::Vector{String} = ["", "", ""]
     # Refreshed each frame from client.variable_data; used by the X/Y combos.
     variable_names::Vector{String} = String[]
 end
@@ -224,14 +232,25 @@ struct AdvertisedSpec <: SpecSource
     name::String
 end
 
-# One layer of a SpecView. `image` is the state of a rect layer, `matcher` pairs
-# the two variables of a lookup layer, and `series` holds the series a color
-# channel groups the data into, rebuilt when it updates.
+struct ColorScale
+    clip_min::Float64
+    clip_max::Float64
+    log::Bool
+    colormap::Cint
+end
+
+# One layer of a SpecView. `image` is the state of a rect layer or of points
+# coloured by value, `matcher` matches the variables of a lookup layer, and
+# `series` holds the series a color channel groups the data into. `colors` are
+# the points' colours on `color_scale`.
 @kwdef mutable struct ViewLayer
     const spec::LayerSpec
     image::Maybe{ImageState} = nothing
     const matcher::Maybe{VariableTrainmatcher} = nothing
     const series::Vector{PlotType} = PlotType[]
+    const colors::Vector{UInt32} = UInt32[]
+    color_scale::Maybe{ColorScale} = nothing
+    const hist_buf::Vector{Int32} = Int32[]
 end
 
 # The curves of one of a spec's models, resampled when its parameters update.
@@ -302,10 +321,10 @@ end
     const layers::Vector{ViewLayer} = ViewLayer[]
     const models::Vector{ViewModel} = ViewModel[]
     const subscribed::Set{String} = Set{String}()
-    # Bin width of the trainId lookup layers, 0 for a plain scatter. Follows the
-    # X variable's hint until the user touches it.
-    const binning_resolution::Ref{Cfloat} = Ref(Cfloat(0))
-    resolution_touched::Bool = false
+    # Bin width per position axis of the trainId lookup layers, 0 for no
+    # binning. Each follows its variable's hint until the user touches it.
+    const binning_resolution::Vector{Cfloat} = Cfloat[0, 0]
+    const resolution_touched::Vector{Bool} = [false, false]
     # ROI parameter values updated locally during a drag, keyed by parameter
     # name. Flushed to the engine when the user releases the mouse so we don't
     # flood it with per-frame updates.
