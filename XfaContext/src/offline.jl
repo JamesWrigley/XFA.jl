@@ -24,7 +24,14 @@ end
 # holding the GIL, so the task is pinned and the GIL released after an import.
 function guard_pythoncall_import(f)
     if haskey(Base.loaded_modules, PythonCall_pkgid)
-        return f()
+        state = @invokelatest pysafe_enter()
+        try
+            return f()
+        catch ex
+            @invokelatest pysafe_rethrow(ex)
+        finally
+            @invokelatest pysafe_exit(state)
+        end
     end
 
     pinned = () -> begin
@@ -57,19 +64,29 @@ function guard_pythoncall_import(f)
     end
 end
 
-# Call `f()` holding the GIL with the task pinned to its OS thread, rethrowing
-# Python exceptions as plain errors. Implemented by the PythonCall extension.
-function pysafe end
+# Take the GIL and pin the task to its OS thread, undone by `pysafe_exit`, and
+# rethrow Python exceptions as plain errors. Implemented by the PythonCall
+# extension.
+function pysafe_enter end
+function pysafe_exit end
+function pysafe_rethrow end
 
 """
     @pysafe expr
 
 Evaluate `expr` holding the Python GIL, for calling Python from a variable.
 Requires PythonCall to be loaded by the context file. Keep Julia blocking
-operations (`put!`, `wait`, `sleep`) out of it.
+operations (`put!`, `wait`, `sleep`) out of it. `expr` runs in the enclosing
+scope, so variables it assigns stay visible afterwards.
 """
 macro pysafe(expr)
-    :($pysafe(() -> $(esc(expr))))
+    # The raw :trycatch/:tryfinally forms don't open a scope like `try` does
+    state = gensym("pysafe_state")
+    Expr(:block,
+         :($state = $pysafe_enter()),
+         Expr(:trycatch,
+              Expr(:tryfinally, esc(expr), :($pysafe_exit($state))),
+              :($pysafe_rethrow($(Expr(:the_exception))))))
 end
 
 # Offline input API over an extra-data DataCollection, implemented by the

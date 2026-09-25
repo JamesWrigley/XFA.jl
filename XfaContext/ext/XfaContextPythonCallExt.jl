@@ -10,20 +10,41 @@ import DimensionalData as DD
 using FileWatching: FDWatcher
 using PythonCall
 
-# Run `expr` holding the GIL with the task pinned to its OS thread, since
+# Serialises Julia tasks' use of Python. Native code may drop the GIL mid-call
+# and re-take it in a GC-unsafe ccall, which deadlocks if another Julia thread
+# took the GIL meanwhile and then waits for a GC. Waiting on this lock yields,
+# so it can't block the GC.
+const PYTHON_LOCK = ReentrantLock()
+
+# Wait for the GIL in a GC-safe region, otherwise a GC started while a
+# non-Julia thread holds the GIL deadlocks.
+gil_ensure() = @ccall gc_safe=true $(PythonCall.C.POINTERS.PyGILState_Ensure)()::PythonCall.C.PyGILState_STATE
+
+# Take the Python lock and the GIL with the task pinned to its OS thread, since
 # releasing the GIL from another thread than the one that took it crashes.
-# Keep Julia blocking primitives (`put!`, `wait`) outside it.
+function gil_enter()
+    lock(PYTHON_LOCK)
+    task = current_task()
+    was_sticky = task.sticky
+    task.sticky = true
+    return (gil_ensure(), was_sticky)
+end
+
+function gil_exit((state, was_sticky))
+    PythonCall.C.PyGILState_Release(state)
+    current_task().sticky = was_sticky
+    unlock(PYTHON_LOCK)
+end
+
+# Run `expr` holding the GIL. Keep Julia blocking primitives (`put!`, `wait`)
+# outside it.
 macro pysafe_impl(expr)
     quote
-        task = current_task()
-        was_sticky = task.sticky
-        task.sticky = true
-        state = PythonCall.C.PyGILState_Ensure()
+        state = gil_enter()
         try
             $(esc(expr))
         finally
-            PythonCall.C.PyGILState_Release(state)
-            task.sticky = was_sticky
+            gil_exit(state)
         end
     end
 end
@@ -63,26 +84,33 @@ end
 
 # Showing a Python exception needs the GIL, which the pipeline doesn't hold when
 # it logs a failed input, so re-raise it as a plain error rendered under the GIL.
+# `backtrace=false` would also drop the Python stacktrace, so pass an empty
+# Julia backtrace instead; the new error carries its own.
+function XfaContext.pysafe_rethrow(ex)
+    if ex isa PyException
+        msg = @pysafe_impl sprint((io, ex) -> showerror(io, ex, []; backtrace=true), ex)
+        throw(ErrorException(msg))
+    end
+    rethrow()
+end
+
 function pyguard(f)
     try
         f()
     catch ex
-        if ex isa PyException
-            throw(ErrorException(@pysafe_impl sprint(showerror, ex)))
-        end
-        rethrow()
+        XfaContext.pysafe_rethrow(ex)
     end
 end
 
+XfaContext.pysafe_enter() = gil_enter()
+
 # Also frees Python objects finalized off the GIL since the last call, which
 # would otherwise pile up while the pipeline runs.
-function XfaContext.pysafe(f)
-    pyguard() do
-        @pysafe_impl try
-            f()
-        finally
-            PythonCall.GC.gc()
-        end
+function XfaContext.pysafe_exit(state)
+    try
+        PythonCall.GC.gc()
+    finally
+        gil_exit(state)
     end
 end
 
