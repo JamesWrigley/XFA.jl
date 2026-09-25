@@ -19,7 +19,7 @@ using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
     ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
-    Scalar1dScan, positions, upstream_closure,
+    BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
