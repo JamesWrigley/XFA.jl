@@ -35,7 +35,6 @@ using TOML: TOML
 using Sockets: Sockets
 using CRC32c: crc32c
 using LibGit2: LibGit2
-using Logging: global_logger
 using Sentry: Sentry
 using XfaContext: XfaContext
 using Serialization
@@ -2115,8 +2114,7 @@ function setup_sentry(settings)
         Sentry.init(get(sentry_settings, "dsn", nothing);
                     environment=get(sentry_settings, "environment", nothing),
                     release="xfa@$(pkgversion(XFA))",
-                    in_app_modules=[XFA, XfaContext, XfaEngine])
-        global_logger(Sentry.SentryLogger())
+                    in_app_include=[XFA, XfaContext, XfaEngine])
     end
 end
 

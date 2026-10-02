@@ -160,7 +160,7 @@ macro guiasync(expr)
             try
                 $(esc(expr))
             catch
-                Sentry.capture_exception(; message="Unhandled task error")
+                Sentry.capture_exception(; handled=false, mechanism_type="task")
                 rethrow()
             end
         end)

@@ -18,7 +18,6 @@ ImGuiNodeEditor = "85025696-5a8b-405d-b30a-426ddbef1325"
 ImPlot = "e8efc688-5342-4ad4-b4ba-9025a731b363"
 LibGit2 = "76f85450-5226-5b5a-8eaa-529ad045b433"
 LibSSH = "00483490-30f8-4353-8aba-35b82f51f4d0"
-Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 ModernGL = "66fc600b-dfda-50eb-8b99-91cfa97b1301"
 NaNStatistics = "b946abbf-3ea7-4610-9019-9858bfdeaf2d"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
@@ -36,7 +35,6 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
-Sentry = {rev = "updates", url = "https://github.com/JamesWrigley/Sentry.jl"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}
 
@@ -55,7 +53,6 @@ ImGuiNodeEditor = "1.0.0"
 ImPlot = "0.8"
 LibGit2 = "1"
 LibSSH = "1"
-Logging = "1"
 ModernGL = "1"
 NaNStatistics = "0.6.55"
 PrecompileTools = "1.2.1"
