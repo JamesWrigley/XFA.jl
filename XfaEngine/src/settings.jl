@@ -73,13 +73,13 @@ end
 # Hardcoded remap rules shipped with XFA. The combined effective list is
 # `user_rules ++ BUILTIN_REMAP_RULES` so user rules always win.
 const BUILTIN_REMAP_RULES = RemapRule[
-    RemapRule(RemapKind_Simple,
-              raw"^(.+):output\[data\.image\.pixels\]$",
-              "AravisBaslerCamera",
-              raw"\1:output[data.image.data]"),
     RemapRule(RemapKind_Proxy,
               raw"^.+:dataOutput\[.+\]$",
               "JungfrauCorrection",
+              ""),
+    RemapRule(RemapKind_Proxy,
+              raw"^.+:dataOutput\[.+\]$",
+              "Epix100Correction",
               "")
 ]
 

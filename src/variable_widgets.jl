@@ -2,21 +2,113 @@
     zmq_outputs::Union{Vector{String}, Exception, Nothing} = nothing
     zmq_outputs_request::Maybe{Int} = nothing
     selected_output::Cint = 0
+    auto_select_output::Bool = false
+    from_directory::Bool = false
 end
 
-function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, name, var_data, gui_state)
+# Change a parameter on the engine and in the context source, without reloading.
+function set_input_param(name, param, value)
+    param.value = value
+    change_parameter(Parameter(param.name, value))
+    @guiasync set_group_param(state[], name, chopprefix(param.name, "$(name)."),
+                              format_param_value(value); reload=false)
+end
+
+function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var_data, gui_state)
     var_data["draw_parameters"] = false
-    client = state[].client
     params = var_data["parameters"]
 
     if isnothing(gui_state)
-        gui_state = KaraboBridgeGuiState()
+        gui_state = KaraboBridgeGuiState(; from_directory=!isempty(params["run_directory"].value))
     end
 
     ig.Text("Parameters:")
 
+    offline = params["offline"]
+    ig.Text("mode:")
+    ig.SameLine()
+    if ig.RadioButton("Online##$(name)", !offline.value) && offline.value
+        set_input_param(name, offline, false)
+    end
+    ig.SameLine()
+    if ig.RadioButton("Offline##$(name)", offline.value) && !offline.value
+        set_input_param(name, offline, true)
+    end
+
+    if offline.value
+        draw_offline_run(name, var_data, gui_state)
+    else
+        draw_online_bridge(name, params, gui_state)
+    end
+
+    return gui_state
+end
+
+# The run is either a directory or a proposal/run pair; the engine prefers a
+# non-empty directory, so switching to proposal/run clears it and vice versa.
+function draw_offline_run(name, var_data, gui_state)
+    client = state[].client
+    params = var_data["parameters"]
+    directory = params["run_directory"]
+    proposal = params["proposal"]
+    run = params["run"]
+
+    ig.Text("load from:")
+    ig.SameLine()
+    if ig.RadioButton("Proposal & run##$(name)", !gui_state.from_directory) && gui_state.from_directory
+        gui_state.from_directory = false
+        if !isempty(directory.value)
+            set_input_param(name, directory, "")
+        end
+    end
+    ig.SameLine()
+    if ig.RadioButton("Run directory##$(name)", gui_state.from_directory) && !gui_state.from_directory
+        gui_state.from_directory = true
+        for param in (proposal, run)
+            if param.value != 0
+                set_input_param(name, param, 0)
+            end
+        end
+    end
+
+    if gui_state.from_directory
+        draw_parameter("run_directory", directory)
+    else
+        draw_parameter("proposal", proposal)
+        draw_parameter("run", run)
+    end
+
+    rate = params["rate"]
+    ig.Text("rate (Hz):")
+    ig.SameLine()
+    ig.SetNextItemWidth(225)
+    new_rate = Ref(rate.value)
+    if ig.InputDouble("##rate-$(name)", new_rate, 0.0, 0.0, "%.1f", ig.ImGuiInputTextFlags_EnterReturnsTrue) && new_rate[] > 0
+        client.pending_source_edit = rate.name
+        change_parameter(Parameter(rate.name, new_rate[]))
+    end
+
+    configured = !isempty(directory.value) || (proposal.value > 0 && run.value > 0)
+    sources = get(client.sources_by_input, "$(name).stream", nothing)
+    if configured && !isnothing(sources)
+        if isempty(sources)
+            ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), "No sources found, is the run readable?")
+        else
+            ig.TextDisabled("$(length(sources)) sources in the run")
+        end
+    end
+
+    processed, total = var_data["displayables"]["progress"].value
+    if total > 0
+        ig.ProgressBar(processed / total, ig.ImVec2(225, 0))
+    end
+end
+
+function draw_online_bridge(name, params, gui_state)
+    client = state[].client
+
     tm_param = params["trainmatcher"]
-    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
+    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param, client.trainmatcher_sources)
     if tm_modified
         tm_param[] = new_tm
         @guiasync set_group_param(state[], name, "trainmatcher",
@@ -24,6 +116,7 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
 
         gui_state.zmq_outputs = nothing
         gui_state.selected_output = 0
+        gui_state.auto_select_output = true
     end
 
     draw_parameter("manual_configuration", params["manual_configuration"])
@@ -33,7 +126,7 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
     else
         # Fetch zmqOutputs from the trainmatcher device
         tm = params["trainmatcher"].value
-        if !isempty(tm.topic) && !isempty(tm.name) && !is_pending(client, gui_state.zmq_outputs_request)
+        if !isnothing(tm) && !isempty(tm.topic) && !isempty(tm.name) && !is_pending(client, gui_state.zmq_outputs_request)
             if isnothing(gui_state.zmq_outputs)
                 gui_state.zmq_outputs_request = send_with_callback(
                     client, GetDeviceProperty(tm.topic, tm.name, "zmqOutputs"),
@@ -55,6 +148,18 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
             ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), sprint(showerror, gui_state.zmq_outputs))
         elseif gui_state.zmq_outputs isa Vector
             if !isempty(gui_state.zmq_outputs)
+                # After a trainmatcher change, push the first output through as the new address
+                if gui_state.auto_select_output
+                    gui_state.auto_select_output = false
+                    gui_state.selected_output = 0
+                    new_address = gui_state.zmq_outputs[1]
+                    address_param = params["address"]
+                    if address_param.value != new_address
+                        client.pending_source_edit = address_param.name
+                        change_parameter(Parameter(address_param.name, new_address))
+                    end
+                end
+
                 # Sync combo selection with the current address parameter
                 current_address = params["address"].value
                 if !isempty(current_address)
@@ -85,6 +190,67 @@ function draw_variable_content(::Val{Symbol("XfaEngine.Context.KaraboBridge")}, 
             end
         end
     end
+end
 
-    return gui_state
+# The scantool is chosen among the Karabacon devices. With one assigned the
+# motor dependency and resolution are derived by the engine (see Scan in
+# context_builtins.jl), so the derived parameters are hidden and the motor's
+# pin is shown but not editable.
+function draw_variable_content(::Val{Symbol("XfaContext.Scan")}, name, var_data, gui_state)
+    var_data["draw_parameters"] = false
+    params = var_data["parameters"]
+    automatic = isassigned(params["scantool"])
+
+    ig.Text("Parameters:")
+    for (param_name, param) in params
+        if param_name == "scantool"
+            scantools = filter(s -> s.class_id == "Karabacon", state[].client.source_list)
+            draw_parameter(param_name, param, scantools)
+        elseif !(automatic && param_name in ("resolution", "position_property"))
+            draw_parameter(param_name, param)
+        end
+    end
+
+    for pin in var_data["dependencies"]
+        pin.readonly = automatic && pin.field == "position1"
+    end
+    return nothing
+end
+
+# Resolve the variable name connected to a group's Parameter{Dependency} field.
+function group_dep_variable(var_data, field::AbstractString)
+    for pin in var_data["dependencies"]
+        if pin.field == field
+            return pin.dep.name
+        end
+    end
+    return nothing
+end
+
+# Plots the spectrum with the fitted spikes drawn over it. spike_fitting returns
+# a (params, n_spikes) matrix where each column is (y0, A, mu, sigma) for one
+# spike.
+function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, gui_state)
+    client = state[].client
+    if ig.Button("Plot fits##$(name)")
+        spectrum_name = group_dep_variable(var_data, "spectrum")
+        if !isnothing(spectrum_name)
+            fits = ModelOverlay(:gaussian; params="$(name).spike_fitting", title="spike fit")
+            push!(client.plots, variable_plot(spectrum_name, client.plot_counter, [fits]))
+            client.plot_counter += 1
+        end
+    end
+    return nothing
+end
+
+function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp, min_node_width)
+    param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
+    for param_name in param_order
+        if param_name == "buffer_size" && !pp.params["windowed"].value
+            continue
+        end
+        if haskey(pp.params, param_name)
+            draw_parameter(param_name, pp.params[param_name]; min_node_width)
+        end
+    end
 end

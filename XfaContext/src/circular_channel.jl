@@ -7,7 +7,7 @@ mutable struct CircularChannel{T} <: AbstractChannel{T}
     const lock::ReentrantLock
     const cond_take::Threads.Condition
     @atomic drop_count::Int
-    @atomic size::Int
+    @atomic length::Int
     @atomic is_open::Bool
 end
 
@@ -18,11 +18,11 @@ end
 
 drop_count(c::CircularChannel) = @atomic c.drop_count
 
-# `size` mirrors `length(buffer)` but is maintained as an atomic so that
-# `length()` can be queried lock-free (e.g. from telemetry running outside
-# the producer/consumer tasks). put!/take! already hold the lock, so the
-# atomic update is essentially free there.
-Base.size(c::CircularChannel) = @atomic c.size
+# The `length` field mirrors `length(buffer)` but is maintained as an atomic
+# so that `length()` can be queried lock-free (e.g. from telemetry running
+# outside the producer/consumer tasks). put!/take! already hold the lock, so
+# the atomic update is essentially free there.
+Base.length(c::CircularChannel) = @atomic c.length
 DataStructures.capacity(c::CircularChannel) = DataStructures.capacity(c.buffer)
 
 function Base.put!(c::CircularChannel{T}, v) where T
@@ -34,7 +34,7 @@ function Base.put!(c::CircularChannel{T}, v) where T
         if isfull(c.buffer)
             @atomic c.drop_count += 1
         else
-            @atomic c.size += 1
+            @atomic c.length += 1
         end
         push!(c.buffer, item)
         notify(c.cond_take, nothing; all=false)
@@ -50,7 +50,7 @@ function Base.take!(c::CircularChannel)
             end
             wait(c.cond_take)
         end
-        @atomic c.size -= 1
+        @atomic c.length -= 1
         return popfirst!(c.buffer)
     end
 end

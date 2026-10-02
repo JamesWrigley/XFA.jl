@@ -45,7 +45,11 @@ function ssh_initialize(state::GuiState)
 
     if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
         push!(client.ssh_hops, SshState(; address=BASTION))
-        push!(client.ssh_hops, SshState(; address=GATEWAY))
+        # Maxwell nodes (max-*) are reachable from bastion, the online cluster
+        # needs the gateway hop too.
+        if !startswith(address, "max-")
+            push!(client.ssh_hops, SshState(; address=GATEWAY))
+        end
     end
 
     # This is the blocking SSH session used for SFTP
@@ -57,6 +61,12 @@ function ssh_initialize(state::GuiState)
     ssh_initialize_hop(state, 1, user)
 end
 
+# Pin every SSH session's actor + fd poller to one dedicated default-pool
+# thread so their per-poll notify/wait handshake stays thread-local instead of
+# thrashing the cross-thread scheduler. The last default thread tends to be
+# quieter than the first, which GUI/engine work lands on.
+ssh_pin_tid() = first(Threads.threadpooltids(:default))
+
 function ssh_initialize_hop(state, hop_idx, user)
     client = state.client
     ssh_state = client.ssh_hops[hop_idx]
@@ -65,14 +75,16 @@ function ssh_initialize_hop(state, hop_idx, user)
     if !isnothing(forwarder_idx) # hop_idx > firstindex(client.ssh_hops)
         # Connect to the forwarded port 22
         forwarder = client.ssh_hops[forwarder_idx].forwarder
-        session = ssh.Session(forwarder.localinterface, forwarder.localport; user)
+        session = ssh.Session(forwarder.localinterface, forwarder.localport;
+                               user, pin_tid=ssh_pin_tid())
 
         # Reset the host so that GSSAPI auth works
         session.host = ssh_state.address
 
         ssh_state.session = session
     else
-        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port; user)
+        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port;
+                                        user, pin_tid=ssh_pin_tid())
     end
 
     ssh_authenticate_hop(state, hop_idx)
@@ -165,6 +177,33 @@ function auth_supported(auth_method)
     end
 end
 
+# The sources of the package at `dir` that differ from HEAD, staged or not, as
+# paths relative to `dir`. Untracked files aren't included.
+function changed_sources(dir)
+    repo = LibGit2.GitRepoExt(dir)
+    # The default flags would also report untracked files
+    status = LibGit2.GitStatus(repo; status_opts=LibGit2.StatusOptions(; flags=0))
+    # Status paths are relative to the repository
+    prefix = normpath(joinpath(relpath(dir, LibGit2.workdir(repo)), "src")) * "/"
+
+    sources = String[]
+    try
+        for i in 1:length(status)
+            entry = status[i]
+            delta = entry.index_to_workdir == C_NULL ? entry.head_to_index : entry.index_to_workdir
+            path = unsafe_string(unsafe_load(delta).new_file.path)
+            if startswith(path, prefix)
+                push!(sources, joinpath("src", chopprefix(path, prefix)))
+            end
+        end
+    finally
+        close(status)
+        close(repo)
+    end
+
+    return sources
+end
+
 function sync_files()
     client = state[].client
     if client.embedded_engine
@@ -173,26 +212,31 @@ function sync_files()
 
     client.syncing = true
     try
-        engine_dir = joinpath(pkgdir(XfaEngine), "src")
-        git_diff = readchomp(`git diff --name-only $(engine_dir)`)
-        if isempty(git_diff)
-            @info "No files to sync"
-            return
+        synced = 0
+        for (local_dir, remote_dir) in ((pkgdir(XfaEngine), client.remote_engine_dir),
+                                        (pkgdir(XfaContext), client.remote_context_dir))
+            for path in changed_sources(local_dir)
+                local_path = joinpath(local_dir, path)
+                # Deleted files are in the diff too, there's nothing to send for them
+                if !isfile(local_path)
+                    continue
+                end
+
+                # Note that we read `local_path` before opening the remote path.
+                # This to avoid the file getting truncated by `open(; write=true)`
+                # if we're SSH'ing locally.
+                data = read(local_path)
+                open(joinpath(remote_dir, path), client.sftp; write=true) do f
+                    write(f, data)
+                end
+                synced += 1
+            end
         end
 
-        changed_files = split(git_diff, "\n")
-
-        for path in changed_files
-            local_path = joinpath(engine_dir, basename(path))
-            remote_path = joinpath(client.remote_engine_dir, "src", basename(path))
-
-            # Note that we read `local_path` before opening `remote_path`. This to
-            # avoid the file getting truncated by `open(; write=true)` if we're
-            # SSH'ing locally.
-            data = read(local_path)
-            open(remote_path, client.sftp; write=true) do f
-                write(f, data)
-            end
+        if synced == 0
+            @info "No files to sync"
+        else
+            @info "Synced $(synced) file(s) to the engine"
         end
     finally
         client.syncing = false
@@ -208,7 +252,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202601 > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202602 > /dev/null 2>&1"
     end
 
     bootstrap_process = nothing
@@ -230,8 +274,7 @@ function initialize_engine(state)
                 write(f, code)
             end
 
-            bootstrap_env = Dict("XFA_ENVIRONMENT" => state.engine_environment,
-                                 "XFA_WORKING_DIR" => working_dir)
+            bootstrap_env = Dict("XFA_WORKING_DIR" => working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
             bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
@@ -361,8 +404,37 @@ function restart_engine(state)
     initialize_engine(state)
 end
 
-# Create a Int32 hash to use for ImNodes
-node_hash(x) = reinterpret(Cint, crc32c(x))
+# 32-bit hash for ImPlot drag-tool ids, whose id parameter is a C int. Node
+# editor ids use hash() directly (a Csize_t-width, content-derived id).
+int32_hash(x, y) = reinterpret(Cint, crc32c(y, crc32c(x)))
+
+# Add a subvariable of `var_name` to its node: a plain output pin, or a
+# postprocessor entry with its own parameters. `node_name` is the node the pin
+# lives on, which for a group variable is the group.
+function add_subvariable!(node, ctx_info, node_name, var_name, subvar, pp_names)
+    subvar_id = hash("$(var_name).outputs.$(subvar)")
+    if subvar in pp_names
+        pp_prefix = "$(subvar)."
+        pp_params = Dict{String, Any}()
+        for (param_name, param) in ctx_info["parameters"]
+            if startswith(param_name, pp_prefix)
+                pp_params[chopprefix(param_name, pp_prefix)] = param
+            end
+        end
+        push!(node["postprocessors"], (
+            id = subvar_id,
+            name = subvar,
+            display_name = chopprefix(subvar, "$(node_name)."),
+            tree_id_suffix = "###pp_$(subvar)",
+            plot_id = "Plot##pp_plot_$(subvar)",
+            params = pp_params,
+            origin = ctx_info["postprocessor_origins"][subvar],
+        ))
+    else
+        push!(node["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(node_name)."), true))
+    end
+    return subvar_id
+end
 
 function build_context_state(state, ctx_info)
     ctx_state = Dict{String, Any}()
@@ -371,6 +443,9 @@ function build_context_state(state, ctx_info)
     empty!(state.client.parameter_states)
     empty!(state.client.karabo_dep_states)
     empty!(state.client.dep_text_states)
+    empty!(state.client.ne_dep_pins)
+    empty!(state.client.ne_output_pins)
+    empty!(state.client.pending_nodes)
     empty!(safe_input_text_cache)
 
     group_names = Set(ctx_info["groups"])
@@ -385,7 +460,7 @@ function build_context_state(state, ctx_info)
             continue
         end
 
-        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => hash(name))
 
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
@@ -394,36 +469,23 @@ function build_context_state(state, ctx_info)
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
 
-        for dep_pair in deps
-            attr_id = node_hash("$(name).dependencies.$(dep_pair)")
-            push!(ctx_state[name]["dependencies"], (attr_id, dep_pair))
+        for (arg_name, dep) in deps
+            attr_id = hash("$(name).dependencies.$(arg_name => dep)")
+            push!(ctx_state[name]["dependencies"], DependencyPin(; id=attr_id, arg_name, dep))
+            if dep isa Dependency
+                state.client.ne_dep_pins[attr_id] = DepPinInfo(name, arg_name, name, dep)
+            end
         end
 
         # The variable itself is always the first output
-        push!(ctx_state[name]["outputs"], OutputPin(node_hash("$(name).outputs."), ""))
+        output_id = hash("$(name).outputs.")
+        push!(ctx_state[name]["outputs"], OutputPin(output_id, ""))
+        state.client.ne_output_pins[output_id] = OutputPinInfo(name, name)
 
         pp_names = Set(get(postprocessors_info, name, String[]))
         for subvar in ctx_info["subvariables"][name]
-            subvar_id = node_hash("$(name).outputs.$(subvar)")
-            if subvar in pp_names
-                pp_prefix = "$(subvar)."
-                pp_params = Dict{String, Any}()
-                for (param_name, param) in ctx_info["parameters"]
-                    if startswith(param_name, pp_prefix)
-                        pp_params[chopprefix(param_name, pp_prefix)] = param
-                    end
-                end
-                push!(ctx_state[name]["postprocessors"], (
-                    id = subvar_id,
-                    name = subvar,
-                    display_name = chopprefix(subvar, "$(name)."),
-                    tree_id_suffix = "###pp_$(subvar)",
-                    plot_id = "Plot##pp_plot_$(subvar)",
-                    params = pp_params,
-                ))
-            else
-                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
-            end
+            subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, name, subvar, pp_names)
+            state.client.ne_output_pins[subvar_id] = OutputPinInfo(name, subvar)
         end
     end
 
@@ -431,44 +493,53 @@ function build_context_state(state, ctx_info)
     for name in ctx_info["groups"]
         group_filter = startswith("$(name).")
 
-        ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+        ctx_state[name] = Dict{String, Any}("id" => hash(name))
         ctx_state[name]["dependencies"] = []
         ctx_state[name]["outputs"] = []
+        ctx_state[name]["postprocessors"] = []
         ctx_state[name]["type"] = :group
         ctx_state[name]["origin"] = ctx_info["origins"][name]
         ctx_state[name]["draw_parameters"] = true
         ctx_state[name]["links"] = LinkInfo[]
         ctx_state[name]["parameters"] = Dict{String, Any}()
-        # Maps attr_id -> group struct field name, for arg_names that bind to a
-        # Parameter{Dependency} field of the group. The client uses the field
-        # name (not the @Variable's arg_name) when rewriting the constructor
-        # kwarg in source.
-        ctx_state[name]["dep_field_names"] = Dict{Int, String}()
+        ctx_state[name]["displayables"] = Dict{String, Any}(chopprefix(d_name, "$(name).") => d
+                                                            for (d_name, d) in ctx_info["displayables"]
+                                                            if group_filter(d_name))
+        ctx_state[name]["callbacks"] = OrderedDict{String, String}(cb_name => title
+                                                                   for (cb_name, title) in ctx_info["callbacks"]
+                                                                   if group_filter(cb_name))
 
         group_param_args = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
 
-        # Add dependencies from group member variables as inputs on the group node
+        # Add Parameter{Dependency} fields of the group struct as inputs. Member
+        # variable dependencies that don't bind to a group field are excluded:
+        # they're either group-internal references or static (and editable via
+        # parameters).
         dep_param_names = Set{String}()
+        seen_field_names = Set{String}()
         for (var_name, deps) in ctx_info["dag"]
             if !group_filter(var_name)
                 continue
             end
 
             for (arg_name, dep) in deps
-                if dep isa Dependency && dep.kind == DepKind_Group
-                    continue
-                end
-                if dep isa Parameter
-                    continue
-                end
-                attr_id = node_hash("$(var_name).dependencies.$(arg_name => dep)")
-                push!(ctx_state[name]["dependencies"], (attr_id, arg_name => dep))
                 field_name = get(get(group_param_args, var_name, Dict{String, String}()), arg_name, nothing)
-                if !isnothing(field_name)
-                    ctx_state[name]["dep_field_names"][attr_id] = field_name
-                    push!(dep_param_names, field_name)
-                else
-                    push!(dep_param_names, arg_name)
+                if isnothing(field_name)
+                    continue
+                end
+                if field_name in seen_field_names
+                    continue
+                end
+                push!(seen_field_names, field_name)
+                attr_id = hash("$(var_name).dependencies.$(arg_name => dep)")
+                push!(ctx_state[name]["dependencies"],
+                      DependencyPin(; id=attr_id, arg_name, dep, field=field_name,
+                                    optional=ctx_info["parameters"]["$(name).$(field_name)"].optional))
+                push!(dep_param_names, field_name)
+                # The group's kwarg is what gets rewritten, not the member
+                # variable's argument.
+                if dep isa Dependency
+                    state.client.ne_dep_pins[attr_id] = DepPinInfo(name, field_name, var_name, dep)
                 end
             end
         end
@@ -477,7 +548,7 @@ function build_context_state(state, ctx_info)
         inputs = filter(group_filter, keys(ctx_info["inputs"]))
         for input_name in inputs
             stripped_name = chopprefix(input_name, "$(name).")
-            push!(ctx_state[name]["outputs"], OutputPin(node_hash(input_name), stripped_name))
+            push!(ctx_state[name]["outputs"], OutputPin(hash(input_name), stripped_name))
         end
 
         # Add group variables from the DAG as outputs
@@ -488,21 +559,52 @@ function build_context_state(state, ctx_info)
             stripped_name = chopprefix(var_name, "$(name).")
 
             # The variable itself
-            attr_id = node_hash("$(var_name).outputs.")
+            attr_id = hash("$(var_name).outputs.")
             push!(ctx_state[name]["outputs"], OutputPin(attr_id, stripped_name))
+            state.client.ne_output_pins[attr_id] = OutputPinInfo(var_name, var_name)
 
             # Its subvariables
+            pp_names = Set(get(postprocessors_info, var_name, String[]))
             for subvar in ctx_info["subvariables"][var_name]
-                subvar_id = node_hash("$(var_name).outputs.$(subvar)")
-                push!(ctx_state[name]["outputs"], OutputPin(subvar_id, chopprefix(subvar, "$(name)."), true))
+                subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, var_name, subvar, pp_names)
+                state.client.ne_output_pins[subvar_id] = OutputPinInfo(var_name, subvar)
             end
         end
 
         for (param_name, param) in ctx_info["parameters"]
-            if group_filter(param_name)
-                stripped_name = chopprefix(param_name, "$(name).")
-                # Skip parameters that are already shown as dependency inputs
-                stripped_name in dep_param_names && continue
+            if !group_filter(param_name)
+                continue
+            end
+
+            stripped_name = chopprefix(param_name, "$(name).")
+            if stripped_name in dep_param_names
+                # Already shown as a dependency input
+                continue
+            end
+
+            # Drawn in the postprocessor's own tree
+            if any(pp -> startswith(param_name, "$(pp.name)."), ctx_state[name]["postprocessors"])
+                continue
+            end
+
+            if param isa Parameter{Dependency} && param.optional
+                # An unwired optional dependency is absent from the DAG, but it
+                # still gets a pin so a link can be dragged onto it.
+                attr_id = hash("$(name).dependencies.$(stripped_name)")
+                dep = Dependency("")
+                # The member variable consuming the field, for the cycle check
+                # when a link is dropped on the pin.
+                owner = name
+                for (var_name, mapping) in group_param_args
+                    if group_filter(var_name) && stripped_name in values(mapping)
+                        owner = var_name
+                        break
+                    end
+                end
+                push!(ctx_state[name]["dependencies"],
+                      DependencyPin(; id=attr_id, arg_name=stripped_name, dep, field=stripped_name, optional=true))
+                state.client.ne_dep_pins[attr_id] = DepPinInfo(name, stripped_name, owner, dep)
+            else
                 ctx_state[name]["parameters"][stripped_name] = param
             end
         end
@@ -515,9 +617,9 @@ function build_context_state(state, ctx_info)
         end
 
         if !haskey(ctx_info, name)
-            ctx_state[name] = Dict{String, Any}("id" => node_hash(name))
+            ctx_state[name] = Dict{String, Any}("id" => hash(name))
             ctx_state[name]["dependencies"] = []
-            ctx_state[name]["outputs"] = [OutputPin(node_hash(name), name)]
+            ctx_state[name]["outputs"] = [OutputPin(hash(name), name)]
             ctx_state[name]["type"] = :input
             ctx_state[name]["links"] = LinkInfo[]
         end
@@ -525,7 +627,19 @@ function build_context_state(state, ctx_info)
 
     node_dag = Dict(name => String[] for name in keys(ctx_state))
 
+    # Reverse lookup: (group_name, field_name) -> the single attr_id used as the
+    # group's pin for that field. Multiple member-variable deps bound to the
+    # same group field collapse to one link.
+    group_field_pins = Dict{Tuple{String, String}, UInt}()
+    for gname in ctx_info["groups"]
+        for pin in ctx_state[gname]["dependencies"]
+            group_field_pins[(gname, pin.field)] = pin.id
+        end
+    end
+    group_param_args_all = get(ctx_info, "group_parameter_args", Dict{String, Dict{String, String}}())
+
     new_links = LinkInfo[]
+    seen_link_ids = Set{UInt}()
     for (name, deps) in ctx_info["dag"]
         # Determine which node this variable belongs to
         node_name = is_group_var(name) ? group_of(name) : name
@@ -536,28 +650,37 @@ function build_context_state(state, ctx_info)
                 continue
             end
 
-            link_end_id = node_hash("$(name).dependencies.$(arg_name => dep)")
+            link_end_id = if is_group_var(name)
+                field_name = get(get(group_param_args_all, name, Dict{String, String}()), arg_name, nothing)
+                isnothing(field_name) ? nothing : get(group_field_pins, (node_name, field_name), nothing)
+            else
+                hash("$(name).dependencies.$(arg_name => dep)")
+            end
+            if isnothing(link_end_id)
+                continue
+            end
 
-            if dep isa Dependency && dep.kind == DepKind_Variable
-                if is_group_var(dep.name)
-                    # Link from the group node's output pin for this variable
-                    link_start_id = node_hash("$(dep.name).outputs.")
-                    dep_node = group_of(dep.name)
-                else
-                    link_start_id = ctx_state[dep.name]["outputs"][1].id
-                    dep_node = dep.name
+            if dep isa Dependency && dep.kind in (DepKind_Variable, DepKind_Subvariable)
+                owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
+                link_start_id = hash("$(owner).outputs.$(pin_suffix)")
+                dep_node = is_group_var(owner) ? group_of(owner) : owner
+                link_id = hash("$(link_start_id)->$(link_end_id)")
+                if !(link_id in seen_link_ids)
+                    push!(seen_link_ids, link_id)
+                    push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
                 end
-                link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
 
                 if dep_node != node_name
                     push!(node_dag[node_name], dep_node)
                 end
             elseif dep isa Dependency && dep.kind == DepKind_Karabo
                 input_name = ctx_info["dep_to_input"][dep.name]
-                link_start_id = node_hash(input_name)
-                link_id = node_hash("$(link_start_id)->$(link_end_id)")
-                push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                link_start_id = hash(input_name)
+                link_id = hash("$(link_start_id)->$(link_end_id)")
+                if !(link_id in seen_link_ids)
+                    push!(seen_link_ids, link_id)
+                    push!(new_links, LinkInfo(link_id, link_start_id, link_end_id, (dep.name, name)))
+                end
 
                 input_node_name = split(input_name, ".")[1]
                 if input_node_name != node_name
@@ -603,6 +726,12 @@ function build_context_state(state, ctx_info)
         end
     end
 
+    # Mirror the engine's parameter dict and @display map onto the client
+    # context so plot overlays can look up referenced parameters by name.
+    state.client.context.dag = ctx_info["dag"]
+    state.client.context.parameters = Dict{String, Parameter}(ctx_info["parameters"])
+    state.client.context.displays = Dict{String, Vector{String}}(get(ctx_info, "displays", Dict{String, Vector{String}}()))
+
     return ctx_state
 end
 
@@ -622,7 +751,7 @@ function coffman_graham(dag; W=3)
     return levels
 end
 
-function schema_property_names(schema::Dict)
+function schema_property_names(schema::AbstractDict)
     props = DeviceProperties()
     collect_properties!(props, "", schema)
     slow_order = sortperm(props.slow.names)
@@ -639,10 +768,10 @@ end
 
 const NDARRAY_PROPERTIES = ("data", "shape", "type", "isBigEndian")
 
-function collect_properties!(props, prefix, node::Dict, target::PropertyList=props.slow)
+function collect_properties!(props, prefix, node::AbstractDict, target::PropertyList=props.slow)
     for (key, value) in node
         path = isempty(prefix) ? key : "$(prefix).$(key)"
-        if value isa Dict
+        if value isa AbstractDict
             if get(value, "nodeType", "") == "Leaf"
                 push!(target.names, path)
                 push!(target.displayed_names, get(value, "displayedName", ""))
@@ -668,22 +797,21 @@ function store_variable_data!(client, variable::VariableData)
     data = variable.data
     name = variable.name
 
+    # `nothing` means the engine skipped this train (missing input, failed
+    # body, or a variable that opted out by returning nothing). Skip silently.
+    if isnothing(data)
+        return
+    end
+
     compression_ratio = NaN
     received_bytes = data isa AbstractArray ? sizeof(data) : 0
     if data isa CompressedArray
-        # Allocate fresh — the decompressed array is queued onto `store.updates`
-        # and read by GUI consumers later, so reusing one buffer per variable
-        # would let later trains overwrite a not-yet-consumed payload.
-        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
-        decompressed = decompress_array(ws, data)
+        # Don't decompress here: the payload is queued onto `store.updates` and
+        # draw_plots decompresses only the most recent one, so frames that pile
+        # up between renders are dropped before the expensive ZFP decode.
         received_bytes = sizeof(data.data) + (isnothing(data.nonfinite_mask) ? 0 : sizeof(data.nonfinite_mask))
-        compression_ratio = sizeof(decompressed) / received_bytes
-        variable = VariableData(; tid=variable.tid, name=variable.name, data=decompressed,
-                                subvariables=variable.subvariables,
-                                title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
-                                xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                                fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
-        data = decompressed
+        decompressed_bytes = prod(data.shape) * sizeof(data.original_eltype)
+        compression_ratio = decompressed_bytes / received_bytes
     end
 
     # Unsubscribed array variables arrive as shape-only metadata. We store the
@@ -700,6 +828,8 @@ function store_variable_data!(client, variable::VariableData)
         store.update_rate = variable.update_rate
         store.compression_ratio = compression_ratio
         store.received_bytes = received_bytes
+        store.compress = variable.compress
+        store.plot_specs = variable.plot_specs
         return
     end
 
@@ -707,11 +837,13 @@ function store_variable_data!(client, variable::VariableData)
         if data isa Number
             values = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
             tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-            push!(values, data)
-            push!(tids, variable.tid)
             client.variable_data[name] = VariableStore(; data=values, scalar_tids=tids)
         elseif data isa AbstractArray
             client.variable_data[name] = VariableStore(; data)
+        elseif data isa CompressedArray
+            # Seed with a buffer of the right eltype/shape so draw_plots can
+            # decompress into it in place rather than allocating per train.
+            client.variable_data[name] = VariableStore(; data=allocate_array(data))
         else
             @error "Unsupported variable type: $(typeof(data))"
             return
@@ -719,17 +851,36 @@ function store_variable_data!(client, variable::VariableData)
     end
 
     store = client.variable_data[name]
+    push!(store.updates, variable)
+    store.update_rate = variable.update_rate
+    store.compression_ratio = compression_ratio
+    store.received_bytes = received_bytes
+    store.compress = variable.compress
+end
+
+function apply_metadata!(store, variable::VariableData)
+    data = variable.data
+    name = variable.name
     store.title = if !isnothing(variable.title)
         variable.title
-    elseif data isa DimArray
-        DD.label(data)
     else
-        name
+        # An unnamed DimArray has an empty label, which would hide the legend entry
+        label = if data isa DimArray
+            DD.label(data)
+        elseif data isa CompressedArray && !isnothing(data.dims)
+            data.dims.name
+        else
+            ""
+        end
+        isempty(label) ? name : label
     end
     store.x_axis = variable.x_axis
     store.y_axis = variable.y_axis
     store.unit = variable.unit
+    store.bin_resolution = variable.bin_resolution
     store.fixed_aspect = variable.fixed_aspect
+    store.plot_type = variable.plot_type
+    store.plot_specs = variable.plot_specs
 
     # Use explicit labels if provided, otherwise derive from DimArray or data type.
     # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).
@@ -739,6 +890,8 @@ function store_variable_data!(client, variable::VariableData)
         DD.label(DD.dims(data)[2])
     elseif data isa DimArray
         DD.label(DD.dims(data)[1])
+    elseif data isa CompressedArray && !isnothing(data.dims)
+        string(length(data.shape) == 2 ? data.dims.dim_names[2] : data.dims.dim_names[1])
     elseif data isa Number
         "trainId"
     else
@@ -750,26 +903,26 @@ function store_variable_data!(client, variable::VariableData)
         DD.label(DD.dims(data)[1])
     elseif data isa DimArray
         DD.label(data)
+    elseif data isa CompressedArray && !isnothing(data.dims)
+        length(data.shape) == 2 ? string(data.dims.dim_names[1]) : data.dims.name
     else
         ""
     end
 
-    type = if data isa Number
+    store.type = if data isa Number
         VariableType_Scalar
     elseif data isa AbstractVector
         VariableType_Vector
     elseif data isa AbstractArray
         VariableType_Array
+    elseif data isa CompressedArray
+        length(data.shape) == 1 ? VariableType_Vector : VariableType_Array
     else
         VariableType_Unknown
     end
-    push!(store.updates, (variable.tid, data, type))
-    store.update_rate = variable.update_rate
-    store.compression_ratio = compression_ratio
-    store.received_bytes = received_bytes
 end
 
-@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor
+@enum ParameterOwnerKind ParameterOwner_Group ParameterOwner_Postprocessor ParameterOwner_Global
 
 struct ParameterOwner
     kind::ParameterOwnerKind
@@ -789,18 +942,38 @@ function find_parameter_owner(client, param_name::String)
                     return ParameterOwner(ParameterOwner_Group, var_name, nothing, field_name)
                 end
             end
-        elseif var_data["type"] === :variable
-            for pp in var_data["postprocessors"]
-                for (field_name, stored) in pp.params
-                    if stored.name == param_name
-                        return ParameterOwner(ParameterOwner_Postprocessor,
-                                              var_name, pp.name, field_name)
-                    end
+        end
+
+        # A group's member variables can have postprocessors too
+        for pp in get(var_data, "postprocessors", ())
+            for (field_name, stored) in pp.params
+                if stored.name == param_name
+                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp.name, field_name)
                 end
             end
         end
     end
+    # Top-level `name = Parameter(...)` — present in context.parameters but not
+    # nested under any group or postprocessor.
+    if haskey(client.context.parameters, param_name) && !occursin('.', param_name)
+        return ParameterOwner(ParameterOwner_Global, param_name, nothing, param_name)
+    end
     return nothing
+end
+
+# Flatten the sources of all the inputs into a single sorted list for
+# autocompletion, marking the sources whose name is served by more than one
+# topic as ambiguous so that they're completed topic-qualified.
+function build_source_list(sources)
+    topics = Dict{String, Set{String}}()
+    for source in sources
+        push!(get!(Set{String}, topics, source.name), source.topic)
+    end
+
+    source_list = [SourceInfo(source.topic, source.name, source.class_id,
+                              length(topics[source.name]) > 1)
+                   for source in unique(sources)]
+    return sort!(source_list; by=source -> source.name)
 end
 
 function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothing)
@@ -812,43 +985,35 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
 
-    elseif msg isa Devices
-        if msg.device_names isa ExceptionMessage
-            @error "Error from server with DEVICES" exception=msg.device_names.text
-            log_engine_error(state, "Failed to get devices", msg.device_names.text)
-            client.webproxy_status = RequestStatus_Error
+    elseif msg isa InputSources
+        if msg.input_sources isa ExceptionMessage
+            @error "Error from server with INPUTSOURCES" exception=msg.input_sources.text
+            log_engine_error(state, "Failed to get the input sources", msg.input_sources.text)
         else
-            client.karabo_devices = msg.device_names
-            client.device_tree = sort(
-                [(topic, sort([(name, sort(collect(info); by=first))
-                               for (name, info) in devices]; by=first))
-                 for (topic, devices) in msg.device_names]; by=first)
-            all_names = [name for (_, devices) in client.device_tree for (name, _) in devices]
-            seen = Set{String}()
-            ambiguous = Set{String}()
-            for name in all_names
-                if name in seen
-                    push!(ambiguous, name)
-                else
-                    push!(seen, name)
-                end
-            end
-            client.source_list = [SourceInfo((topic, name, name in ambiguous))
-                                  for (topic, devices) in client.device_tree
-                                  for (name, _) in devices]
+            client.sources_by_input = msg.input_sources
+            client.source_list = build_source_list(Iterators.flatten(values(msg.input_sources)))
+
             sources_by_topic = Dict{String, Vector{SourceInfo}}()
-            for s in client.source_list
-                if !haskey(sources_by_topic, s.topic)
-                    sources_by_topic[s.topic] = SourceInfo[]
+            for source in client.source_list
+                if !haskey(sources_by_topic, source.topic)
+                    sources_by_topic[source.topic] = SourceInfo[]
                 end
-                push!(sources_by_topic[s.topic], s)
+                push!(sources_by_topic[source.topic], source)
             end
             client.sources_by_topic = sources_by_topic
-            client.webproxy_status = RequestStatus_Idle
         end
 
-    elseif msg isa EngineDir
-        client.remote_engine_dir = msg.path
+    elseif msg isa PackageDirs
+        client.remote_engine_dir = msg.engine
+        client.remote_context_dir = msg.context
+
+    elseif msg isa AvailableVariables
+        if msg.variables isa ExceptionMessage
+            @error "Error from server with AvailableVariables" exception=msg.variables.text
+            log_engine_error(state, "Failed to get the available variables", msg.variables.text)
+        else
+            client.available_variables = msg.variables
+        end
 
     elseif msg isa AvailableTrainmatchers
         trainmatchers = Dict{String, Vector{String}}()
@@ -864,6 +1029,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             trainmatchers[topic] = names
         end
         client.trainmatchers = trainmatchers
+        client.trainmatcher_sources = build_source_list(
+            [SourceInfo(topic, name, "TrainMatcher")
+             for (topic, names) in trainmatchers for name in names])
         client.whitelisted_trainmatchers = whitelisted
         client.trainmatchers_request_status = RequestStatus_Idle
 
@@ -875,7 +1043,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remap_rules = msg.rules
 
     elseif msg isa DeviceSchema
-        client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        if msg.schema isa ExceptionMessage
+            @error "Error from server with DEVICESCHEMA" exception=msg.schema.text
+            log_engine_error(state, "Failed to get the schema of $(msg.topic)//$(msg.name)", msg.schema.text)
+        else
+            client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
+        end
         delete!(client.device_schema_requests, (msg.topic, msg.name))
 
     elseif msg isa DeviceProperty
@@ -887,6 +1060,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.source = msg.source
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
+            # The new context has its own inputs, so the sources we complete
+            # against have changed.
+            get_input_sources(client)
+            # A newly loaded context may pull in packages that register more
+            # variables, so refresh the add-variable palette.
+            get_available_variables(client)
         else
             @error "Context failed to load"
             log_engine_error(state, "Context failed to load", msg.info.text)
@@ -901,8 +1080,19 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                 store_variable_data!(client, subvar)
             end
         end
+    elseif msg isa DisplayableChanged
+        group, field = rsplit(msg.displayable.name, '.'; limit=2)
+        if haskey(client.context.context_state, group)
+            client.context.context_state[group]["displayables"][field] = msg.displayable
+        end
     elseif msg isa ParameterChanged
         param = msg.parameter
+        # Top-level dict covers globals (which aren't attached to any node).
+        # Group/postprocessor params share instances with the node dicts, so
+        # the walk below still updates them.
+        if haskey(client.context.parameters, param.name)
+            client.context.parameters[param.name].value = param.value
+        end
         # The same parameter may appear under a node's "parameters" dict (group
         # params) or inside a postprocessor's `params`. Walk every node and
         # update wherever the full name matches.
@@ -924,15 +1114,26 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             end
         end
 
+        # An input's configuration changed (trainmatcher, offline run...), so
+        # it may be serving a different set of sources now.
+        owner = find_parameter_owner(client, param.name)
+        if !isnothing(owner) && owner.kind == ParameterOwner_Group &&
+           any(startswith(input, "$(owner.var_name).") for input in keys(client.sources_by_input))
+            get_input_sources(client)
+        end
+
         if client.pending_parameter_change == param.name
             client.pending_parameter_change = nothing
         end
 
         if client.pending_source_edit == param.name
-            owner = find_parameter_owner(client, param.name)
-            if !isnothing(owner) && owner.kind == ParameterOwner_Group && param.value isa String
-                set_group_param(state, owner.var_name, owner.field_name,
-                                "\"$(escape_string(param.value))\""; reload=false)
+            new_value = isnothing(owner) ? nothing : format_param_value(param.value)
+            if !isnothing(new_value)
+                if owner.kind == ParameterOwner_Group
+                    set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)
+                elseif owner.kind == ParameterOwner_Global
+                    set_parameter_value(state, owner.var_name, new_value; reload=false)
+                end
             end
             client.pending_source_edit = nothing
         end
@@ -943,7 +1144,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
-        if !isnothing(msg.error)
+        # Callback errors are logged with the callback's name by invoke_callback
+        is_callback = !isnothing(replied_to) && replied_to.msg_type == InvokeCallback
+        if !isnothing(msg.error) && !is_callback
             @error "Server reported an error" exception=msg.error.text
             log_engine_error(state, "Server reported an error", msg.error.text)
         end
@@ -981,7 +1184,7 @@ function handle_server(state)
             # because the server is running locally or because it's running remotely
             # and we've forwarded the port. Connecting to open servers is not
             # support for the moment.
-            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true) do ws
+            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true, maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                 client.websocket = ws
 
                 # The first message we receive is our client ID
@@ -989,8 +1192,9 @@ function handle_server(state)
                 client.client_id = id
 
                 client.status = RemoteStatus_Connected
-                send(client, GetEngineDir())
-                get_devices(client)
+                send(client, GetPackageDirs())
+                get_input_sources(client)
+                get_available_variables(client)
                 get_trainmatchers(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
@@ -1030,6 +1234,7 @@ function handle_server(state)
         catch ex
             # If the client was already connected then we don't try again
             if !isnothing(client.websocket)
+                @error "Client websocket loop exited with exception" exception=(ex, catch_backtrace())
                 break
             end
 
@@ -1061,8 +1266,12 @@ function handle_server(state)
     end
 end
 
-function get_devices(client)
-    client.devices_request = send(client, GetDevices())
+function get_input_sources(client)
+    send(client, GetInputSources())
+end
+
+function get_available_variables(client)
+    send(client, GetVariables())
 end
 
 function get_trainmatchers(client)
@@ -1076,16 +1285,21 @@ function get_routing_rules(client)
 end
 
 # Returns (topic, device, classId) for the device referenced by `source`, or
-# ("", device, "") if the device isn't in the loaded topology.
+# ("", device, "") if the device isn't reported by any input.
 function source_device_info(client::ClientState, source::String)
     sep = find_separator(source)
-    device = strip_topic(isnothing(sep) ? source : source[1:sep-1])
-    for (topic, devices) in client.karabo_devices
-        if haskey(devices, device)
-            return topic, device, get(devices[device], "classId", "")
-        end
+    head = isnothing(sep) ? source : source[1:sep-1]
+    topic_hint, device = split_topic(head)
+
+    idx = findfirst(client.source_list) do known
+        known.name == device && (isempty(topic_hint) || known.topic == topic_hint)
     end
-    return "", device, ""
+    if isnothing(idx)
+        return topic_hint, device, ""
+    else
+        known = client.source_list[idx]
+        return known.topic, device, known.class_id
+    end
 end
 
 source_device_class(client::ClientState, source::String) = source_device_info(client, source)[3]
@@ -1100,6 +1314,7 @@ function apply_remap_rule(client::ClientState, rule::RemapRule, source,
     if !occursin(Regex(rule.device_class), device_class)
         return nothing, nothing
     end
+
     pattern = Regex(rule.source)
     if !occursin(pattern, source)
         return nothing, nothing
@@ -1158,6 +1373,36 @@ function remap_source(client::ClientState, source::String, property_ref::Ref{Any
     return source, nothing
 end
 
+# Whether `property` is usable with `source`, given the device's schema property
+# `names`. A property is valid if it's in the schema, or if it's what a schema
+# property becomes once the remap rules run: committed sources store the
+# remapped form, which never appears in the schema itself.
+function karabo_property_valid(client::ClientState, source::AbstractString, property::AbstractString, names)
+    if property in names
+        return true
+    end
+
+    topic, device, device_class = source_device_info(client, source)
+    rules = filter(rule -> rule.kind == RemapKind_Simple, client.remap_rules)
+    target = karabo_dep_string(nothing, source, property)
+
+    for name in names
+        remapped = karabo_dep_string(nothing, source, name)
+        for rule in rules
+            result, _ = apply_remap_rule(client, rule, remapped, topic, device, device_class,
+                                         Ref{Any}(nothing))
+            if !isnothing(result)
+                remapped = result
+            end
+        end
+        if remapped == target
+            return true
+        end
+    end
+
+    return false
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))
@@ -1175,6 +1420,17 @@ function change_parameter(param::Parameter)
     client = state[].client
     send(client, ChangeParameter(param))
     client.pending_parameter_change = param.name
+end
+
+function invoke_callback(name::String)
+    gui_state = state[]
+    on_reply = msg -> begin
+        if !isnothing(msg.error)
+            @error "Callback '$(name)' failed" exception=msg.error.text
+            log_engine_error(gui_state, "Callback '$(name)' failed", msg.error.text)
+        end
+    end
+    gui_state.client.callback_requests[name] = send_with_callback(gui_state.client, InvokeCallback(name), on_reply)
 end
 
 function start(state)
@@ -1207,24 +1463,24 @@ function set_remoterepl(state)
 end
 
 function send_subscriptions(client)
-    variables = Dict{String, Int}(name => sub.precision
-                                  for (name, sub) in client.subscriptions
-                                  if sub.active)
+    variables = Dict{String, Float64}(name => sub.k
+                                      for (name, sub) in client.subscriptions
+                                      if sub.active)
     send(client, SetVariableSubscriptions(variables))
 end
 
-# Update the requested zfp precision for a subscribed variable. Callers only
-# invoke this on a real change (e.g. InputInt edit), so we always send.
-function set_subscription_precision(state, name, precision::Int)
+# Update the requested zfp accuracy `k` for a subscribed variable. Callers only
+# invoke this on a real change (e.g. InputFloat edit), so we always send.
+function set_subscription_k(state, name, k::Float64)
     client = state.client
     if isempty(name) || !haskey(client.subscriptions, name)
         return
     end
-    client.subscriptions[name].precision = precision
+    client.subscriptions[name].k = k
     send_subscriptions(client)
 end
 
-function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
+function subscribe_variable(state, name; k::Maybe{Float64}=nothing)
     if isempty(name)
         return
     end
@@ -1234,7 +1490,7 @@ function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
 
     if !haskey(client.subscriptions, name)
         client.subscriptions[name] = SubscriptionState(; count=1,
-                                                       precision=something(precision, -1))
+                                                       k=something(k, -1))
         needs_send = true
     else
         sub = client.subscriptions[name]
@@ -1243,8 +1499,8 @@ function subscribe_variable(state, name; precision::Maybe{Int}=nothing)
             sub.active = true
             needs_send = true
         end
-        if !isnothing(precision) && sub.precision != precision
-            sub.precision = precision
+        if !isnothing(k) && sub.k != k
+            sub.k = k
             needs_send = true
         end
     end

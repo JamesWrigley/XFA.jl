@@ -1,3 +1,4 @@
+using Printf: @sprintf
 import Base.ScopedValues: ScopedValue, @with
 
 using CImGui: CImGui as ig, ImVec2, ImVec4, IM_COL32
@@ -5,33 +6,42 @@ using CImGui.CSyntax: @c
 using ImPlot: ImPlot
 using GLFW: GLFW
 using ModernGL
-
-include("imnodes.jl")
-
-using NaNStatistics: nanpctile
-using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
-using DataStructures: CircularBuffer
-using Printf: @sprintf
-include("plotting.jl")
+import ImGuiNodeEditor as ne
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
 using Dates: Dates, unix2datetime, @dateformat_str
-using XfaEngine.Context: Parameter, OptionalDims, KaraboDevice, Dependency, karabo_dependency,
-    ArrayMetadata
+using DataStructures: CircularBuffer, OrderedDict
+using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
-    decompress_array!, allocate_array
+    decompress_array!, allocate_array, restore_dims
+using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
+    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
+    BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
+    PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
+    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
+    FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
 include("states.jl")
+
+using NaNStatistics: nanpctile
+using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
+include("plot_spec.jl")
+include("plotting.jl")
 
 using TOML: TOML
 using Sockets: Sockets
 using CRC32c: crc32c
+using LibGit2: LibGit2
+using Sentry: Sentry
+using XfaContext: XfaContext
 using Serialization
 using XfaEngine.Protocol
 using XfaEngine: XfaEngine, Protocol
-using XfaEngine.Context: Dependency, DependencyKind, DepKind_Variable, DepKind_Karabo, DepKind_Group,
+using XfaContext: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
+    subvariable_dependency,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
 include("imgui_helpers.jl")
@@ -42,9 +52,133 @@ include("variable_widgets.jl")
 
 import Revise
 
-import .ImNodes
-
 const state = ScopedValue{GuiState}()
+
+# The node editor persists its own state (node positions, pan, zoom) through
+# these callbacks. It hands us a JSON string to stash and reads it back on load;
+# save_settings writes ne_settings out to settings.toml.
+function ne_save_settings(data::Ptr{Cchar}, size::Csize_t, reason, user::Ptr{Cvoid})::Bool
+    client = unsafe_pointer_to_objref(user)::ClientState
+    client.ne_settings = unsafe_string(data, size)
+    return true
+end
+
+# Called first with a null buffer to query the size, then with a buffer to fill.
+function ne_load_settings(data::Ptr{Cchar}, user::Ptr{Cvoid})::Csize_t
+    client = unsafe_pointer_to_objref(user)::ClientState
+    blob = client.ne_settings
+    if data != C_NULL && !isempty(blob)
+        unsafe_copyto!(Ptr{UInt8}(data), pointer(blob), ncodeunits(blob))
+    end
+    return Csize_t(ncodeunits(blob))
+end
+
+# Create the editor with our save/load callbacks wired up. ne_settings must hold
+# the current context's blob first so the editor's initial LoadSettings restores
+# the layout. The editor is recreated this way whenever the context changes.
+function create_node_editor!(client)
+    save_cb = @cfunction(ne_save_settings, Bool, (Ptr{Cchar}, Csize_t, ne.SaveReasonFlags, Ptr{Cvoid}))
+    load_cb = @cfunction(ne_load_settings, Csize_t, (Ptr{Cchar}, Ptr{Cvoid}))
+
+    config = ne.Config()
+    config.SettingsFile = Ptr{Cchar}(C_NULL)
+    config.SaveSettings = save_cb
+    config.LoadSettings = load_cb
+    config.UserPointer = pointer_from_objref(client)
+
+    # CreateEditor copies the config by value, so the transient one can go.
+    client.ne_editor = ne.CreateEditor(config)
+    ne.Destroy(config)
+    client.ne_editor_path = client.context_path
+end
+
+# The graph can only be edited while the pipeline is idle or fully running,
+# anything else means the engine is busy and would reject an edit.
+function graph_editable(client)
+    return client.context.pipeline_status in (PipelineStatus_Stopped, PipelineStatus_Started) &&
+           isnothing(client.pending_parameter_change)
+end
+
+# Draw a pin marker. The pivot anchors the link to the left edge of input rows and
+# the right edge of output rows, reproducing the imnodes left-in/right-out wiring.
+function draw_pin(client, id, kind)
+    pivot = kind == ne.PinKind_Input ? ImVec2(0f0, 0.5f0) : ImVec2(1f0, 0.5f0)
+    ne.PushStyleVar(ne.StyleVar_PivotAlignment, pivot)
+    ne.BeginPin(ne.PinId(id), kind)
+
+    # Get the alpha from the current style so we respect the current disabled state
+    alpha = graph_editable(client) ? 1f0 : unsafe_load(ig.GetStyle().DisabledAlpha)
+    sz = ig.GetTextLineHeight()
+    p = ig.GetCursorScreenPos()
+    ig.AddCircleFilled(ig.GetWindowDrawList(), (p.x + sz * 0.5f0, p.y + sz * 0.5f0),
+                       sz * 0.35f0, IM_COL32(204, 204, 204, round(Int, 255 * alpha)))
+    ig.Dummy(sz, sz)
+
+    ne.EndPin()
+    ne.PopStyleVar()
+end
+
+# Show a tooltip at the mouse. An ImGui tooltip created while drawing a node is
+# captured by the editor's zoomed canvas and lands in the wrong place; Suspend()ing
+# to escape it corrupts the node/pin draw list. So inside the editor we draw the
+# tooltip directly on the foreground draw list, which is screen space and never
+# touched by the canvas. Outside the editor, a normal tooltip is fine.
+function node_tooltip(text)
+    if ne.GetCurrentEditor() == C_NULL
+        ig.SetTooltip(text)
+        return
+    end
+
+    # While the canvas is active GetMousePos() is in zoomed canvas space; map it
+    # back to screen space for the (unscaled) foreground draw list. Scale the text
+    # and box by the canvas magnification so they match the zoomed node text, but
+    # clamp to between the default and twice the default so it stays readable.
+    scale = clamp(ne.current_scale(), 1f0, 2f0)
+    font = ig.GetFont()
+    font_size = ig.GetFontSize() * scale
+
+    draw_list = ig.GetForegroundDrawList()
+    mouse = ne.CanvasToScreen(ig.GetMousePos())
+    text_size = ig.CalcTextSize(text)
+    pad = ImVec2(8 * scale, 6 * scale)
+    pos = ImVec2(mouse.x + 16 * scale, mouse.y + 8 * scale)
+
+    # The canvas leaves the foreground list clipped to the (zoom-shrunk) local
+    # viewport, which culls the tooltip when zoomed in; clip to the full screen.
+    ig.PushClipRectFullScreen(draw_list)
+    ig.AddRectFilled(draw_list, (pos.x - pad.x, pos.y - pad.y),
+                     (pos.x + text_size.x * scale + pad.x, pos.y + text_size.y * scale + pad.y),
+                     IM_COL32(35, 35, 40, 240), 4f0 * scale)
+    # The foreground list is unscaled screen space, but when zoomed in the frame
+    # density is cranked up for the canvas-magnified node text; that bakes this
+    # tooltip oversized and minifies it (aliasing). Bake at the displayed size.
+    frame_density = ig.GetFontRasterizerDensity()
+    ig.SetFontRasterizerDensity(1f0)
+    ig.AddText(draw_list, font, font_size, pos, IM_COL32(230, 230, 230, 255), text)
+    ig.SetFontRasterizerDensity(frame_density)
+    ig.PopClipRect(draw_list)
+end
+
+# Node names in front-to-back order so the top node under the mouse wins input on
+# overlapping widgets: ImGui gives the first-submitted overlapping item the click,
+# and the editor keeps the active/selected node last in its order. New nodes the
+# editor hasn't seen yet are appended.
+function node_draw_order(ctx_state)
+    id_to_name = Dict{UInt, String}(UInt(var_data["id"]) => name for (name, var_data) in ctx_state)
+    ordered = String[]
+    for id in Iterators.reverse(ne.GetOrderedNodeIds())
+        name = get(id_to_name, id.value, nothing)
+        if !isnothing(name)
+            push!(ordered, name)
+        end
+    end
+    for name in keys(ctx_state)
+        if !(name in ordered)
+            push!(ordered, name)
+        end
+    end
+    return ordered
+end
 
 ## Helper functions for the GUI
 
@@ -107,18 +241,16 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Int})
     int32_ref = Ref(Int32(param.value))
-    ret = ig.InputInt("##$(name)", int32_ref)
-    param.value = Int(int32_ref[])
+    ret = ig.InputInt("##$(name)", int32_ref, 1, 100, ig.ImGuiInputTextFlags_EnterReturnsTrue)
+    if ret
+        param.value = Int(int32_ref[])
+    end
 
     return ret, param.value
 end
 
 function draw_parameter_widget(name, param::Parameter{String})
-    edited, new_text = SafeInputText("##$(name)"; current_text=param.value)
-    if edited && is_group_param(state[].client, param.name)
-        state[].client.pending_source_edit = param.name
-    end
-    return edited, new_text
+    return SafeInputText("##$(name)"; current_text=param.value)
 end
 
 # True if `param_name` is a fully-qualified "<group>.<field>" name belonging to
@@ -139,9 +271,40 @@ function draw_parameter_widget(name, param::Parameter{Vector{String}})
     return false, nothing
 end
 
+function draw_numeric_vector_widget(name, param::Parameter{Vector{T}}) where {T <: Number}
+    current = join(param.value, ", ")
+    edited, new_text = SafeInputText("##$(name)"; current_text=current)
+    if !edited
+        return false, nothing
+    end
+    parts = [strip(s) for s in split(new_text, ","; keepempty=false)]
+    parsed = [tryparse(T, p) for p in parts]
+    if any(isnothing, parsed)
+        return false, nothing
+    end
+    return true, T[parsed...]
+end
+
 function draw_parameter_widget(name, param::Parameter{Vector{Int}})
-    ig.Text("Vector{Int}")
-    return false, nothing
+    return draw_numeric_vector_widget(name, param)
+end
+
+function draw_parameter_widget(name, param::Parameter{Vector{Float64}})
+    return draw_numeric_vector_widget(name, param)
+end
+
+# (lo, hi) range editor. We only commit a new value once lo < hi so the engine
+# isn't bombarded with half-edited input. Tracking of "user-pinned vs auto" is
+# handled engine-side via the parameter's `set_by_user` flag.
+function draw_parameter_widget(name, param::Parameter{Tuple{Float64, Float64}})
+    lo, hi = param.value
+    buf = Cdouble[lo, hi]
+    edited = ig.InputScalarN("##$(name)", ig.ImGuiDataType_Double, buf, 2,
+                             C_NULL, C_NULL, "%.3f0", ig.ImGuiInputTextFlags_EnterReturnsTrue)
+    if !edited || !(buf[1] < buf[2])
+        return false, nothing
+    end
+    return true, (buf[1], buf[2])
 end
 
 function draw_parameter_widget(name, param::Parameter{OptionalDims})
@@ -178,26 +341,21 @@ function draw_parameter_widget(name, param::Parameter{OptionalDims})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{KaraboDevice})
+function draw_parameter_widget(name, param::Parameter{KaraboDevice}, sources)
     client = state[].client
-    dep_key = node_hash(param.name)
+    dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
-    device_props = if isnothing(dep_state.device)
-        DeviceProperties()
-    else
-        get_source_properties(client, dep_state.device)
-    end
 
     device = param.value
-    text = "$(device.topic)//$(device.name)"
+    text = isnothing(device) ? "" : "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     client.source_list, device_props, client; device_only=true)
+                                     sources, client; device_only=true)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
-            idx = findfirst(s -> s.name == new_device.name, client.source_list)
+            idx = findfirst(s -> s.name == new_device.name, sources)
             if !isnothing(idx)
-                new_device = KaraboDevice(client.source_list[idx].topic, new_device.name)
+                new_device = KaraboDevice(sources[idx].topic, new_device.name)
             end
         end
         return true, new_device
@@ -212,21 +370,16 @@ end
 function draw_dep_editor(label, dep::Dependency, dep_id::Integer;
                          device_only::Bool=false, variable_name::String="")
     client = state[].client
-    dep_state = get!(client.dep_text_states, Int(dep_id)) do
-        DepTextState(dep.kind == DepKind_Karabo)
+    dep_state = get!(client.dep_text_states, dep_id) do
+        DepTextState(; is_karabo=dep.kind == DepKind_Karabo)
     end
-    device_props = if isnothing(dep_state.karabo_state.device)
-        DeviceProperties()
-    else
-        get_source_properties(client, dep_state.karabo_state.device)
-    end
-    return DepText(label, dep, dep_state, client.source_list, device_props,
+    return DepText(label, dep, dep_state, client.source_list,
                    client.variable_names, client; device_only, variable_name)
 end
 
 function draw_parameter_widget(name, param::Parameter{Dependency})
     dep = param.value
-    dep_id = node_hash(param.name)
+    dep_id = hash(param.name)
     edited, new_dep = draw_dep_editor("param-dep-$(param.name)", dep, dep_id)
     if edited
         return true, new_dep
@@ -234,10 +387,17 @@ function draw_parameter_widget(name, param::Parameter{Dependency})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{Bool})
-    @c ig.Checkbox("", &param.value)
-
+function draw_parameter_widget(name, param::Parameter{<:AbstractROI})
+    text = format_param_value(param.value)
+    buf = Vector{UInt8}(undef, length(text) + 1)
+    Util.strcpy!(buf, text)
+    ig.InputText("##$(name)", buf, length(buf), ig.ImGuiInputTextFlags_ReadOnly)
     return false, nothing
+end
+
+function draw_parameter_widget(name, param::Parameter{Bool})
+    changed = @c ig.Checkbox("##$(name)", &param.value)
+    return changed, param.value
 end
 
 function get_variable_typeinfo(name)
@@ -278,29 +438,39 @@ end
 function plot_button(label, name; button=ig.Button)
     nd = variable_ndims(name)
     too_many_dims = !isnothing(nd) && nd > 2
+
     if too_many_dims
         ig.BeginDisabled()
     end
+
     clicked = button(label)
+
     if too_many_dims
         ig.EndDisabled()
         if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
             ig.SetTooltip("Plotting arrays with more than 2 dimensions is not supported")
         end
     end
+
     return clicked
+end
+
+function clear_variable_data(store)
+    # Only scalar histories accumulate; array data is replaced wholesale and
+    # may not even be resizable (e.g. a view into a decompression buffer).
+    if store.data isa CircularBuffer
+        empty!(store.data)
+    end
+    if !isnothing(store.scalar_tids)
+        empty!(store.scalar_tids)
+    end
 end
 
 function clear_variables()
     client = state[].client
 
     for store in values(client.variable_data)
-        if store.data isa AbstractVector
-            empty!(store.data)
-        end
-        if !isnothing(store.scalar_tids)
-            empty!(store.scalar_tids)
-        end
+        clear_variable_data(store)
     end
 
     for plot in client.plots
@@ -308,42 +478,7 @@ function clear_variables()
     end
 end
 
-function draw_device_tree(device_tree)
-    if isempty(device_tree)
-        ig.TextDisabled("No devices loaded")
-        return
-    end
-
-    n_devices = sum(length(devs) for (_, devs) in device_tree)
-    n_topics = length(device_tree)
-    if ig.TreeNode("Devices ($n_devices across $n_topics topics)##device-tree")
-        for (topic, devices) in device_tree
-            if ig.TreeNode("$topic ($(length(devices)))##topic-$topic")
-                for (name, info_pairs) in devices
-                    class_id_pair = findfirst(p -> p.first == "classId", info_pairs)
-                    class_id = isnothing(class_id_pair) ? "" : info_pairs[class_id_pair].second
-                    if ig.TreeNode("$name##dev-$name")
-                        for (key, value) in info_pairs
-                            ig.Text("$key: $value")
-                        end
-                        ig.TreePop()
-                    else
-                        ig.SameLine()
-                        ig.TextDisabled(class_id)
-                    end
-                end
-                ig.TreePop()
-            end
-        end
-        ig.TreePop()
-    end
-end
-
-function get_source_properties(client, device_name)
-    idx = findfirst(s -> s.name == device_name, client.source_list)
-    isnothing(idx) && return DeviceProperties()
-
-    topic = client.source_list[idx].topic
+function get_source_properties(client, topic::AbstractString, device_name::AbstractString)
     key = (topic, device_name)
     return get!(client.source_properties, key) do
         id = send(client, GetDeviceSchema(topic, device_name))
@@ -354,24 +489,46 @@ end
 
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
-function draw_parameter(name, param; min_node_width=150)
+function draw_parameter(name, param, widget_args...; min_node_width=150, pending=false)
     ig.Text(name * ":")
     ig.SameLine()
     ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
-    modified, new_value = draw_parameter_widget(name, param)
+    modified, new_value = draw_parameter_widget(name, param, widget_args...)
     if modified
-        change_parameter(Parameter(param.name, new_value))
+        if pending
+            # A not-yet-added node: keep the edit local, don't touch the engine.
+            param.value = new_value
+        else
+            state[].client.pending_source_edit = param.name
+            change_parameter(Parameter(param.name, new_value))
+        end
     end
     return modified, new_value
 end
 
 # Draw the parameters section of a variable node. Can be called from custom
 # draw_variable_content() methods to include the default parameter UI.
-function draw_parameters(var_data)
+function draw_parameters(var_data; pending=false)
     if haskey(var_data, "parameters")
         ig.Text("Parameters:")
         for (param_name, param) in var_data["parameters"]
-            draw_parameter(param_name, param)
+            if param isa Parameter{KaraboDevice}
+                draw_parameter(param_name, param, state[].client.source_list; pending)
+            else
+                draw_parameter(param_name, param; pending)
+            end
+        end
+    end
+end
+
+function draw_callbacks(var_data)
+    client = state[].client
+    for (name, title) in var_data["callbacks"]
+        running = haskey(client.callback_requests, name) && is_pending(client, client.callback_requests[name])
+        @Disabled running begin
+            if ig.Button("$(title)###callback-$(name)")
+                invoke_callback(name)
+            end
         end
     end
 end
@@ -381,72 +538,287 @@ end
 # Return a gui state object to persist custom state across frames, or nothing.
 draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
+# Specialize on Val{Symbol("ModulePath.PostprocessorType")} to draw a custom
+# parameter UI for a postprocessor. Default: list every parameter.
+function draw_postprocessor_params(::Val, pp, min_node_width)
+    for (param_name, param) in pp.params
+        draw_parameter(param_name, param; min_node_width)
+    end
+end
+
+# Tint for pending (not-yet-committed) nodes: their background, the links into
+# them, and the drag-accept preview. Alpha is varied per use via pending_color.
+const PENDING_NODE_COLOR = ImVec4(0.32f0, 0.10f0, 0.10f0, 1f0)
+pending_color(alpha) = ImVec4(PENDING_NODE_COLOR.x, PENDING_NODE_COLOR.y, PENDING_NODE_COLOR.z, alpha)
+
+# The dependency that points at an output pin. A subvariable output (variable !=
+# name) becomes a subvariable dependency so its pin id resolves correctly; a plain
+# variable output becomes a variable dependency.
+function output_dependency(output::OutputPinInfo)
+    if output.variable == output.name
+        return Dependency(output.name)
+    end
+    return subvariable_dependency(output.variable, chopprefix(output.name, "$(output.variable)."))
+end
+
+# The pending node (if any) that owns this node id, else nothing. Used by
+# draw_variable to route edits to local pending state instead of the source.
+function pending_node_for(client, id)
+    idx = findfirst(p -> p.id == id, client.pending_nodes)
+    return isnothing(idx) ? nothing : client.pending_nodes[idx]
+end
+
+# Whether a pending node's dependency arg is backed by an optional group
+# parameter, and so may be left unwired.
+function optional_dep(pending::PendingNode, arg::AbstractString)
+    param = get(pending.spec.group_parameters, Symbol(arg), nothing)
+    return !isnothing(param) && param.optional
+end
+
+# A default node name for a freshly-added spec that doesn't collide with an
+# existing variable or another pending node, suffixing a counter if needed.
+function unique_pending_name(client, base)
+    taken = Set(keys(client.context.context_state))
+    for p in client.pending_nodes
+        push!(taken, p.name)
+    end
+    if !(base in taken)
+        return base
+    end
+    i = 1
+    while "$(base)$(i)" in taken
+        i += 1
+    end
+    return "$(base)$(i)"
+end
+
+# Start assembling a new node from a spec: mint a synthetic id, seed its
+# dependencies from the spec's declared args, and drop it into the editor as a
+# pending node.
+function add_pending_node!(client, spec::VariableSpec)
+    client.pending_node_counter += 1
+    id = hash(("<pending>", client.pending_node_counter))
+    name = unique_pending_name(client, spec.name)
+
+    dep_values = OrderedDict{String, Dependency}()
+    param_values = OrderedDict{Symbol, Parameter}()
+    if spec.kind == VariableKind_Variable
+        for (arg_name, dep) in spec.dependencies
+            dep_values[arg_name] = dep
+        end
+    else
+        # Group/input: Parameter{Dependency} fields become dep pins, the rest are
+        # editable value parameters (copied so edits don't touch the shared spec).
+        for (fname, param) in spec.group_parameters
+            if param isa Parameter{Dependency}
+                dep_values[string(fname)] = isnothing(param.value) ? Dependency("") : param.value
+            else
+                param_values[fname] = deepcopy(param)
+            end
+        end
+    end
+
+    push!(client.pending_nodes, PendingNode(; id, spec, name, dep_values, param_values))
+end
+
+# Build a var_data dict (the schema draw_variable consumes) for a pending node,
+# so the add-variable preview reuses the exact same node-drawing machinery as
+# real nodes. All pin/attr ids derive from the node's synthetic id so they don't
+# collide with real nodes or other pending nodes.
+function spec_to_var_data(pending::PendingNode)
+    spec = pending.spec
+    base = pending.id
+    is_var = spec.kind == VariableKind_Variable
+    var_data = Dict{String, Any}(
+        "id" => base,
+        "origin" => spec.origin,
+        "type" => is_var ? :variable : :group,
+        "draw_parameters" => !is_var,
+        "dependencies" => [],
+        "outputs" => OutputPin[OutputPin(hash("$(base).outputs."), "")],
+        "postprocessors" => [],
+    )
+
+    if is_var
+        for subvar in spec.subvariables
+            push!(var_data["outputs"], OutputPin(hash("$(base).outputs.$(subvar)"), subvar, true))
+        end
+    else
+        var_data["parameters"] = OrderedDict{String, Any}(
+            string(fname) => param for (fname, param) in pending.param_values)
+    end
+
+    # Dependency pins, wired from local state (variable args or group dep fields).
+    for (arg_name, dep) in pending.dep_values
+        push!(var_data["dependencies"],
+              DependencyPin(; id=hash("$(base).dependencies.$(arg_name)"), arg_name, dep,
+                            field=is_var ? nothing : arg_name, optional=optional_dep(pending, arg_name)))
+    end
+
+    return var_data
+end
+
+# Commit a pending node to the context source. The reload apply_source_edit
+# triggers clears the pending nodes, and the committed node comes back through
+# the normal ContextInfo path.
+function commit_pending_node(state, pending)
+    apply_source_edit(state, source -> add_variable_source(source, pending.spec, pending.name,
+                                                          pending.dep_values, pending.param_values))
+end
+
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
 # always the same, but draw_variable_content() is called inside to allow
 # custom rendering for specific variables.
 function draw_variable(name, var_data)
     client = state[].client
+    pending = pending_node_for(client, var_data["id"])
     min_node_width = 150
     variable_store = get(client.variable_data, name, nothing)
 
     ig.PushID(name)
-    ImNodes.BeginNode(var_data["id"])
+    # Tint pending nodes so they read as drafts, not committed graph nodes.
+    if !isnothing(pending)
+        ne.PushStyleColor(ne.StyleColor_NodeBg, pending_color(0.9f0))
+    end
+    handle = ne.NodeId(var_data["id"])
+    ne.BeginNode(handle)
 
-    disable_node = client.context.pipeline_status ∉ (PipelineStatus_Stopped, PipelineStatus_Started) ||
-                   !isnothing(client.pending_parameter_change)
-    @Disabled disable_node begin
-        # Draw titlebar
-        ImNodes.BeginNodeTitleBar()
-        edited, new_name = ElidedText("var-name-$(name)", name; editable=true,
-                                      validator=variable_name_validator(name))
+    # Right-align the output/postprocessor pins to the widest left-anchored row.
+    # `content_measured` accumulates each row's width (via origin-independent
+    # GetItemRectSize) this frame; `content_width` reuses last frame's value to
+    # place the pins. The pins are never measured, so they can't ratchet the node
+    # ever-wider.
+    content_measured = Float32(min_node_width)
+    content_width = get(client.ne_node_content_widths, var_data["id"], Float32(min_node_width))
+
+    @Disabled !graph_editable(client) begin
+        # Draw the titlebar at a fixed 1.5x canvas size (1.5*current_scale() keeps
+        # the local size constant across zoom) so it doesn't grow the node's
+        # canvas-space width when zoomed out and strand the right-aligned pins.
+        title_pos = ig.GetCursorPos()
+        edited, new_name = ne.@with_font_scale 1.5f0 * ne.current_scale() ElidedText("var-name-$(name)", name;
+            editable=true, validator=variable_name_validator(name))
         if edited
-            @guiasync rename_variable(state[], name, new_name)
+            if !isnothing(pending)
+                pending.name = new_name
+            else
+                @guiasync rename_variable(state[], name, new_name)
+            end
         end
-        ImNodes.EndNodeTitleBar()
-        # Draw custom content
+        # Bottom of the title, used to size the header background drawn after
+        # EndNode. The Dummy adds breathing room between the header and content.
+        title_bottom = ig.GetItemRectMax().y
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
+
+        # Right-aligned delete button in the header. It does nothing for real
+        # nodes yet; for pending nodes it discards them. Placed on the title row
+        # via content_width (last frame's width), then the cursor is restored to
+        # below the title so the rest of the node stacks normally.
+        after_title = ig.GetCursorPos()
+        del_w = ig.GetTextLineHeight()
+        ig.SetCursorPos((title_pos.x + content_width - del_w, title_pos.y))
+        if ig.Button("##delete-$(var_data["id"])", (del_w, del_w))
+            if !isnothing(pending)
+                filter!(p -> p !== pending, client.pending_nodes)
+            end
+        end
+        ig.SetCursorPos(after_title)
+
+        if !isnothing(pending)
+            ig.TextDisabled("(pending)")
+            content_measured = max(content_measured, ig.GetItemRectSize().x)
+        end
+
+        ig.Dummy(0, 6)
+        # Group the custom content so we can measure its full width; the helpers
+        # draw several rows and GetItemRectMax alone would only see the last one.
+        ig.BeginGroup()
         origin = var_data["origin"]
-        gui_state = get(client.variable_gui_states, name, nothing)
-        new_gui_state = draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
-        if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
-            client.variable_gui_states[name] = new_gui_state
+        # Skip custom content for pending nodes: it targets live engine state
+        # (fires parameter changes, reads runtime data) that a not-yet-added node
+        # doesn't have. Pending nodes fall back to the default parameter UI.
+        if isnothing(pending)
+            gui_state = get(client.variable_gui_states, name, nothing)
+            # Ending the editor with a node still open crashes it, so an error
+            # here is reported and the frame finished; the render loop's crash
+            # screen takes over from the next frame.
+            new_gui_state = try
+                draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
+            catch ex
+                @error "Error while drawing node '$(name)'" exception=(ex, catch_backtrace())
+                state[].disable_rendering = true
+                nothing
+            end
+            if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
+                client.variable_gui_states[name] = new_gui_state
+            end
         end
 
         if var_data["draw_parameters"]
-            draw_parameters(var_data)
+            draw_parameters(var_data; pending=!isnothing(pending))
         end
+        if haskey(var_data, "callbacks")
+            draw_callbacks(var_data)
+        end
+        ig.EndGroup()
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
         ig.Dummy(min_node_width, 20)
 
         # Draw dependencies
-        deps = var_data["dependencies"]
-        for (dep_id, dep_pair) in deps
-            arg_name, dep = dep_pair
+        for pin in var_data["dependencies"]
+            dep_id, arg_name, dep = pin.id, pin.arg_name, pin.dep
             # Don't draw pins for parameters
             if dep isa Parameter
                 continue
             end
 
             dep_ts = get!(client.dep_text_states, dep_id) do
-                DepTextState(dep isa Dependency && dep.kind == DepKind_Karabo)
+                DepTextState(; is_karabo=dep isa Dependency && dep.kind == DepKind_Karabo)
             end
-            pin_shape = dep_ts.is_karabo ? ImNodes.ImNodesPinShape_TriangleFilled : ImNodes.ImNodesPinShape_CircleFilled
 
-            ImNodes.BeginInputAttribute(dep_id, pin_shape)
+            # The pin wraps only the icon so its hover rect doesn't span the whole
+            # row; the label/editor are drawn after EndPin on the same line.
+            draw_pin(client, dep_id, ne.PinKind_Input)
+            ig.SameLine()
+            # Group the post-pin content so we can size the row from it. The pin
+            # icon to its left is a fixed advance (icon + SameLine spacing).
+            ig.BeginGroup()
             if var_data["type"] == :group
-                ig.Text(arg_name * ":")
+                label = something(pin.field, arg_name)
+                if pin.readonly || pin.optional
+                    ig.TextDisabled(label * ":")
+                else
+                    ig.Text(label * ":")
+                end
+                if pin.optional && !pin.readonly && ig.IsItemHovered()
+                    node_tooltip("This dependency is optional, it may be left unwired")
+                end
                 ig.SameLine()
             end
-            edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
-            if edited
-                # For group nodes the kwarg in the constructor uses the group
-                # struct field name, not the @Variable's arg name.
-                target_arg = arg_name
-                if var_data["type"] == :group
-                    target_arg = get(var_data["dep_field_names"], dep_id, arg_name)
-                end
-                @guiasync rename_dep(state[], name, target_arg, dep, new_dep)
+            if pin.readonly
+                ig.BeginDisabled()
             end
-            ImNodes.EndInputAttribute()
+            edited, new_dep = draw_dep_editor("dep-$(dep_id)", dep, dep_id; variable_name=name)
+            if pin.readonly
+                ig.EndDisabled()
+            end
+            ig.EndGroup()
+            if pin.readonly && ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+                node_tooltip(isempty(dep.name) ? "Set by the engine, not known yet" :
+                             "Set by the engine to $(dep.name)")
+            end
+            pin_advance = ig.GetTextLineHeight() + unsafe_load(ig.GetStyle().ItemSpacing.x)
+            content_measured = max(content_measured, pin_advance + ig.GetItemRectSize().x)
+            if edited
+                if !isnothing(pending)
+                    pending.dep_values[arg_name] = new_dep
+                else
+                    # For group nodes the kwarg in the constructor uses the group
+                    # struct field name, not the @Variable's arg name.
+                    @guiasync rename_dep(state[], name, something(pin.field, arg_name), dep, new_dep)
+                end
+            end
         end
     end # @Disabled
 
@@ -463,8 +835,13 @@ function draw_variable(name, var_data)
     for output in var_data["outputs"]
         label = output.label
         output_name = isempty(label) ? name : "$(name).$(label)"
-        ImNodes.BeginOutputAttribute(output.id, ImNodes.ImNodesPinShape_CircleFilled)
+        pin_start = ig.GetCursorPos()
 
+        # Measure the label group before placing the pin. BeginPin leaves the
+        # cursor's max-x at the far-right pin position, so measuring after it would
+        # make content_width self-sustaining (the node would never shrink). The pin
+        # is drawn afterwards via SetCursorPos.
+        ig.BeginGroup()
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
             label = isempty(label) ? typestr : "$(label) - $(typestr)"
@@ -472,8 +849,8 @@ function draw_variable(name, var_data)
 
         if !isempty(label)
             if haskey(client.variable_data, output_name)
-                if plot_button("$(label)###plot_button", output_name)
-                    push!(client.plots, Plot(output_name, client.plot_counter))
+                if plot_button("$(label)###$(output_name)-plot_button", output_name)
+                    push!(client.plots, variable_plot(output_name, client.plot_counter))
                     client.plot_counter += 1
                 end
             else
@@ -493,7 +870,34 @@ function draw_variable(name, var_data)
             end
         end
 
-        ImNodes.EndOutputAttribute()
+        # Advertised plot specs are openable in addition to the default plot.
+        if haskey(client.variable_data, output_name)
+            specs = client.variable_data[output_name].plot_specs
+            if !isempty(specs)
+                ig.Indent()
+                for spec in specs
+                    if ig.SmallButton("\uf201 $(spec.name)###$(output_name)-spec-$(spec.name)")
+                        push!(client.plots, spec_plot(output_name, spec.name, client.plot_counter))
+                        client.plot_counter += 1
+                    end
+                end
+                ig.Unindent()
+            end
+        end
+        ig.EndGroup()
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
+        after_label = ig.GetCursorPos()
+
+        # Right-aligned output pin on the label's row. Drawing it (icon Dummy) after
+        # the rightward SetCursorPos validates the extent (no boundary assert).
+        icon_w = ig.GetTextLineHeight()
+        ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+        draw_pin(client, output.id, ne.PinKind_Output)
+        # Continue below both the label and the pin icon so rows don't overlap.
+        # The trailing Dummy validates the SetCursorPos extent so ImGui's boundary
+        # check doesn't warn.
+        ig.SetCursorPos((pin_start.x, max(after_label.y, pin_start.y + icon_w)))
+        ig.Dummy(0f0, 0f0)
     end
 
     # Draw postprocessors
@@ -507,59 +911,189 @@ function draw_variable(name, var_data)
 
         for pp in postprocessors
             label = pp.display_name * pp.tree_id_suffix
-            ImNodes.BeginOutputAttribute(pp.id, ImNodes.ImNodesPinShape_CircleFilled)
+            pin_start = ig.GetCursorPos()
+            icon_w = ig.GetTextLineHeight()
 
-            # This child window is here to get around an imnodes limitation that
-            # would make a regular TreeNode extend it's width to the edge of the
-            # screen: https://github.com/Nelarius/imnodes/issues/167
-            ig.PushStyleColor(ig.ImGuiCol_ChildBg, ig.ImVec4(0, 0, 0, 0))
-            node_width = ImNodes.GetNodeDimensions(var_data["id"]).x
-            child_width = max(min_node_width, node_width * 3 / 4)
+            # The pin wraps only the icon (right-aligned to the node edge) so its
+            # hover rect doesn't span the whole row; the tree is drawn after EndPin
+            # from the left.
+            ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+            draw_pin(client, pp.id, ne.PinKind_Output)
+            ig.SetCursorPos(pin_start)
 
-            if ig.BeginChild("##pp-$(pp.id)", ImVec2(child_width, 0), ig.ImGuiChildFlags_AutoResizeY, ig.ImGuiWindowFlags_HorizontalScrollbar)
-                expanded = ig.TreeNode(label)
-                if haskey(client.variable_data, pp.name)
-                    typestr = get_variable_typeinfo(pp.name)
-                    if !isempty(typestr)
-                        ig.SameLine()
-                        if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
-                            push!(client.plots, Plot(pp.name, client.plot_counter))
-                            client.plot_counter += 1
-                        end
+            # Constrain the tree widget width with the old Columns API, otherwise
+            # the TreeNode's clickable area stretches to the window edge (see the
+            # imgui-node-editor widgets example).
+            ig.BeginColumns("##pp-$(pp.id)", 2,
+                            ig.ImGuiOldColumnFlags_NoBorder | ig.ImGuiOldColumnFlags_NoResize |
+                            ig.ImGuiOldColumnFlags_NoPreserveWidths | ig.ImGuiOldColumnFlags_NoForceWithinWindow)
+            ig.SetColumnWidth(0, content_width - icon_w)
+
+            expanded = ig.TreeNode(label)
+            if haskey(client.variable_data, pp.name)
+                typestr = get_variable_typeinfo(pp.name)
+                if !isempty(typestr)
+                    ig.SameLine()
+                    if plot_button("$(typestr)$(pp.tree_id_suffix)_plot", pp.name; button=ig.SmallButton)
+                        push!(client.plots, variable_plot(pp.name, client.plot_counter))
+                        client.plot_counter += 1
                     end
-                end
-
-                if expanded
-                    if isempty(pp.params)
-                        ig.TextDisabled("(no parameters)")
-                    else
-                        for (param_name, param) in pp.params
-                            draw_parameter(param_name, param; min_node_width)
-                        end
-                    end
-                    ig.TreePop()
                 end
             end
 
-            ig.EndChild()
-            ig.PopStyleColor()
+            if expanded
+                if isempty(pp.params)
+                    ig.TextDisabled("(no parameters)")
+                else
+                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
+                end
+                ig.TreePop()
+            end
 
-            ImNodes.EndOutputAttribute()
+            ig.EndColumns()
         end
     end
 
-    ImNodes.EndNode()
+    # Commit button for a pending node. Enabled once the name is valid and every
+    # dependency has been wired to something.
+    if !isnothing(pending)
+        ig.Dummy(min_node_width, 8)
+        valid = isnothing(variable_name_validator(name, name)) &&
+                all(!isempty(dep.name) for (arg, dep) in pending.dep_values
+                    if !optional_dep(pending, arg))
+        @Disabled !valid begin
+            if ig.Button("Add###commit-$(var_data["id"])")
+                @guiasync commit_pending_node(state[], pending)
+            end
+        end
+        content_measured = max(content_measured, ig.GetItemRectSize().x)
+    end
+
+    # Stash the widest content row for next frame's pin alignment. Postprocessors
+    # are excluded: their tree column is sized to content_width, so measuring it
+    # would feed the imposed width back and re-introduce the ratchet.
+    client.ne_node_content_widths[var_data["id"]] = content_measured
+
+    ne.EndNode()
+
+    # Dark blue header background behind the title (following builders.cpp
+    # BlueprintNodeBuilder::End): drawn after EndNode on the node's background draw
+    # list so it sits above the node fill but below the title text.
+    node_pos = ne.GetNodePosition(handle)
+    node_size = ne.GetNodeSize(handle)
+    border = unsafe_load(ne.GetStyle().NodeBorderWidth)
+    # Shrink the radius with the inset so the band's corner stays concentric with
+    # the border's inner edge.
+    rounding = max(0f0, unsafe_load(ne.GetStyle().NodeRounding) - border)
+    # Match the band's alpha to the node body so it's translucent like the rest.
+    node_alpha = round(Int, unsafe_load(ne.GetStyle().Colors)[ne.StyleColor_NodeBg + 1].w * 255)
+    # Inset by the border width so the band stays inside the node's (selection)
+    # border instead of painting over it.
+    ig.AddRectFilled(ne.GetNodeBackgroundDrawList(handle),
+                     (node_pos.x + border, node_pos.y + border),
+                     (node_pos.x + node_size.x - border, title_bottom),
+                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundCornersTop)
+
+    if !isnothing(pending)
+        ne.PopStyleColor()
+    end
     ig.PopID()
+end
+
+# Handle a link dragged between two pins. A dependency has exactly one source, so
+# accepting a link rewrites that dependency in the context source, replacing
+# whatever it was wired to before. EndCreate() must be called even when
+# BeginCreate() returns false, otherwise the editor's create action is left open.
+function handle_link_creation(client)
+    if ne.BeginCreate()
+        if ne.QueryNewLink(client.ne_new_link_start, client.ne_new_link_end)
+            start_id = client.ne_new_link_start[].value
+            end_id = client.ne_new_link_end[].value
+
+            # Both ids are only set once the drag hovers a second pin.
+            if start_id != 0 && end_id != 0
+                # The drag can start at either end, so normalise to (output, dep).
+                output_id, dep_id = if haskey(client.ne_dep_pins, start_id)
+                    (end_id, start_id)
+                else
+                    (start_id, end_id)
+                end
+                output = get(client.ne_output_pins, output_id, nothing)
+                dep_pin = get(client.ne_dep_pins, dep_id, nothing)
+
+                # Only the pins of input nodes are in neither registry.
+                is_input_pin(id) = !haskey(client.ne_output_pins, id) && !haskey(client.ne_dep_pins, id)
+
+                # A link must go from an output pin to a dependency pin of an editable
+                # graph, and must not close a cycle (self-links land there too).
+                acceptable = !is_input_pin(output_id) && !is_input_pin(dep_id) &&
+                    !isnothing(output) && !isnothing(dep_pin) && graph_editable(client) &&
+                    !(dep_pin.variable in upstream_closure(client.context.dag, [output.variable]))
+
+                if acceptable
+                    # Pending targets get the tint of the pending nodes.
+                    is_pending_target = haskey(client.pending_dep_pins, dep_id)
+                    accept_color = is_pending_target ? pending_color(1f0) :
+                                                        ImVec4(0.4f0, 0.9f0, 0.4f0, 1f0)
+                    # AcceptNewItem() only returns true once the mouse is released.
+                    if ne.AcceptNewItem(accept_color, 3f0)
+                        if is_pending_target
+                            node_id, arg = client.pending_dep_pins[dep_id]
+                            target = pending_node_for(client, node_id)
+                            if !isnothing(target)
+                                target.dep_values[arg] = output_dependency(output)
+                            end
+                        else
+                            @guiasync rename_dep(state[], dep_pin.node, dep_pin.arg,
+                                                 dep_pin.dep, Dependency(output.name))
+                        end
+                    end
+                else
+                    ne.RejectNewItem(ImVec4(1f0, 0.3f0, 0.3f0, 1f0), 2f0)
+                end
+            end
+        end
+    end
+    ne.EndCreate()
+end
+
+# Deletes a selected link with the Del key. Only links into pending nodes can be
+# deleted, by clearing the dependency; committed links come from the source, so
+# they're rejected. Deleted nodes aren't queried, so Del ignores nodes.
+function handle_link_deletion(client)
+    if ne.BeginDelete()
+        while ne.QueryDeletedLink(client.ne_deleted_link)
+            link_id = client.ne_deleted_link[].value
+            attr_id = nothing
+            for id in keys(client.pending_dep_pins)
+                if hash("pending-link-$(id)") == link_id
+                    attr_id = id
+                    break
+                end
+            end
+
+            if isnothing(attr_id)
+                ne.RejectDeletedItem()
+            elseif ne.AcceptDeletedItem()
+                node_id, arg = client.pending_dep_pins[attr_id]
+                target = pending_node_for(client, node_id)
+                if !isnothing(target)
+                    target.dep_values[arg] = Dependency("")
+                end
+            end
+        end
+    end
+    ne.EndDelete()
 end
 
 # Link color for a channel-fill ratio (load ∈ [0, 1]). Ramps from muted green
 # (empty) through orange (half-full) to bright red (at capacity). The green
 # ceiling is lowered so idle channels don't glare.
 function link_load_color(load)
-    green_ceiling = 0xa0
-    r = load < 0.5 ? round(UInt8, 0xff * 2 * load) : 0xff
-    g = load < 0.5 ? green_ceiling : round(UInt8, green_ceiling * 2 * (1 - load))
-    return ig.IM_COL32(r, g, 0, 0xff)
+    green_ceiling = 0xa0 / 0xff
+    r = load < 0.5 ? 2 * load : 1
+    g = load < 0.5 ? green_ceiling : green_ceiling * 2 * (1 - load)
+    return ImVec4(r, g, 0, 1)
 end
 
 function draw_routing_rules()
@@ -657,14 +1191,9 @@ function draw_routing_rules()
                 ig.TableNextColumn()
                 ig.SetNextItemWidth(-1)
                 src_state = get!(client.routing_rule_source_states, i, KaraboDepTextState())
-                src_props = if isnothing(src_state.device)
-                    DeviceProperties()
-                else
-                    get_source_properties(client, src_state.device)
-                end
                 filtered_sources = get(client.sources_by_topic, rule.topic, SourceInfo[])
                 edited, new_source = KaraboDepText("##rule-source-$i", rule.source, src_state,
-                                                   filtered_sources, src_props, client;
+                                                   filtered_sources, client;
                                                    allow_slow=false)
                 if edited
                     client.routing_rules[i] = RoutingRule(rule.topic, new_source, rule.input)
@@ -769,7 +1298,7 @@ function draw_dag()
     ig.SameLine()
     @Disabled isempty(client.variable_data) begin
         if ig.Button("Correlate")
-            push!(client.plots, CorrelationPlot(client.plot_counter))
+            push!(client.plots, correlation_plot(client.plot_counter))
             client.plot_counter += 1
         end
     end
@@ -781,50 +1310,174 @@ function draw_dag()
 
     ig.SameLine()
     ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - 100)
-    if ig.Button("Add variable")
-        ig.OpenPopup("add_variable_popup")
+    @Disabled isempty(ctx_state) begin
+        if ig.Button("Add variable")
+            ig.OpenPopup("add_variable_popup")
+        end
     end
     if ig.BeginPopup("add_variable_popup")
-        if ig.Selectable("Karabo source")
+        for spec in client.available_variables
+            if ig.Selectable("$(spec.name) ($(spec.kind))")
+                add_pending_node!(client, spec)
+            end
         end
         ig.EndPopup()
     end
 
     ig.Dummy(0, 10)
 
-    ImNodes.BeginNodeEditor()
-
-    for (name, var_data) in ctx_state
-        ig.PushID(name)
-
-        draw_variable(name, var_data)
-
-        pos = context.node_positions[name]
-        if pos != Point2d(-1, -1)
-            ImNodes.SetNodeGridSpacePos(var_data["id"], (pos.x, pos.y))
-            context.node_positions[name] = Point2d(-1, -1)
+    # (Re)create the editor whenever the loaded context changes so it restores
+    # that context's saved layout. Persist the outgoing context's layout first.
+    if client.ne_editor_path != client.context_path
+        if client.ne_editor != C_NULL
+            save_node_editor_state(client.ne_editor_path, client.ne_settings)
+            ne.DestroyEditor(client.ne_editor)
         end
-
-        ig.PopID()
+        client.ne_settings = load_node_editor_state(client.context_path)
+        create_node_editor!(client)
     end
 
-    channel_stats = context.channel_stats
-    for var_data in values(ctx_state)
-        for link in var_data["links"]
-            stat = get(channel_stats, link.channel_key, nothing)
-            colored = !isnothing(stat) && stat.capacity > 0
-            if colored
-                ig.imnodes_PushColorStyle(ig.ImNodesCol_Link, link_load_color(stat.size / stat.capacity))
+    # Left edge of the canvas in screen space, used to keep deferred popups from
+    # spilling off the side of the window.
+    canvas_min_x = ig.GetCursorScreenPos().x
+
+    @NodeEditor client.ne_editor "dag-editor" begin
+        # The editor zooms by scaling the draw list, which blurs text baked at the
+        # base size. Match the font rasterizer density to the magnification (snapped
+        # up to a power of two so the bake cache stays warm) to keep text crisp.
+        magnification = ne.current_scale()
+        ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
+
+        for name in node_draw_order(ctx_state)
+            var_data = ctx_state[name]
+            ig.PushID(name)
+
+            draw_variable(name, var_data)
+
+            # Apply the auto-layout position only to nodes the editor didn't restore
+            # (new nodes sit at the origin); restored nodes keep their saved spot.
+            pos = context.node_positions[name]
+            if pos != Point2d(-1, -1)
+                handle = ne.NodeId(var_data["id"])
+                editor_pos = ne.GetNodePosition(handle)
+                if editor_pos.x == 0 && editor_pos.y == 0
+                    ne.SetNodePosition(handle, (pos.x, pos.y))
+                end
+                context.node_positions[name] = Point2d(-1, -1)
             end
-            ImNodes.Link(link.id, link.start_id, link.end_id)
-            if colored
-                ig.imnodes_PopColorStyle()
+
+            ig.PopID()
+        end
+
+        # Draw pending nodes. Copy since the delete button mutates the vector.
+        empty!(client.pending_dep_pins)
+        for pending in copy(client.pending_nodes)
+            pending.var_data = spec_to_var_data(pending)
+            # Register the node's dep pins so links can be dragged onto them.
+            for pin in pending.var_data["dependencies"]
+                client.ne_dep_pins[pin.id] = DepPinInfo(pending.name, pin.arg_name, pending.name, pin.dep)
+                client.pending_dep_pins[pin.id] = (pending.id, pin.arg_name)
+            end
+            ig.PushID("pending-$(pending.id)")
+            draw_variable(pending.name, pending.var_data)
+            ig.PopID()
+
+            if !pending.centered
+                ne.CenterNodeOnScreen(ne.NodeId(pending.id))
+                pending.centered = true
             end
         end
-    end
 
-    ImNodes.MiniMap()
-    ImNodes.EndNodeEditor()
+        # The dep-kind and CopyableCombo dropdowns are drawn here, after all nodes,
+        # under Suspend/Resume so they escape the node canvas and position in screen
+        # space (a popup opened mid-node lands in the wrong place). Only one of each is
+        # open at a time; the in-node widgets set the request and a one-shot trigger.
+        ne.Suspend()
+        if !isnothing(client.dep_kind_popup)
+            popup_label, dep_state = client.dep_kind_popup
+            if client.dep_kind_popup_trigger
+                ig.OpenPopup(popup_label)
+                client.dep_kind_popup_trigger = false
+            end
+            if ig.BeginPopup(popup_label)
+                for (is_karabo, kind_label) in ((true, "Karabo"), (false, "Variable"))
+                    if ig.Selectable(kind_label, dep_state.is_karabo == is_karabo)
+                        if dep_state.is_karabo != is_karabo
+                            dep_state.is_karabo = is_karabo
+                            dep_state.wants_focus = true
+                        end
+                        ig.CloseCurrentPopup()
+                    end
+                end
+                ig.EndPopup()
+            else
+                client.dep_kind_popup = nothing
+            end
+        end
+
+        popup = client.combo_popup
+        if !isnothing(popup.label)
+            popup_id = "combo-popup-$(popup.label)"
+            if popup.trigger
+                ig.OpenPopup(popup_id)
+                popup.trigger = false
+            end
+            anchor = ImVec2(max(popup.anchor.x, canvas_min_x), popup.anchor.y)
+            ig.SetNextWindowPos(anchor)
+            new_idx = draw_combo_popup(popup_id, popup.items, popup.width)
+            if !isnothing(new_idx)
+                popup.result_label = popup.label
+                popup.result_index = new_idx
+                popup.label = nothing
+            elseif !ig.IsPopupOpen(popup_id)
+                popup.label = nothing
+            end
+        end
+
+        # The autocomplete popup of the ElidedText being edited, if any. The request is
+        # re-recorded every frame the widget is edited, so consuming it here also stops
+        # the popup once editing ends.
+        completions = client.completion_popup
+        if !isnothing(completions.label)
+            result, hovered = draw_autocomplete_popup(completions.label, completions.state,
+                                                      completions.completions,
+                                                      completions.input_min, completions.input_max)
+            completions.drawn_label = completions.label
+            completions.result = result
+            completions.hovered = hovered
+            completions.label = nothing
+        end
+        ne.Resume()
+
+        channel_stats = context.channel_stats
+        for var_data in values(ctx_state)
+            for link in var_data["links"]
+                stat = get(channel_stats, link.channel_key, nothing)
+                colored = !isnothing(stat) && stat.capacity > 0
+                color = colored ? link_load_color(stat.size / stat.capacity) : ImVec4(1, 1, 1, 1)
+                ne.Link(ne.LinkId(link.id), ne.PinId(link.start_id),
+                        ne.PinId(link.end_id), color)
+            end
+        end
+
+        # Links into pending nodes, drawn in the pending tint.
+        for pending in client.pending_nodes
+            for pin in pending.var_data["dependencies"]
+                dep = pin.dep
+                if dep.kind ∉ (DepKind_Variable, DepKind_Subvariable) || isempty(dep.name)
+                    continue
+                end
+                owner, pin_suffix = dep.kind == DepKind_Variable ? (dep.name, "") : (dep.parent, dep.name)
+                start_id = hash("$(owner).outputs.$(pin_suffix)")
+                link_id = hash("pending-link-$(pin.id)")
+                ne.Link(ne.LinkId(link_id), ne.PinId(start_id),
+                        ne.PinId(pin.id), ImVec4(1f0, 0.8f0, 0.8f0, 0.5f0))
+            end
+        end
+
+        handle_link_creation(client)
+        handle_link_deletion(client)
+    end
 
     # Timer to save the current settings periodically. Mostly useful for the
     # node positions.
@@ -955,14 +1608,6 @@ function restore_plots(state::GuiState)
 
     ctx = state.saved_contexts[ctx_path]
 
-    context = client.context
-    if haskey(ctx, "node_positions") && isempty(context.node_positions)
-        saved_positions = ctx["node_positions"]
-        for (name, pos) in saved_positions
-            context.node_positions[name] = Point2d(pos[1], pos[2])
-        end
-    end
-
     ## Code to restore plots is buggy, so it's disabled for now
 
     # # Close existing plots before restoring
@@ -974,9 +1619,9 @@ function restore_plots(state::GuiState)
     # for p in get(ctx, "plots", [])
     #     dock_id = UInt32(get(p, "dock_id", 0))
     #     if p["type"] == "Plot"
-    #         push!(gui_state.client.plots, Plot(p["name"], p["id"], dock_id))
+    #         push!(gui_state.client.plots, variable_plot(p["name"], p["id"], dock_id))
     #     else
-    #         push!(gui_state.client.plots, CorrelationPlot(p["id"], dock_id))
+    #         push!(gui_state.client.plots, correlation_plot(p["id"], dock_id))
     #     end
     # end
 
@@ -997,62 +1642,122 @@ function restore_plots(state::GuiState)
     # end
 end
 
+# Decode one array frame, reusing `spare` in place when its shape/eltype match.
+# Runs on a background task, so it touches only `ws`, `ca`, and `spare` — never
+# the store's live `data`.
+function decode_frame(ws::ZfpWorkspace, ca::CompressedArray, spare)
+    if spare isa Array && eltype(spare) === ca.original_eltype && size(spare) == Tuple(ca.shape)
+        decompress_array!(ws, spare, ca)
+        return restore_dims(spare, ca)
+    else
+        return decompress_array(ws, ca)
+    end
+end
+
 function draw_plots()
     client = state[].client
 
     # Update all the observables
     updated_variables = Dict{String, Set{Int}}()
     for (name, store) in client.variable_data
-        if !isready(store.updates)
-            continue
-        end
-
         new_tids = Set{Int}()
-        while isready(store.updates)
-            tid, x, type = take!(store.updates)
-            push!(new_tids, tid)
-            store.type = type
-            if x isa Number
-                # Reset scalar_tids too, to preserve the parallel-length
-                # invariant — store.data may have been overwritten outside this
-                # loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
-                if !(store.data isa CircularBuffer)
-                    store.data = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
-                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-                elseif isnothing(store.scalar_tids)
-                    store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
-                end
-                push!(store.data, x)
-                push!(store.scalar_tids, tid)
-            elseif x isa AbstractArray
-                store.data = x
-                store.trainId = tid
+
+        # Pick up a finished background decode (may finish on an idle frame, so
+        # this runs before the isready check).
+        if !isnothing(store.decode_task) && istaskdone(store.decode_task)
+            # Clear before fetching so a failed decode drops the frame instead of
+            # wedging the variable on a task that rethrows every frame.
+            task = store.decode_task
+            variable = store.decode_variable
+            store.decode_task = nothing
+            store.decode_variable = nothing
+            decoded = try
+                fetch(task)
+            catch err
+                @error "Failed to decompress array for $name" exception=(err, catch_backtrace())
+                nothing
+            end
+            if !isnothing(decoded)
+                prev = store.data
+                # Retire the old display buffer as the next spare. nothing (fresh
+                # alloc) when prev isn't a plain array, else the spare would alias
+                # the just-decoded buffer and a later decode would clobber it.
+                store.spare_buffer = prev isa DimArray ? parent(prev) : prev isa Array ? prev : nothing
+                store.data = decoded
+                store.trainId = variable.tid
+                apply_metadata!(store, variable)
+                push!(new_tids, variable.tid)
                 if !isnothing(store.scalar_tids)
                     empty!(store.scalar_tids)
                 end
             end
         end
 
-        # Update contiguous caches for scalar data so plotting doesn't allocate
-        if !isnothing(store.scalar_tids) && store.data isa CircularBuffer
-            n = length(store.data)
-            resize!(store.scalar_data_cache, n)
-            resize!(store.scalar_tids_cache, n)
-            copyto!(store.scalar_data_cache, store.data)
-            copyto!(store.scalar_tids_cache, store.scalar_tids)
+        if isready(store.updates)
+            latest_array = nothing  # only the last array frame is kept
+            while isready(store.updates)
+                variable = take!(store.updates)
+                x = variable.data
+                push!(new_tids, variable.tid)
+                if x isa Number
+                    apply_metadata!(store, variable)
+                    # Reset scalar_tids too, to preserve the parallel-length
+                    # invariant — store.data may have been overwritten outside
+                    # this loop (e.g. ArrayMetadata in client.jl) leaving stale tids.
+                    if !(store.data isa CircularBuffer)
+                        store.data = CircularBuffer{Float64}(SCALAR_BUFFER_CAPACITY)
+                        store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                    elseif isnothing(store.scalar_tids)
+                        store.scalar_tids = CircularBuffer{Int}(SCALAR_BUFFER_CAPACITY)
+                    end
+                    push!(store.data, x)
+                    push!(store.scalar_tids, variable.tid)
+                else
+                    # Arrays are latest-wins: discard intermediate frames and
+                    # decompress only the most recent one after the loop.
+                    latest_array = variable
+                end
+            end
+
+            if !isnothing(latest_array)
+                x = latest_array.data
+                if x isa CompressedArray
+                    # Skip if already decoding (drop the frame, a newer one will
+                    # arrive); otherwise decode off-thread into the spare buffer.
+                    if isnothing(store.decode_task)
+                        ws = get!(() -> ZfpWorkspace(), client.zfp_workspaces, name)
+                        spare = store.spare_buffer
+                        store.decode_variable = latest_array
+                        store.decode_task = Threads.@spawn decode_frame(ws, x, spare)
+                    end
+                else
+                    store.data = x
+                    store.trainId = latest_array.tid
+                    apply_metadata!(store, latest_array)
+                    if !isnothing(store.scalar_tids)
+                        empty!(store.scalar_tids)
+                    end
+                end
+            end
+
+            # Update contiguous caches for scalar data so plotting doesn't allocate
+            if !isnothing(store.scalar_tids) && store.data isa CircularBuffer
+                n = length(store.data)
+                resize!(store.scalar_data_cache, n)
+                resize!(store.scalar_tids_cache, n)
+                copyto!(store.scalar_data_cache, store.data)
+                copyto!(store.scalar_tids_cache, store.scalar_tids)
+            end
         end
 
-        updated_variables[name] = new_tids
+        if !isempty(new_tids)
+            updated_variables[name] = new_tids
+        end
     end
 
     # Draw plot windows
     for plot in client.plots
-        if plot isa CorrelationPlot
-            draw_plot(plot, client.variable_data, updated_variables)
-        else
-            store = get(client.variable_data, plot.name, nothing)
-            draw_plot(plot, store, !isnothing(store) && haskey(updated_variables, plot.name))
-        end
+        draw_plot(plot, updated_variables)
     end
 
     # Remove closed plots
@@ -1106,6 +1811,70 @@ end
 ## Main GUI function
 
 default(value, default="") = something(value, default)
+
+# ImGui's GLFW backend (1.92.6+) remembers the last cursor it applied in a
+# single field shared by all viewports, so after the main window is updated
+# every secondary viewport window is skipped and never changes cursor. Apply
+# the frame's cursor to those windows ourselves. GLFW.jl's wrappers assert the
+# main thread, which the render loop isn't on, hence calling libglfw directly.
+const glfw_cursors = Dict{ig.ImGuiMouseCursor_, Ptr{Cvoid}}()
+const viewport_cursors = Dict{Ptr{Cvoid}, ig.ImGuiMouseCursor_}()
+
+function update_viewport_cursors()
+    cursor = ig.ImGuiMouseCursor_(ig.GetMouseCursor())
+    if cursor == ig.ImGuiMouseCursor_None || unsafe_load(ig.GetIO().MouseDrawCursor)
+        return
+    end
+    if !haskey(glfw_cursors, cursor)
+        shape = if cursor == ig.ImGuiMouseCursor_TextInput
+            GLFW.IBEAM_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeAll
+            GLFW.RESIZE_ALL_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNS
+            GLFW.RESIZE_NS_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeEW
+            GLFW.RESIZE_EW_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNESW
+            GLFW.RESIZE_NESW_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_ResizeNWSE
+            GLFW.RESIZE_NWSE_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_Hand
+            GLFW.POINTING_HAND_CURSOR
+        elseif cursor == ig.ImGuiMouseCursor_NotAllowed
+            GLFW.NOT_ALLOWED_CURSOR
+        else
+            GLFW.ARROW_CURSOR
+        end
+        # Not every X11 cursor theme has the GLFW 3.4 shapes; like ImGui's
+        # backend, fall back to the arrow for those.
+        glfw_cursors[cursor] = try
+            @ccall GLFW.libglfw.glfwCreateStandardCursor(shape::Cint)::Ptr{Cvoid}
+        catch err
+            if !(err isa GLFW.GLFWError)
+                rethrow()
+            end
+            @ccall GLFW.libglfw.glfwCreateStandardCursor(GLFW.ARROW_CURSOR::Cint)::Ptr{Cvoid}
+        end
+    end
+
+    main_window = unsafe_load(ig.GetMainViewport().PlatformHandle)
+    viewports = unsafe_load(ig.GetPlatformIO().Viewports)
+    windows = Set{Ptr{Cvoid}}()
+    for i in 1:viewports.Size
+        window = unsafe_load(unsafe_load(viewports.Data, i).PlatformHandle)
+        if window == C_NULL || window == main_window
+            continue
+        end
+        push!(windows, window)
+        if !haskey(viewport_cursors, window) || viewport_cursors[window] != cursor
+            viewport_cursors[window] = cursor
+            @ccall GLFW.libglfw.glfwSetCursor(window::Ptr{Cvoid}, glfw_cursors[cursor]::Ptr{Cvoid})::Cvoid
+        end
+    end
+    # A closed window's address may be reused by a new one that starts out with
+    # the default cursor, so forget windows that are gone.
+    filter!(kv -> kv.first in windows, viewport_cursors)
+end
 
 function draw_gui()
     # Dock the main window by default
@@ -1281,16 +2050,6 @@ function draw_gui()
                 ig.Dummy(0, 10)
 
                 draw_routing_rules()
-
-                ig.Dummy(0, 10)
-
-                @Disabled is_pending(client, client.devices_request) begin
-                    if ig.Button("Get devices")
-                        get_devices(client)
-                    end
-
-                    draw_device_tree(client.device_tree)
-                end
             end
         end
 
@@ -1320,6 +2079,10 @@ function draw_gui()
         ig.End()
     end
 
+    # The Karabo source editor, opened by any inline KaraboDepText widget. Drawn
+    # here at the top level so it escapes the node canvas and works from any tab.
+    draw_karabo_editor(client)
+
     # Display tooling windows
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
                                       (:show_imgui_metrics,  ig.ShowMetricsWindow),
@@ -1339,19 +2102,37 @@ function draw_gui()
         save_settings(client)
         io.WantSaveIniSettings = false
     end
+
+    update_viewport_cursors()
 end
 
 """Start the XFA GUI."""
+# Reports exceptions to Sentry when a DSN is configured
+function setup_sentry(settings)
+    sentry_settings = get(settings, "Sentry", Dict{String, Any}())
+    if haskey(sentry_settings, "dsn") || haskey(ENV, "SENTRY_DSN")
+        Sentry.init(get(sentry_settings, "dsn", nothing);
+                    environment=get(sentry_settings, "environment", nothing),
+                    release="xfa@$(pkgversion(XFA))",
+                    in_app_include=[XFA, XfaContext, XfaEngine])
+    end
+end
+
 function main(; test_engine=nothing)
-    gui_state = GuiState(load_settings())
+    # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
+    # point it at the system.
+    if !haskey(ENV, "XCURSOR_PATH")
+        ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
+    end
+
+    settings = load_settings()
+    setup_sentry(settings)
+    gui_state = GuiState(settings)
 
     # Setup Dear ImGui context
     ig.set_backend(:GlfwOpenGL3)
     imgui_ctx = ig.CreateContext()
     ig.SetCurrentContext(imgui_ctx)
-
-    # Setup ImNodes
-    imnodes_ctx = ImNodes.CreateContext()
 
     # Setup Dear ImGui style
     ig.StyleColorsDark()
@@ -1412,11 +2193,19 @@ function main(; test_engine=nothing)
         destroy_heatmap_context!()
 
         ImPlot.DestroyContext(implot_ctx)
-        ImNodes.DestroyContext(imnodes_ctx)
+        if client.ne_editor != C_NULL
+            ne.DestroyEditor(client.ne_editor)
+        end
         empty!(safe_input_text_cache)
         close(gui_state)
     end
+
     t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
+        # Bake GL-backed resources on the first frame, once a GL context exists.
+        if isnothing(gui_state.window_shadow)
+            gui_state.window_shadow = build_window_shadow()
+        end
+
         if gui_state.disable_rendering
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
@@ -1445,6 +2234,3 @@ function main(; test_engine=nothing)
 
     return t, gui_state
 end
-
-# precompile(main, ())
-# precompile(draw_gui, ())

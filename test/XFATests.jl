@@ -14,7 +14,8 @@ using ImGuiTestEngine
 import ImGuiTestEngine as te
 import CImGui as ig
 using XFA.XfaEngine.Context: Dependency, DepKind_Karabo, DepKind_Variable, DepKind_Subvariable,
-    karabo_dependency, @karabo_str
+    karabo_dependency, @karabo_str, SourceInfo
+using XfaContext: XfaContext as Context
 
 # Set up the backend for CImGui
 import GLFW
@@ -319,6 +320,26 @@ end
         @Variable baz -> karabo"A/B.prop"
         @Variable bar -> karabo"C/D.prop"
         """
+
+        # A group/input is defined by assignment, not a @Variable, and its
+        # references inside variables are renamed along with it
+        source = """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+        @Variable function bar(y -> my_group.thing)
+            return y
+        end
+        """
+        @test XFA.replace_variable_name(source, "my_group", "baz") == """
+        baz = MyGroup(; x=karabo"A/B.prop")
+        @Variable function bar(y -> baz.thing)
+            return y
+        end
+        """
+
+        # Unknown names still warn and change nothing
+        @test_logs (:warn, r"No occurrences") begin
+            @test XFA.replace_variable_name(source, "nonexistent", "baz") == source
+        end
     end
 
     @testset "Set bridge address" begin
@@ -345,6 +366,86 @@ end
         @test_logs (:warn, r"Could not find constructor.*") begin
             @test XFA.replace_constructor_kwarg(source, "other", "address", "\"tcp://foo:1234\"") == source
         end
+    end
+
+    @testset "Edit RectROI parameter" begin
+        roi = XFA.XfaEngine.Context.RectROI(1.5, 2.5, 10.0, 20.0)
+        @test XFA.format_param_value(roi) == "RectROI(1.5, 2.5, 10.0, 20.0)"
+
+        # Top-level `roi = Parameter(RectROI())` assignment
+        source = """
+        roi = Parameter(RectROI())
+        """
+        @test XFA.replace_parameter_value(source, "roi", XFA.format_param_value(roi)) == """
+        roi = Parameter(RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Replaces the existing value, preserving the Parameter wrapper
+        source = """
+        roi = Parameter(RectROI(0.0, 0.0, 1.0, 1.0))
+        """
+        @test XFA.replace_parameter_value(source, "roi", XFA.format_param_value(roi)) == """
+        roi = Parameter(RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Inside a group constructor as a kwarg
+        source = """
+        my_group = MyGroup(; roi=RectROI())
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "roi",
+                                            XFA.format_param_value(roi)) == """
+        my_group = MyGroup(; roi=RectROI(1.5, 2.5, 10.0, 20.0))
+        """
+
+        # Missing assignment returns source unchanged with a warning
+        source = """
+        other = Parameter(RectROI())
+        """
+        @test_logs (:warn, r"Could not find Parameter assignment.*") begin
+            @test XFA.replace_parameter_value(source, "roi", "RectROI(1.0, 2.0, 3.0, 4.0)") == source
+        end
+
+        @test XFA.format_param_value(Context.LinearROI(1.5, 10.0; axis=:y)) == "LinearROI(1.5, 10.0; axis=:y)"
+    end
+
+    @testset "Edit Int parameter" begin
+        @test XFA.format_param_value(42) == "42"
+
+        source = """
+        count = Parameter(0)
+        """
+        @test XFA.replace_parameter_value(source, "count", XFA.format_param_value(42)) == """
+        count = Parameter(42)
+        """
+
+        source = """
+        my_group = MyGroup(; count=3)
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "count",
+                                            XFA.format_param_value(42)) == """
+        my_group = MyGroup(; count=42)
+        """
+    end
+
+    @testset "Edit vector parameter" begin
+        @test XFA.format_param_value([1, 2, 3]) == "[1, 2, 3]"
+        @test XFA.format_param_value([1.5, 2.0]) == "[1.5, 2.0]"
+        @test XFA.format_param_value(Int[]) == "[]"
+
+        source = """
+        bins = Parameter([0, 1])
+        """
+        @test XFA.replace_parameter_value(source, "bins", XFA.format_param_value([1, 2, 3])) == """
+        bins = Parameter([1, 2, 3])
+        """
+
+        source = """
+        my_group = MyGroup(; bins=[0.0])
+        """
+        @test XFA.replace_constructor_kwarg(source, "my_group", "bins",
+                                            XFA.format_param_value([1.5, 2.0])) == """
+        my_group = MyGroup(; bins=[1.5, 2.0])
+        """
     end
 
     @testset "Edit string group parameter" begin
@@ -374,46 +475,203 @@ end
         my_group = MyGroup(; label="with \\"quotes\\" and \\\\ slash")
         """
     end
+
+    @testset "Add variable" begin
+        variable_spec(origin) = Context.VariableSpec("scan", Context.VariableKind_Variable, origin,
+                                                     Context.OrderedDict{String, Dependency}(),
+                                                     String[], String[],
+                                                     Context.OrderedDict{Symbol, Context.Parameter}())
+        group_spec(origin, params) = Context.VariableSpec("MyGroup", Context.VariableKind_Group,
+                                                          origin,
+                                                          Context.OrderedDict{String, Dependency}(),
+                                                          String[], String[], params)
+        # Adds to whatever `source` currently holds
+        add(spec, name; deps=Context.OrderedDict{String, Dependency}(),
+            params=Context.OrderedDict{Symbol, Context.Parameter}()) =
+            XFA.add_variable_source(source, spec, name, deps, params)
+
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        """
+
+        # A variable's wired deps become overrides on the origin reference; Karabo,
+        # variable and subvariable deps each get their own source form.
+        deps = Context.OrderedDict("x" => karabo"C/D.prop",
+                                   "y" => Dependency("foo"),
+                                   "z" => Context.subvariable_dependency("foo", "mean"))
+        @test add(variable_spec("XfaContext.scan"), "my_scan"; deps) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan(x -> karabo"C/D.prop", y -> foo, z -> foo.mean)
+        """
+
+        # Unwired and group deps are left off, so a bare reference is emitted
+        deps = Context.OrderedDict("x" => Dependency(""),
+                                   "group" => Context.group_dependency(Context.RectROI))
+        @test add(variable_spec("XfaContext.scan"), "my_scan"; deps) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan
+        """
+
+        # An origin from a module that isn't in scope gets an import, inserted
+        # after the last existing one. XfaContext is always in scope, so it doesn't.
+        source = """
+        using XfaContext: Dependency
+        import Foo
+
+        @Variable foo -> karabo"A/B.prop"
+        """
+        @test add(variable_spec("XfaEngine.scan"), "my_scan") == """
+        using XfaContext: Dependency
+        import Foo
+        using XfaEngine: XfaEngine
+
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaEngine.scan
+        """
+        @test add(variable_spec("XfaContext.scan"), "my_scan") == """
+        using XfaContext: Dependency
+        import Foo
+
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable my_scan -> XfaContext.scan
+        """
+
+        # `using X: X`, `import X` and `using X` bind X, `using X: name` doesn't
+        for stmt in ("using Foo: Foo", "import Foo", "using Foo")
+            @test XFA.ensure_import("$(stmt)\n", "Foo.bar") == "$(stmt)\n"
+        end
+        @test XFA.ensure_import("using Foo: bar\n", "Foo.bar") == "using Foo: bar\nusing Foo: Foo\n"
+        @test XFA.ensure_import("x = 1\n", "Foo.bar") == "using Foo: Foo\n\nx = 1\n"
+
+        # Groups become a constructor call; only wired deps and parameters edited
+        # away from the spec's default are passed as kwargs.
+        params = Context.OrderedDict(:threshold => Context.Parameter(800.0),
+                                     :label => Context.Parameter("old"))
+        spec = group_spec("MyLib.MyGroup", params)
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        """
+        @test add(spec, "my_group";
+                  deps=Context.OrderedDict("x" => karabo"C/D.prop", "y" => Dependency("foo")),
+                  params=Context.OrderedDict(:threshold => Context.Parameter(900.0),
+                                             :label => Context.Parameter("old"))) == """
+        using MyLib: MyLib
+
+        @Variable foo -> karabo"A/B.prop"
+
+        my_group = MyLib.MyGroup(; x=karabo"C/D.prop", y=Dependency("foo"), threshold=900.0)
+        """
+
+        # A group with nothing wired or edited falls back to the constructor defaults
+        @test add(spec, "my_group"; params=deepcopy(params)) == """
+        using MyLib: MyLib
+
+        @Variable foo -> karabo"A/B.prop"
+
+        my_group = MyLib.MyGroup()
+        """
+
+        # An edited parameter whose value has no source representation is an error
+        unwritable = Context.OrderedDict(:threshold => Context.Parameter(800.0),
+                                         :label => Context.Parameter(Dict("a" => 1)))
+        @test_throws "Cannot represent parameter 'label'" add(spec, "my_group"; params=unwritable)
+    end
+
+    @testset "Remove variable" begin
+        # Every definition form is removed whole, and the surviving neighbours
+        # keep a blank line between them
+        source = """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "foo") == """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "my_group") == """
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+
+        @Variable bar -> karabo"C/D.prop"
+        """
+        @test XFA.remove_variable_source(source, "bar") == """
+        my_group = MyGroup(; x=karabo"A/B.prop")
+
+        @Variable function foo(x -> my_group.thing)
+            return x
+        end
+        """
+
+        # Removing the only declaration empties the file
+        @test XFA.remove_variable_source("@Variable bar -> karabo\"C/D.prop\"\n", "bar") == ""
+
+        @test_throws "Could not find a definition for 'nonexistent'" XFA.remove_variable_source(source, "nonexistent")
+    end
 end
 
 @testset "Dependency completions" begin
-    SI = XFA.SourceInfo
-    source_list = SI[SI(("MID", "MID_DET/CAM/1", true)),
-                     SI(("MID", "MID_EXP/MOTOR/1", false)),
-                     SI(("SA2", "SA2_XTD1_XGM/XGM/DOOCS", false)),
-                     SI(("SA2", "MID_DET/CAM/1", true))]
-    empty_props = XFA.DeviceProperties()
+    SI(topic, name, ambiguous) = SourceInfo(topic, name, "", ambiguous)
+    source_list = [SI("MID", "MID_DET/CAM/1", true),
+                   SI("MID", "MID_EXP/MOTOR/1", false),
+                   SI("SA2", "SA2_XTD1_XGM/XGM/DOOCS", false),
+                   SI("SA2", "MID_DET/CAM/1", true)]
 
-    # Without topic prefix, unique names are bare
-    items, fmt, query = XFA.dep_completions("MID_EXP", -1, source_list, empty_props)
-    @test items === source_list
-    @test query == "MID_EXP"
-    @test fmt(SI(("MID", "MID_EXP/MOTOR/1", false))) == "MID_EXP/MOTOR/1"
+    # A device is inserted bare when its name is unique, and topic-qualified
+    # when the same name exists under more than one topic.
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
+    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
 
-    # Without topic prefix, ambiguous names get TOPIC// prefix
-    @test fmt(SI(("MID", "MID_DET/CAM/1", true))) == "MID//MID_DET/CAM/1"
-    @test fmt(SI(("SA2", "MID_DET/CAM/1", true))) == "SA2//MID_DET/CAM/1"
+    # A "TOPIC//" prefix splits off as the fixed topic, leaving the fuzzy query
+    @test XFA.split_topic("MID//DET") == ("MID", "DET")
+    @test XFA.split_topic("MID_EXP") == ("", "MID_EXP")
 
-    # With topic prefix, only devices in that topic are returned
-    items, fmt, query = XFA.dep_completions("MID//DET", -1, source_list, empty_props)
+    # The topic prefix restricts the device list to that topic
+    topic_fixed, query = XFA.split_topic("MID//DET")
+    items = filter(s -> s.topic == topic_fixed, source_list)
     @test all(s -> s.topic == "MID", items)
-    @test query == "DET"
-    @test fmt(SI(("MID", "MID_DET/CAM/1", true))) == "MID//MID_DET/CAM/1"
+    # The substring match outranks the (fuzzy) MID_EXP/MOTOR/1 d-e-t match
+    @test first(XFA.fuzzy_match(query, items, s -> s.name))[2].name == "MID_DET/CAM/1"
 
-    # Slow property completion
-    slow = XFA.PropertyList(["pos", "velocity"], String[], String[], String[])
-    props = XFA.DeviceProperties(slow, Dict{String, XFA.PropertyList}())
-    items, fmt, query = XFA.dep_completions("MID_EXP/MOTOR/1.vel", 100, source_list, props)
-    @test items == ["pos", "velocity"]
-    @test query == "vel"
-    @test fmt("pos") == "MID_EXP/MOTOR/1.pos"
+    # A channel suffix isn't part of the device being completed
+    @test XFA.strip_channel("MID_DET/CAM/1:daqOutput") == "MID_DET/CAM/1"
+    @test XFA.source_channel("MID_DET/CAM/1:daqOutput") == "daqOutput"
+    @test XFA.strip_channel("MID_EXP/MOTOR/1") == "MID_EXP/MOTOR/1"
+    @test XFA.source_channel("MID_EXP/MOTOR/1") == ""
+
+    # Property completions come from the cached device schema
+    props(names) = XFA.PropertyList(names, String[], String[], String[])
+    client = XFA.ClientState()
+    client.source_list = source_list
+    client.source_properties[("MID", "MID_EXP/MOTOR/1")] =
+        XFA.DeviceProperties(props(["pos", "velocity"]), Dict("daqOutput" => props(["data.image"])))
+
+    # A bare device completes against its slow properties, but only where slow
+    # sources are allowed; a device:channel completes against its fast data paths
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1", true) == ["pos", "velocity"]
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1", false) == String[]
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1:daqOutput", false) == ["data.image"]
+
+    # Unknown devices and channels complete to nothing
+    @test XFA.property_completions(client, "MID_EXP/MOTOR/1:nope", true) == String[]
+    @test XFA.property_completions(client, "GHOST/DEV/1", true) == String[]
 end
 
 @testset "remap_source" begin
     client = XFA.ClientState()
-    client.karabo_devices = Dict{String, Dict{String, Any}}(
-        "MID" => Dict{String, Any}("camera" => Dict("classId" => "AravisBaslerCamera"),
-                                   "motor"  => Dict("classId" => "Motor")))
+    client.source_list = [SourceInfo("MID", "camera", "AravisBaslerCamera"),
+                          SourceInfo("MID", "motor", "Motor")]
 
     camera_rule = XFA.RemapRule(XFA.RemapKind_Simple,
                                 raw"^(.*):output\[data\.image\.pixels\]$",
@@ -449,28 +707,517 @@ end
 end
 
 @testset "sampled_pctile!" begin
-    buf = Float64[]
+    buf = Int32[]
+    # True 1st/99th percentiles of the valid subset, for the approximate
+    # histogram estimate to be checked against.
+    pct(v) = (XFA.nanpctile(v, 1), XFA.nanpctile(v, 99))
 
-    # Small array (<1000): stride=1, picks the 2nd and 99th order statistics
+    # Histogram estimate lands within a bin's width of the true percentiles.
+    # Small array (<1000) uses stride=1.
     small = reshape(collect(1.0:100.0), 10, 10)
-    @test XFA.sampled_pctile!(buf, small) == (2.0, 99.0)
+    e1, e99 = pct(vec(small))
+    p1, p99 = XFA.sampled_pctile!(buf, small)
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
 
-    # Large array (>=1000): strided, but a constant matrix gives exact result
-    large = fill(7.0, 100, 100)
-    @test XFA.sampled_pctile!(buf, large) == (7.0, 7.0)
+    # Constant matrix is exact (degenerate range), and exercises the strided
+    # path for a large (>=1000) input.
+    @test XFA.sampled_pctile!(buf, fill(7.0, 100, 100)) == (7.0, 7.0)
 
-    # Mixed finite + NaN/Inf: non-finite values are dropped
-    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 50.0 NaN 100.0]
+    # Non-finite samples (NaN, Inf, -Inf) are dropped.
+    mixed = [1.0 NaN Inf; 2.0 -Inf 99.0; 25.0 NaN 100.0]
+    e1, e99 = pct(filter(isfinite, vec(mixed)))
     p1, p99 = XFA.sampled_pctile!(buf, mixed)
     @test isfinite(p1) && isfinite(p99)
-    @test p1 == 1.0 && p99 == 100.0
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
 
-    # All non-finite: fall back to (0.0, 1.0), still finite
-    nonfinite = [NaN Inf; -Inf NaN]
-    @test XFA.sampled_pctile!(buf, nonfinite) == (0.0, 1.0)
-
-    # Empty input: same fallback
+    # All non-finite / empty → fallback, still finite.
+    @test XFA.sampled_pctile!(buf, [NaN Inf; -Inf NaN]) == (0.0, 1.0)
     @test XFA.sampled_pctile!(buf, Matrix{Float64}(undef, 0, 0)) == (0.0, 1.0)
+
+    # Integer input filters nothing (no non-finite ints) but still works.
+    ints = reshape(collect(Int32(1):Int32(100)), 10, 10)
+    e1, e99 = pct(vec(ints))
+    p1, p99 = XFA.sampled_pctile!(buf, ints)
+    @test p1 ≈ e1 atol = 1.0
+    @test p99 ≈ e99 atol = 1.0
+
+    # Log mode: percentiles of the log10 of the positive samples.
+    small_pos = reshape(10.0 .^ collect(0.0:0.01:0.99), 10, 10)
+    e1, e99 = pct(log10.(vec(small_pos)))
+    p1, p99 = XFA.sampled_pctile!(buf, small_pos, true)
+    @test p1 ≈ e1 atol = 0.05
+    @test p99 ≈ e99 atol = 0.05
+
+    # Non-positive samples are dropped before log10.
+    mixed_log = [-1.0 0.0 NaN; 1.0 10.0 NaN; 100.0 1000.0 NaN]
+    e1, e99 = pct(log10.(filter(x -> isfinite(x) && x > 0, vec(mixed_log))))
+    p1, p99 = XFA.sampled_pctile!(buf, mixed_log, true)
+    @test p1 ≈ e1 atol = 0.1
+    @test p99 ≈ e99 atol = 0.1
+
+    # No positive samples → fallback, never NaN/-Inf from log10(≤0).
+    @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
+end
+
+@testset "Fitting" begin
+    @testset "fit_gaussian" begin
+        # Recover known parameters from clean data.
+        y0, A, μ, σ = 1.0, 5.0, 2.0, 0.5
+        x = collect(range(-2.0, 6.0; length=200))
+        y = @. XFA.gaussian(x, y0, A, μ, σ)
+        popt, retcode = XFA.fit_gaussian(y, x)
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out; xdata defaults to 1:length(ydata).
+        y_noisy = copy(y)
+        y_noisy[[10, 50, 100]] .= [NaN, Inf, -Inf]
+        @test XFA.fit_gaussian(y_noisy, x)[1] ≈ [y0, A, μ, σ] atol=1e-6
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        popt, retcode = XFA.fit_gaussian(fill(NaN, 10))
+        @test isnothing(popt)
+        @test retcode == :NoFiniteSamples
+
+        # A_sign=-1 fits a downward peak.
+        y_down = @. XFA.gaussian(x, 0.0, -3.0, 1.0, 0.4)
+        popt, _ = XFA.fit_gaussian(y_down, x; A_sign=-1)
+        @test popt[2] < 0
+        @test popt[3] ≈ 1.0 atol=1e-4
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_gaussian(y, x; p0=[1.0, 2.0])
+
+        # Fixed parameters: pinned slots stay put, free slots converge. Pins
+        # exercise the ForwardDiff path through the closure.
+        popt, retcode = XFA.fit_gaussian(y, x; fixed=[y0, nothing, nothing, nothing])
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        @test retcode == :Success
+        popt, _ = XFA.fit_gaussian(y, x; fixed=[nothing, nothing, μ, σ])
+        @test popt[3] == μ && popt[4] == σ
+        @test popt ≈ [y0, A, μ, σ] atol=1e-6
+        # All slots pinned → return the pinned vector directly.
+        @test XFA.fit_gaussian(y, x; fixed=[y0, A, μ, σ]) == ([y0, A, μ, σ], :Success)
+    end
+
+    @testset "fit_erf" begin
+        # Recover known parameters from a clean step
+        y0, A, center, width = 0.5, 2.0, 1.0, 1.5
+        x = collect(range(-3.0, 5.0; length=200))
+        y = @. XFA.erf(x, y0, A, center, width)
+        popt, retcode = XFA.fit_erf(y, x)
+        @test popt ≈ [y0, A, center, width] atol=1e-4
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out
+        y_noisy = copy(y)
+        y_noisy[[10, 50, 100]] .= [NaN, Inf, -Inf]
+        @test XFA.fit_erf(y_noisy, x)[1] ≈ [y0, A, center, width] atol=1e-4
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        popt, retcode = XFA.fit_erf(fill(NaN, 10))
+        @test isnothing(popt)
+        @test retcode == :NoFiniteSamples
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_erf(y, x; p0=[1.0])
+    end
+
+    @testset "fit_sin" begin
+        # Multi-cycle data with a non-trivial phase shift.
+        y0, A, period, φ = 0.5, 2.0, 3.0, 0.4
+        x = collect(range(0.0, 30.0; length=600))
+        y = @. XFA.sinusoid(x, y0, A, period, φ)
+        popt, retcode = XFA.fit_sin(y, x)
+        @test popt ≈ [y0, A, period, φ] atol=1e-4
+        @test retcode == :Success
+
+        # Invalid p0 length is rejected.
+        @test_throws ArgumentError XFA.fit_sin(y, x; p0=[1.0, 2.0])
+
+        # No finite samples → nothing popt + :NoFiniteSamples retcode.
+        @test XFA.fit_sin(fill(NaN, 10)) == (nothing, :NoFiniteSamples)
+    end
+
+    @testset "fit_line" begin
+        line(x, intercept, slope) = intercept + slope * x
+
+        intercept = 0.5
+        slope = 2.0
+        x = collect(range(-3.0, 5.0; length=50))
+        y = @. line(x, intercept, slope)
+        popt, retcode = XFA.fit_line(y, x)
+        @test popt ≈ [slope, intercept] atol=1e-10
+        @test retcode == :Success
+
+        # Non-finite ydata is masked out.
+        y_noisy = copy(y)
+        y_noisy[[5, 25]] .= [NaN, Inf]
+        @test XFA.fit_line(y_noisy, x)[1] ≈ [slope, intercept] atol=1e-10
+
+        # Failure modes carry the right retcode.
+        @test XFA.fit_line(fill(NaN, 10)) == (nothing, :NoFiniteSamples)
+        @test XFA.fit_line([1.0]) == (nothing, :InsufficientData)
+    end
+
+    @testset "Restrict X" begin
+        # Only samples inside the ROI are fitted (X needn't be sorted, as for
+        # scatter data) and the model curve spans it.
+        x = collect(0.0:0.1:10.0)[[1:2:101; 2:2:100]]
+        y = [2.0 <= xi <= 4.0 ? 3.0 * xi + 1.0 : 100.0 for xi in x]
+        fit = XFA.FitSettings(; fit_type=Ref(Cint(findfirst(==("Line"), XFA.FIT_TYPES) - 1)),
+                              restrict_x=true, x_roi=XFA.LinearROI(2.0, 2.0))
+        XFA.reset_fit_params!(fit)
+        XFA.compute_fit!(fit, y, x)
+        @test fit.popt ≈ [3.0, 1.0] atol=1e-10
+        @test extrema(fit.model_x) == (2.0, 4.0)
+    end
+end
+
+@testset "Plot specs" begin
+    quantitative(field) = Dict("field" => field, "type" => "quantitative")
+
+    # A layered spec exercising a multi-series layer, a lookup, ROI params and a model
+    spec = Dict(
+        "title" => "Spectra",
+        "layer" => [
+            Dict("data" => Dict("name" => "spectra"), "mark" => "line",
+                 "encoding" => Dict("x" => Dict("field" => "X", "type" => "quantitative",
+                                                "axis" => Dict("title" => "Energy")),
+                                    "y" => Dict("field" => "value", "scale" => Dict("type" => "log"),
+                                                "title" => nothing),
+                                    "color" => Dict("field" => "pulseId")),
+                 "params" => [Dict("name" => "grp.band",
+                                   "select" => Dict("type" => "interval", "encodings" => ["x"]),
+                                   "value" => Dict("x" => [5, 2]))]),
+            Dict("data" => Dict("name" => "intensity"), "mark" => Dict("type" => "point"),
+                 "transform" => [Dict("lookup" => "trainId",
+                                      "from" => Dict("data" => Dict("name" => "motor"),
+                                                     "key" => "trainId", "fields" => ["value"]),
+                                      "as" => ["motor"])],
+                 "encoding" => Dict("x" => quantitative("motor"), "y" => quantitative("value")))],
+        "params" => [Dict("name" => "grp.roi", "select" => "interval")],
+        "usermeta" => Dict("other" => 1,
+                           "xfa" => Dict("fixed_aspect" => false,
+                                         "models" => [Dict("function" => "gaussian",
+                                                           "params" => "spectra.fit")])))
+    compiled = XFA.compile_spec("spectra", spec)
+    spectra, correlation = compiled.layers
+
+    # The hidden y title of the first layer falls through to the second's
+    @test (compiled.title, compiled.xlabel, compiled.ylabel) == ("Spectra", "Energy", "value")
+    @test (spectra.x.log, spectra.y.log, compiled.fixed_aspect) == (false, true, false)
+    # Types follow Vega-Lite's inference: a scale type implies quantitative,
+    # otherwise an untyped field is nominal.
+    @test spectra.y.type == XFA.FieldType_Quantitative
+    @test spectra.color.type == XFA.FieldType_Nominal
+    @test isempty(spectra.lookups)
+    @test correlation.mark == XFA.Mark_Point
+    @test correlation.lookups == (XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "motor"),)
+    @test compiled.rois == [XFA.RoiParam("grp.roi", XFA.RectROI()),
+                            XFA.RoiParam("grp.band", XFA.LinearROI(2.0, 3.0; axis=:x))]
+    @test compiled.models == [XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "spectra.fit", nothing)]
+    # A model's parameters come in a fixed order
+    @test XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0, 0.0, 1.0])(0.0) == 3.0
+    @test_throws "a gaussian takes 4 parameters" XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0])
+    @test XFA.datasets(compiled) == Set(["spectra", "intensity", "motor", "spectra.fit"])
+
+    # A unit spec: an image, with the defaults
+    image = XFA.compile_spec("detector", Dict(
+        "\$schema" => "https://vega.github.io/schema/vega-lite/v5.json",
+        "data" => Dict("name" => "detector"), "mark" => "rect",
+        "encoding" => Dict("x" => Dict("field" => "col", "type" => "ordinal"),
+                           "y" => Dict("field" => "row", "type" => "ordinal"),
+                           "color" => Dict("field" => "value", "type" => "quantitative",
+                                           "scale" => Dict("type" => "log", "scheme" => "turbo")))))
+    layer = only(image.layers)
+    @test layer.mark == XFA.Mark_Rect
+    @test (layer.color.log, layer.color.scheme) == (true, "turbo")
+    @test (image.name, image.title, image.xlabel, image.fixed_aspect) == ("detector", "detector", "col", true)
+    @test isempty(image.rois) && isempty(image.models)
+
+    base(pairs...) = Dict{String, Any}("data" => Dict("name" => "a"), "mark" => "line",
+                                       "encoding" => Dict("x" => quantitative("index"),
+                                                          "y" => quantitative("value")),
+                                       pairs...)
+
+    # Pre-binned bars need no type
+    histogram = XFA.compile_spec("a", base("mark" => "bar",
+                                      "encoding" => Dict("x" => Dict("field" => "index", "bin" => Dict("binned" => true)),
+                                                         "y" => quantitative("value"))))
+    @test only(histogram.layers).x == XFA.ChannelDef("index", XFA.FieldType_Quantitative, "index", false, nothing, true)
+
+    # A lookup plots the pulled field against the layer's own value, either way around
+    lookup(from_key) = [Dict("lookup" => "index", "as" => "b",
+                             "from" => Dict("data" => Dict("name" => "b"), "key" => from_key, "fields" => ["value"]))]
+    paired(x, y) = base("transform" => lookup("index"), "mark" => Dict("type" => "point", "opacity" => 0.5),
+                        "encoding" => Dict("x" => quantitative(x), "y" => quantitative(y)))
+    layer = only(XFA.compile_spec("a", paired("b", "value")).layers)
+    @test (only(layer.lookups).key, layer.opacity) == (XFA.LookupKey_Index, 0.5)
+    @test XFA.lookup_names(layer) == ["b", "a"]
+    @test XFA.lookup_names(only(XFA.compile_spec("a", paired("value", "b")).layers)) == ["a", "b"]
+
+    # Two lookups place the layer's own value at the points they give, coloured by it
+    pull(name, as, key = "trainId") = Dict("lookup" => key, "as" => as,
+                                           "from" => Dict("data" => Dict("name" => name), "key" => key,
+                                                          "fields" => ["value"]))
+    colored = Dict("field" => "value", "type" => "quantitative", "scale" => Dict("type" => "log"))
+    mesh(pairs...) = base("transform" => [pull("m1", "x"), pull("m2", "y")], "mark" => "point",
+                          "encoding" => Dict("x" => quantitative("x"), "y" => quantitative("y"), "color" => colored),
+                          pairs...)
+    layer = only(XFA.compile_spec("a", mesh()).layers)
+    @test length(layer.lookups) == 2 && layer.color.log
+    @test XFA.lookup_names(layer) == ["m1", "m2", "a"]
+    @test XFA.datasets(XFA.compile_spec("a", mesh())) == Set(["a", "m1", "m2"])
+
+    # Anything outside the subset is rejected with a message
+    rejected = [
+        base("width" => 300) => "spec: unsupported property",
+        base("title" => 1) => "spec.title: expected AbstractString, got Int64",
+        delete!(base(), "data") => "spec: missing",
+        Dict("layer" => []) => "at least one layer",
+        base("mark" => "area") => "spec.mark: unsupported value",
+        base("encoding" => Dict("x" => Dict("field" => "index"), "y" => quantitative("value"))) =>
+            "encoding.x: only quantitative axes",
+        base("mark" => "rect") => "a rect needs a quantitative color",
+        base("transform" => [Dict("filter" => "datum.value > 1")]) => "only lookup transforms",
+        base("transform" => lookup("trainId")) => "from.key: must be the same as lookup",
+        paired("index", "value") => "a lookup must plot against",
+        mesh("mark" => "line") => "two lookups must be points",
+        mesh("encoding" => Dict("x" => quantitative("x"), "y" => quantitative("y"))) => "two lookups must be points",
+        mesh("transform" => [pull("m1", "x"), pull("m2", "y", "index")]) => "must share a key",
+        mesh("transform" => [pull("m1", "x"), pull("m2", "y"), pull("m3", "z")]) => "at most two lookup transforms",
+        base("params" => [Dict("name" => "p", "select" => "point")]) => "only interval selections",
+    ]
+    for (bad, message) in rejected
+        @test_throws message XFA.compile_spec("bad", bad)
+    end
+
+    @testset "Correlation specs" begin
+        motor = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar, title="Motor")
+        intensity = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar)
+        spec = XFA.correlation_spec("motor", "intensity", motor, intensity)
+        layer = only(spec.layers)
+        @test (layer.mark, layer.opacity) == (XFA.Mark_Point, 0.5)
+        @test layer.lookups == (XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "x"),)
+        @test XFA.lookup_names(layer) == ["motor", "intensity"]
+        @test (spec.xlabel, spec.ylabel) == ("Motor", "")
+        @test XFA.datasets(spec) == Set(["motor", "intensity"])
+        # Vectors are paired per element instead
+        motor.type = intensity.type = XFA.VariableType_Vector
+        vectors = only(XFA.correlation_spec("motor", "intensity", motor, intensity).layers)
+        @test only(vectors.lookups).key == XFA.LookupKey_Index
+
+        # A new spec keeps the paired history if the same two variables are
+        # still paired, following a swap of the axes
+        matcher = XFA.VariableTrainmatcher(2)
+        append!(matcher.data[1], [1.0, 2.0])
+        append!(matcher.data[2], [10.0, 20.0])
+        previous = XFA.ViewLayer(; spec=layer, matcher)
+        @test XFA.carry_matcher(previous, layer) === matcher
+        swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
+        @test isnothing(XFA.carry_matcher(previous, swapped))   # now vectors, a different key
+        motor.type = intensity.type = XFA.VariableType_Scalar
+        swapped = only(XFA.correlation_spec("intensity", "motor", intensity, motor).layers)
+        @test XFA.carry_matcher(previous, swapped) === matcher
+        @test matcher.data == [[10.0, 20.0], [1.0, 2.0]]
+        other = only(XFA.correlation_spec("other", "motor", intensity, motor).layers)
+        @test isnothing(XFA.carry_matcher(previous, other))
+        @test isnothing(XFA.carry_matcher(nothing, layer))
+
+        # A mesh scan colours Z at the X/Y positions, and swapping keeps Z
+        mesh = only(XFA.mesh_spec("motor", "intensity", "z", motor, intensity, intensity).layers)
+        @test (mesh.data, mesh.color.field) == ("z", "value")
+        @test XFA.lookup_names(mesh) == ["motor", "intensity", "z"]
+        matcher = XFA.VariableTrainmatcher(3)
+        append!.(matcher.data, [[1.0], [2.0], [3.0]])
+        swapped = only(XFA.mesh_spec("intensity", "motor", "z", intensity, motor, intensity).layers)
+        @test XFA.carry_matcher(XFA.ViewLayer(; spec=mesh, matcher), swapped) === matcher
+        @test matcher.data == [[2.0], [1.0], [3.0]]
+    end
+
+    @testset "Train matching" begin
+        function scalar_store(pairs...)
+            store = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), type=XFA.VariableType_Scalar,
+                                      scalar_tids=XFA.CircularBuffer{Int}(10))
+            for (tid, value) in pairs
+                push!(store.scalar_tids, tid)
+                push!(store.data, value)
+            end
+            store
+        end
+        # Train 3 is missing Y and train 4's Z isn't finite
+        stores = [scalar_store(1 => 0.0, 2 => 0.0, 3 => 1.0, 4 => 1.0),
+                  scalar_store(1 => 0.0, 2 => 1.0, 4 => 1.0),
+                  scalar_store(1 => 5.0, 2 => 7.0, 3 => 1.0, 4 => NaN)]
+        names = ["x", "y", "z"]
+        m = XFA.VariableTrainmatcher(3)
+        @test XFA.ingest_scalar!(m, stores, Dict("z" => Set(1:4)), names)
+        @test sort(m.data[3]) == [5.0, 7.0]
+        @test !XFA.ingest_scalar!(m, stores, Dict("other" => Set([1])), names)
+
+        # Binning needs a resolution for both positions, and rebuilds when one changes
+        @test !XFA.set_resolution!(m, Cfloat[0.5, 0])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0.5])
+        @test m.accu isa XFA.Scalar2dScan
+        @test XFA.positions(m.accu, 2) == [0.0, 1.0]
+        @test !XFA.set_resolution!(m, Cfloat[0.5, 0.5])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0.25])
+        @test XFA.set_resolution!(m, Cfloat[0, 0.25]) && isnothing(m.accu)
+
+        # Two variables bin over one position
+        m = XFA.VariableTrainmatcher(2)
+        XFA.ingest_scalar!(m, stores[[1, 3]], Dict("x" => Set(1:4)), ["x", "z"])
+        @test XFA.set_resolution!(m, Cfloat[0.5, 0]) && m.accu isa XFA.Scalar1dScan
+        @test parent(m.accu.mean) == [6.0, 1.0]
+    end
+
+    @testset "Default specs" begin
+        # A DimArray vector is a line over its dim, with empty labels hidden
+        spectrum = XFA.VariableStore(; data=XFA.DimArray([4.0, 5.0, 6.0], (XFA.DD.Dim{:energy}([1.0, 2.0, 3.0]),)),
+                                     title="Spectrum", ylabel="counts")
+        spec = XFA.default_spec("spectrum", spectrum)
+        layer = only(spec.layers)
+        @test (layer.data, layer.mark, layer.x.field, layer.y.field) == ("spectrum", XFA.Mark_Line, "energy", "value")
+        @test (spec.title, spec.xlabel, spec.ylabel) == ("Spectrum", "", "counts")
+        @test XFA.field_values("spectrum", spectrum, "energy") == [1.0, 2.0, 3.0]
+        @test XFA.field_values("spectrum", spectrum, "value") == [4.0, 5.0, 6.0]
+        # The positional names work on a DimArray too
+        @test XFA.field_values("spectrum", spectrum, "index") == [1.0, 2.0, 3.0]
+        @test_throws "no field" XFA.field_values("spectrum", spectrum, "row")
+
+        # The spec is only resynthesised when something it depends on changes
+        key = XFA.default_spec_key(spectrum)
+        @test key == XFA.default_spec_key(spectrum)
+        spectrum.title = "Other"
+        @test key != XFA.default_spec_key(spectrum)
+
+        # A plain histogram is pre-binned bars, its explicit axis is the index
+        histogram = XFA.VariableStore(; data=[1, 2, 3], plot_type=:histogram)
+        layer = only(XFA.default_spec("h", histogram).layers)
+        @test (layer.mark, layer.x.field, layer.x.binned) == (XFA.Mark_Bar, "index", true)
+        @test XFA.field_values("h", histogram, "index") == 1:3
+        histogram.x_axis = [10, 20, 30]
+        @test XFA.field_values("h", histogram, "index") == [10, 20, 30]
+
+        # A matrix is an image, with rows along Y and columns along X
+        image = XFA.VariableStore(; data=zeros(2, 3), fixed_aspect=false)
+        spec = XFA.default_spec("image", image)
+        layer = only(spec.layers)
+        @test (layer.mark, layer.x.field, layer.y.field, layer.color.scheme) == (XFA.Mark_Rect, "col", "row", "turbo")
+        @test !spec.fixed_aspect
+        @test (XFA.field_dim(image.data, "row"), XFA.field_dim(image.data, "col")) == (1, 2)
+
+        # A scalar history is plotted against its train IDs
+        scalar = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), xlabel="trainId")
+        spec = XFA.default_spec("scalar", scalar)
+        @test (only(spec.layers).x.field, spec.xlabel) == ("trainId", "trainId")
+        @test XFA.field_values("scalar", scalar, "trainId") === scalar.scalar_tids_cache
+    end
+
+    @testset "Multi-series layers" begin
+        # The x and color dims of a matrix resolve by name or position, either
+        # way around, and x defaults to the dim the color isn't on
+        spectra = XFA.VariableStore(; data=XFA.DimArray(zeros(3, 2), (XFA.DD.Dim{:X}([1.0, 2.0, 3.0]),
+                                                                       XFA.DD.Dim{:pulseId}([10, 20]))))
+        by_name = XFA.LayerSpec(; data="spectra", x=:X, color=:pulseId)
+        @test XFA.series_dims("spectra", spectra.data, by_name) == (1, 2)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:col, color=:row)) == (2, 1)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:pulseId)) == (1, 2)
+        @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:X)) == (2, 1)
+        @test (XFA.dim_values(spectra, 1), XFA.dim_values(spectra, 2)) == ([1.0, 2.0, 3.0], [10, 20])
+        # An explicit x_axis runs along the columns
+        spectra.x_axis = [0.1, 0.2]
+        @test XFA.dim_values(spectra, 2) == [0.1, 0.2]
+
+        @test_throws "a color channel needs a matrix" XFA.series_dims("spectra", zeros(3), by_name)
+        @test_throws "a color channel needs a matrix" XFA.series_dims(
+            "spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:X, color=:X))
+
+        # Labels the spec leaves open come from the data, whose ylabel runs along the rows
+        spectra.ylabel, spectra.title = "energy", "Spectra"
+        gui = XFA.GuiState(Dict{String, Any}())
+        gui.client.variable_data["spectra"] = spectra
+        XFA.@with XFA.state => gui begin
+            lines = XFA.PlotSpec("lines", [by_name])
+            @test (XFA.axis_label(lines, lines.xlabel, :x), XFA.axis_label(lines, lines.ylabel, :y)) == ("energy", "Spectra")
+            @test XFA.axis_label(lines, "given", :x) == "given"
+        end
+    end
+end
+
+@testset "Metadata follows its data" begin
+    gui = XFA.GuiState(Dict{String, Any}())
+    client = gui.client
+    message(tid, data, title) = XFA.VariableData(; tid, name="a", data, title, x_axis=[tid])
+    XFA.@with XFA.state => gui begin
+        XFA.store_variable_data!(client, message(1, [1.0], "first"))
+        store = client.variable_data["a"]
+        @test store.title == ""
+        XFA.draw_plots()
+        @test (store.data, store.trainId, store.title, store.x_axis) == ([1.0], 1, "first", [1])
+
+        # A dropped frame's metadata is never shown
+        XFA.store_variable_data!(client, message(2, [2.0], "second"))
+        XFA.store_variable_data!(client, message(3, [3.0], "third"))
+        @test store.title == "first"
+        XFA.draw_plots()
+        @test (store.trainId, store.title, store.x_axis) == (3, "third", [3])
+
+        # Compressed data brings its metadata through the decode
+        ws = XFA.ZfpWorkspace()
+        compressed = XFA.XfaEngine.ZfpWorkspaces.compress_array(ws, rand(1000); k=0)
+        XFA.store_variable_data!(client, message(4, compressed, "fourth"))
+        XFA.draw_plots()
+        @test store.title == "third"
+        wait(store.decode_task)
+        XFA.draw_plots()
+        @test (store.trainId, store.title, store.x_axis) == (4, "fourth", [4])
+    end
+end
+
+@testset "Trainmatching array layers" begin
+    a = XFA.VariableStore(; data=[1.0, 2.0], trainId=1)
+    b = XFA.VariableStore(; data=XFA.DimArray([3.0, 4.0], (XFA.DD.Dim{:energy}([1.0, 2.0]),)), trainId=2)
+    fit = XFA.VariableStore(; data=[0.0, 1.0, 0.0, 1.0], trainId=1)
+    scalar = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10))
+    variable_data = Dict("a" => a, "b" => b, "fit" => fit, "scalar" => scalar)
+    view = XFA.SpecView(; source=XFA.DefaultSpec("a", XFA.ModelOverlay[]), id="view")
+    append!(view.layers, [XFA.ViewLayer(; spec=XFA.LayerSpec(; data)) for data in ("a", "b", "scalar")])
+    push!(view.models, XFA.ViewModel(; overlay=XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "fit", nothing)))
+    sync(names...) = keys(XFA.sync_arrays!(view, variable_data, Dict(name => Set(1) for name in names)))
+
+    # Nothing is shown until the arrays hold the same train, scalars aren't held
+    @test sync("a", "b", "fit", "scalar") == Set(["scalar"])
+    @test all(isnothing, values(view.snapshots))
+    a.trainId = 2
+    @test sync("a") == Set(["a", "b"])
+    # The fit is only taken once it's for the shown train
+    fit.trainId = 2
+    @test sync("fit") == Set(["fit"])
+
+    # The copies stay put while the stores move on
+    a.data[1] = 10.0
+    a.trainId = 3
+    @test isempty(sync("a"))
+    @test (view.snapshots["a"].data, view.snapshots["a"].trainId) == ([1.0, 2.0], 2)
+    @test XFA.DD.dims(view.snapshots["b"].data) == XFA.DD.dims(b.data)
+
+    # A lone array is drawn live
+    deleteat!(view.layers, 2)
+    @test sync("a") == Set(["a"])
+    @test isempty(view.snapshots)
+
+    # Unless only every n'th train is shown, the first straight away
+    view.update_every[] = 2
+    @test sync("a") == Set(["a"])
+    a.trainId = 4
+    @test isempty(sync("a"))
+    a.trainId = 5
+    @test sync("a") == Set(["a"])
+    @test view.snapshots["a"].trainId == 5
 end
 
 @testset "GUI" begin

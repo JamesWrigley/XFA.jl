@@ -28,7 +28,325 @@ end
     PipelineStatus_Stopped
 end
 
-const SourceInfo = @NamedTuple{topic::String, name::String, ambiguous::Bool}
+# This enum tracks the original type of the variables. We need to distinguish
+# this from how they're stored because both scalars and vectors are stored as
+# vectors.
+@enum VariableType begin
+    VariableType_Scalar
+    VariableType_Vector
+    VariableType_Array
+    VariableType_Unknown
+end
+
+
+### Plotting types
+
+
+# Per-plot GPU resources for heatmap rendering:
+# - `data_tex`:   single-channel 2D texture holding the raw matrix data
+# - `output_tex`: RGBA8 2D texture holding the colormapped result (fed to PlotImage)
+# - `fbo`:        framebuffer targeting output_tex for off-screen rendering
+mutable struct GPUHeatmap
+    data_tex::GLuint
+    output_tex::GLuint
+    fbo::GLuint
+    width::Int
+    height::Int
+    is_integer::Bool
+    # Reusable buffer for data that needs conversion (e.g. Float64 → Float32).
+    # Avoids allocating a new array every frame.
+    convert_buf::Vector{UInt8}
+    # Reused histogram bin counts for approximate 1st/99th percentile
+    # estimation, avoiding a full copy + sort of the input.
+    hist_buf::Vector{Int32}
+    # Whether the texture was last rendered in log mode — toggling this in the
+    # UI forces a re-render with fresh percentiles.
+    log_scale::Bool
+    # The colormap it was last rendered with.
+    colormap::Cint
+end
+
+function GPUHeatmap()
+    tex_refs = Ref{GLuint}(0)
+
+    glGenTextures(1, tex_refs)
+    data_tex = tex_refs[]
+
+    glGenTextures(1, tex_refs)
+    output_tex = tex_refs[]
+
+    fbo_ref = Ref{GLuint}(0)
+    glGenFramebuffers(1, fbo_ref)
+    fbo = fbo_ref[]
+
+    return GPUHeatmap(data_tex, output_tex, fbo, 0, 0, false, UInt8[], Int32[], false, -1)
+end
+
+# Per-parameter UI state: `fixed` selects whether the slot is held in the next
+# fit; `value` is the committed value used by the fit; `edit_buf` is the
+# InputDouble binding, copied into `value` only on Enter so live keystrokes
+# don't drive the fit.
+@kwdef mutable struct FitParameter
+    fixed::Bool = false
+    value::Float64 = 0.0
+    const edit_buf::Ref{Cdouble} = Ref(0.0)
+end
+
+# Per-view fit configuration, kept in one struct so the side-panel fitting UI
+# can be driven from it. The fit follows the view's first layer.
+@kwdef mutable struct FitSettings
+    fit_type::Ref{Cint} = Ref(Cint(0))
+    live::Bool = true
+    requested::Bool = false
+    restrict_x::Bool = false
+    x_roi::LinearROI = LinearROI()
+    amplitude_sign::Int = 1
+    popt::Maybe{Vector{Float64}} = nothing
+    retcode::Maybe{Symbol} = nothing
+    # Wall time of the most recent fit, in seconds.
+    elapsed::Float64 = 0.0
+    # Sampled model curve, refreshed by compute_fit! on each successful fit so
+    # the GUI can overlay it without re-evaluating per frame.
+    const model_x::Vector{Float64} = Float64[]
+    const model_y::Vector{Float64} = Float64[]
+    # Per-parameter fix flags + values for the current fit type. Rebuilt when
+    # fit_type changes; iteration order matches the positional popt layout.
+    const params::OrderedDict{String, FitParameter} = OrderedDict{String, FitParameter}()
+end
+
+# A `PlotType` is what a SpecView's `prepare!` hands back each frame, drawn by
+# `plot_frame!`.
+abstract type PlotType end
+
+# 1D series. `style` selects the ImPlot primitive:
+#   :line    → PlotLine
+#   :scatter → PlotScatter
+struct Line <: PlotType
+    xs
+    ys
+    label::String
+    style::Symbol
+    # Explicit per-series color, used when a color channel groups a layer into
+    # series. nothing lets ImPlot cycle its palette as usual.
+    color::Maybe{ig.ImVec4}
+    opacity::Float64
+end
+
+# Bar series, for histograms and any vector drawn as bars.
+struct Bars <: PlotType
+    xs
+    ys
+    label::String
+    bar_size::Float64
+end
+
+# Shaded band + central line, sharing one legend entry. Used for binned
+# correlations where `lower`/`upper` bound the spread around `line_ys`.
+struct Band <: PlotType
+    xs
+    lower
+    upper
+    line_ys
+    label::String
+end
+
+# Scatter points, each with its own colour.
+struct ColoredPoints <: PlotType
+    xs::Vector{Float64}
+    ys::Vector{Float64}
+    colors::Vector{UInt32}
+    label::String
+end
+
+# Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
+# may be nothing (defaults to pixel coords).
+struct Image <: PlotType
+    data
+    x_axis::Maybe{AbstractVector}
+    y_axis::Maybe{AbstractVector}
+    gpu::GPUHeatmap
+end
+
+# Nothing to draw this frame. `message`, when non-empty, is shown in place of
+# the plot.
+struct Empty <: PlotType
+    message::String
+end
+
+# Colorbar interaction state. `clip_min`/`clip_max` are the values fed to
+# the colormap shader; `display_min`/`display_max` are the visible range
+# shown on the colorbar axis (>= clip range, controlled by mouse wheel).
+@kwdef mutable struct ColorbarState
+    const autoscale::Ref{Bool} = Ref(true)
+    const clip_min::Ref{Cdouble} = Ref(0.0)
+    const clip_max::Ref{Cdouble} = Ref(1.0)
+    const display_min::Ref{Cdouble} = Ref(0.0)
+    const display_max::Ref{Cdouble} = Ref(1.0)
+    drag::Symbol = :none
+    display_zoomed::Bool = false
+end
+
+# Matrix-rendering state: GPU heatmap resources, colormap log toggle, colorbar
+# state, ROI overlay bookkeeping. Lives on Plot whenever the plotted data is a
+# matrix.
+@kwdef mutable struct ImageState
+    const fixed_aspect::Ref{Bool} = Ref(true)
+    const log_scale::Ref{Bool} = Ref(false)
+    colormap::Cint = turbo_colormap()
+    const colorbar::ColorbarState = ColorbarState()
+    gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
+end
+
+# Matches samples from several VariableData stores on train IDs, one history
+# buffer per store in lookup_names order. The last is the value, binned over the
+# others as positions once there's a resolution. Pure data plumbing — no ImGui
+# state.
+@kwdef mutable struct VariableTrainmatcher
+    const data::Vector{Vector{Float64}}
+    accu::Union{Nothing, Scalar1dScan, Scalar2dScan} = nothing
+    # Last vector-mode tid consumed, so we only copy once per matched train.
+    last_vector_tid::Int = -1
+end
+
+# Where a SpecView's spec comes from, see refresh_spec!.
+abstract type SpecSource end
+
+# The default plot of a variable, with model curves drawn over it if any.
+struct DefaultSpec <: SpecSource
+    variable::String
+    models::Vector{ModelOverlay}
+end
+
+# A correlation of variables picked in the plot window, authored as a lookup
+# spec (see correlation_spec).
+@kwdef struct CorrelationSpec <: SpecSource
+    # The X, Y and optional Z variables, "" until there's one to pick (or for no Z).
+    selected::Vector{String} = ["", "", ""]
+    # Refreshed each frame from client.variable_data; used by the X/Y combos.
+    variable_names::Vector{String} = String[]
+end
+
+# A plot that `variable` advertises under `name`, besides its default one.
+struct AdvertisedSpec <: SpecSource
+    variable::String
+    name::String
+end
+
+# One layer of a SpecView. `image` is the state of a rect layer or of points
+# coloured by value, `matcher` matches the variables of a lookup layer, and
+# `series` holds the series a color channel groups the data into. `colors` are
+# the points' colours, and `fitted_log` the log mode their colorbar was last
+# fitted in.
+@kwdef mutable struct ViewLayer
+    const spec::LayerSpec
+    image::Maybe{ImageState} = nothing
+    const matcher::Maybe{VariableTrainmatcher} = nothing
+    const series::Vector{PlotType} = PlotType[]
+    const colors::Vector{UInt32} = UInt32[]
+    fitted_log::Maybe{Bool} = nothing
+    const hist_buf::Vector{Int32} = Int32[]
+end
+
+# The curves of one of a spec's models, resampled when its parameters update.
+@kwdef struct ViewModel
+    overlay::ModelOverlay
+    xs::Vector{Float64} = Float64[]
+    curves::Vector{PlotType} = PlotType[]
+end
+
+@kwdef mutable struct VariableStore
+    const updates::Channel = Channel(100)
+    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
+    type::VariableType = VariableType_Unknown
+
+    # This field is only used for non-scalar data. Scalar data is stored as a
+    # CircularBuffer with a parallel CircularBuffer for train IDs.
+    trainId::Int = -1
+
+    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
+    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
+
+    # Background array decompression. `decode_task` is this variable's in-flight
+    # decode (or nothing); while it's running draw_plots drops newer frames
+    # instead of spawning another. `decode_variable` is that frame's message.
+    # `spare_buffer` is the off-screen buffer the task decodes into, swapped with
+    # `data` on pickup so decoding never mutates the array being rendered.
+    decode_task::Maybe{Task} = nothing
+    decode_variable::Maybe{VariableData} = nothing
+    spare_buffer::Maybe{Array} = nothing
+
+    # Contiguous caches for plotting scalar CircularBuffer data
+    const scalar_data_cache::Vector{Float64} = Float64[]
+    const scalar_tids_cache::Vector{Float64} = Float64[]
+
+    # Processing rate (Hz) reported by the engine.
+    update_rate::Float64 = 0.0
+
+    # Compression ratio (uncompressed / compressed bytes) of the most recent
+    # payload. NaN when the variable arrived uncompressed.
+    compression_ratio::Float64 = NaN
+
+    # Size in bytes of the most recent array payload on the wire — the
+    # compressed size for compressed payloads, otherwise sizeof(data).
+    received_bytes::Int = 0
+
+    # Metadata from VariableData
+    title::String = ""
+    x_axis::Maybe{AbstractVector} = nothing
+    y_axis::Maybe{AbstractVector} = nothing
+    xlabel::String = ""
+    ylabel::String = ""
+    unit::Maybe{String} = nothing
+    bin_resolution::Float64 = 0.0
+    fixed_aspect::Bool = true
+    plot_type::Symbol = :series
+    compress::Bool = true
+    plot_specs::Vector{PlotSpec} = PlotSpec[]
+end
+
+# Renders a PlotSpec from its source. Synthesised specs are rebuilt whenever
+# the source's `spec_key` changes.
+@kwdef mutable struct SpecView
+    const source::SpecSource
+    const id::String
+    const fit::FitSettings = FitSettings()
+    spec_key::Any = nothing
+    spec::Maybe{PlotSpec} = nothing
+    const layers::Vector{ViewLayer} = ViewLayer[]
+    const models::Vector{ViewModel} = ViewModel[]
+    const subscribed::Set{String} = Set{String}()
+    # Bin width per position axis of the trainId lookup layers, 0 for no
+    # binning. Each follows its variable's hint until the user touches it.
+    const binning_resolution::Vector{Cfloat} = Cfloat[0, 0]
+    const resolution_touched::Vector{Bool} = [false, false]
+    # ROI parameter values updated locally during a drag, keyed by parameter
+    # name. Flushed to the engine when the user releases the mouse so we don't
+    # flood it with per-frame updates.
+    const pending_roi_updates::Dict{String, AbstractROI} = Dict{String, AbstractROI}()
+    # Array variables drawn from copies instead of the live stores, see sync_arrays!
+    const snapshots::Dict{String, Maybe{VariableStore}} = Dict{String, Maybe{VariableStore}}()
+    shown_tid::Int = -1
+    # Only every `update_every`'th matched train is shown
+    const update_every::Ref{Cint} = Ref(Cint(1))
+    update_age::Int = 0
+    matched_tid::Int = -1
+end
+
+# A plot window: the view, and the state of the plot's axes. `id` is also the
+# `##` suffix of the view's widgets.
+@kwdef mutable struct Plot
+    const id::String
+    const view::SpecView
+    const open::Ref{Bool} = Ref(true)
+    const autoscale_x::Ref{Bool} = Ref(true)
+    const autoscale_y::Ref{Bool} = Ref(true)
+    const log_x::Ref{Bool} = Ref(false)
+    const log_y::Ref{Bool} = Ref(false)
+    const show_side_panel::Ref{Bool} = Ref(false)
+    dock_id::UInt32 = 0
+end
+
+### GUI state types
 
 struct PropertyList
     names::Vector{String}
@@ -51,12 +369,44 @@ DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}
 end
 
 @kwdef mutable struct KaraboDepTextState
-    cursor_pos::Cint = -1
-    device::Maybe{String} = nothing
+    # Working copies of the source/property/proxy fields while the editor window
+    # is open. Seeded from the current value when the window opens and composed
+    # back into a source string on OK.
+    source::String = ""
+    property::String = ""
+    proxy::String = ""
+    proxy_expanded::Bool = false
 
-    # If set, the callback will replace the buffer contents with this text,
-    # move the cursor to the end, and then clear it.
-    wanted_text::Maybe{String} = nothing
+    # Set by the editor window's OK button (the raw composed source string) and
+    # picked up by KaraboDepText on the next frame, which runs the remap and
+    # returns the result to the caller.
+    committed::Maybe{String} = nothing
+
+    # Per-call context captured when the editor window opens, so the deferred
+    # top-level draw has everything it needs. `source_list` is the (possibly
+    # topic-filtered) source list to complete against.
+    label::String = ""
+    source_list::Vector{SourceInfo} = SourceInfo[]
+    device_only::Bool = false
+    allow_slow::Bool = true
+    # One-shot flag to open/focus the window on its first drawn frame.
+    trigger::Bool = false
+    # Frames the window has been drawn, so the focus-loss close check is skipped
+    # on the opening frame.
+    frames::Int = 0
+    # Set each frame when an autocomplete popup is hovered, so losing window
+    # focus to that popup doesn't close the editor.
+    ac_hovered::Bool = false
+    # Set each frame when an autocomplete popup is open, so an Enter that selects
+    # a completion isn't also treated as confirming the whole editor.
+    ac_active::Bool = false
+
+    # Set when a new source is picked: the property is re-checked against the new
+    # source once its schema arrives, and dropped (with focus moved to the
+    # property field) if it no longer belongs.
+    revalidate_property::Bool = false
+    # One-shot request to focus the property field on the next frame.
+    property_focus::Bool = false
 
     # Set when a remap requires an async device-property lookup. The widget
     # stays disabled until the request resolves, then re-runs the remap.
@@ -66,12 +416,77 @@ end
     proxy_property::Ref{Any} = Ref{Any}(nothing)
 end
 
-mutable struct DepTextState
-    is_karabo::Bool
-    karabo_state::KaraboDepTextState
+@kwdef mutable struct DepTextState
+    is_karabo::Bool = false
+    karabo_state::KaraboDepTextState = KaraboDepTextState()
+    # Set when the kind is switched via the (deferred) selector popup so the new
+    # text field grabs focus on the next frame.
+    wants_focus::Bool = false
 end
 
-DepTextState(is_karabo::Bool) = DepTextState(is_karabo, KaraboDepTextState())
+@kwdef mutable struct CopyableComboPopup
+    # The active dropdown request; label is nothing when no popup is open.
+    label::Maybe{String} = nothing
+    items::Vector{String} = String[]
+    anchor::ImVec2 = ImVec2(0, 0)
+    width::Cfloat = 0
+    # One-shot flag to open the popup on the next deferred draw.
+    trigger::Bool = false
+    # The chosen selection, held until the widget picks it up next frame.
+    result_label::Maybe{String} = nothing
+    result_index::Cint = 0
+end
+
+@enum ElidedEditState begin
+    ElidedEditState_NoEdit
+    ElidedEditState_WantEdit
+    ElidedEditState_Edit
+end
+
+struct CompletionResult
+    items::Any
+    renderer::Function
+    query::String
+    source::String
+end
+
+@kwdef mutable struct ElidedTextState
+    edit::ElidedEditState = ElidedEditState_NoEdit
+    selected_idx::Int = 1
+    cached_query::String = ""
+    cached_source::String = ""
+    cached_scored::Vector{Tuple{Int, Any}} = Tuple{Int, Any}[]
+    # Source autocomplete only: the row in the channel column of the currently
+    # selected device, or 0 when the device row itself is the current row.
+    channel_idx::Int = 0
+    # Debounce for lazy channel discovery in the source autocomplete: device
+    # schemas are only fetched once the query has been stable for a short while.
+    last_query::String = ""
+    last_change_time::Float64 = 0.0
+end
+
+# An autocomplete popup deferred out of the node canvas, like CopyableComboPopup.
+# While the canvas is drawing it rewrites the ImGui viewport into canvas-local
+# coordinates, and Begin() clips every window against that viewport, so a popup
+# positioned in screen space is clipped away to nothing (it is still begun, just
+# invisible). Widgets inside the canvas record the request here instead, and
+# draw_dag draws it after EndNode under Suspend/Resume.
+@kwdef mutable struct CompletionPopup
+    # The active request; label is nothing when no widget is completing. It is
+    # re-recorded every frame the widget is being edited, and consumed by the
+    # deferred draw.
+    label::Maybe{String} = nothing
+    state::Maybe{ElidedTextState} = nothing
+    completions::Maybe{CompletionResult} = nothing
+    # Screen-space rect of the input, to hang the popup under.
+    input_min::ImVec2 = ImVec2(0, 0)
+    input_max::ImVec2 = ImVec2(0, 0)
+    # The deferred draw's outcome, keyed by the label it was drawn for and held
+    # until that widget picks it up next frame.
+    drawn_label::Maybe{String} = nothing
+    result::Maybe{String} = nothing
+    hovered::Bool = false
+end
 
 abstract type AbstractParameterState end
 
@@ -144,68 +559,48 @@ function Base.close(state::SshState)
     empty!(state.kbdint_prompts)
 end
 
-# This enum tracks the original type of the variables. We need to distinguish
-# this from how they're stored because both scalars and vectors are stored as
-# vectors.
-@enum VariableType begin
-    VariableType_Scalar
-    VariableType_Vector
-    VariableType_Array
-    VariableType_Unknown
-end
-
 const SCALAR_BUFFER_CAPACITY = 10_000
 
-@kwdef mutable struct VariableStore
-    const updates::Channel = Channel(100)
-    data::Union{AbstractArray, CircularBuffer, ArrayMetadata}
-    type::VariableType = VariableType_Unknown
-
-    # This field is only used for non-scalar data. Scalar data is stored as a
-    # CircularBuffer with a parallel CircularBuffer for train IDs.
-    trainId::Int = -1
-
-    # Train IDs for scalar data, parallel to `data` when it's a CircularBuffer
-    scalar_tids::Maybe{CircularBuffer{Int}} = nothing
-
-    # Contiguous caches for plotting scalar CircularBuffer data
-    const scalar_data_cache::Vector{Float64} = Float64[]
-    const scalar_tids_cache::Vector{Float64} = Float64[]
-
-    # Processing rate (Hz) reported by the engine.
-    update_rate::Float64 = 0.0
-
-    # Compression ratio (uncompressed / compressed bytes) of the most recent
-    # payload. NaN when the variable arrived uncompressed.
-    compression_ratio::Float64 = NaN
-
-    # Size in bytes of the most recent array payload on the wire — the
-    # compressed size for compressed payloads, otherwise sizeof(data).
-    received_bytes::Int = 0
-
-    # Metadata from VariableData
-    title::String = ""
-    x_axis::Maybe{AbstractVector} = nothing
-    y_axis::Maybe{AbstractVector} = nothing
-    xlabel::String = ""
-    ylabel::String = ""
-    unit::Maybe{String} = nothing
-    fixed_aspect::Bool = true
-end
-
 struct LinkInfo
-    id::Cint
-    start_id::Cint
-    end_id::Cint
+    id::UInt
+    start_id::UInt
+    end_id::UInt
     channel_key::Tuple{String, String}
 end
 
 struct OutputPin
-    id::Cint
+    id::UInt
     label::String
     is_subvariable::Bool
 end
 OutputPin(id, label) = OutputPin(id, label, false)
+
+# An input pin of a node: a variable argument or, for groups, a
+# Parameter{Dependency} field (`field` is then the constructor kwarg rewritten
+# in source). Readonly pins are engine-managed and drawn disabled.
+@kwdef mutable struct DependencyPin
+    id::UInt
+    arg_name::String
+    dep::Any
+    field::Union{String, Nothing} = nothing
+    optional::Bool = false
+    readonly::Bool = false
+end
+
+# A dependency pin, as needed to rewrite the dependency when a link is dragged
+# onto it.
+struct DepPinInfo
+    node::String
+    arg::String
+    variable::String
+    dep::Dependency
+end
+
+# An output pin a dependency can point at
+struct OutputPinInfo
+    variable::String
+    name::String
+end
 
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
@@ -213,6 +608,17 @@ OutputPin(id, label) = OutputPin(id, label, false)
     source::String = ""
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
+
+    # The engine's variable-level DAG (variable -> arg -> dependency), used to
+    # reject links that would introduce a cycle.
+    dag::Dict{String, OrderedDict} = Dict()
+
+    # All parameters in the loaded context, keyed by fully-qualified name.
+    # Used by plot overlays to look up @display references without walking
+    # context_state. ParameterChanged messages mutate the shared values.
+    parameters::Dict{String, Parameter} = Dict()
+    # Variable name -> list of parameter names to overlay on its plot.
+    displays::Dict{String, Vector{String}} = Dict()
 
     # Latest per-channel (drops, size, capacity) snapshot from the engine,
     # keyed by (producer, consumer). Updated roughly once per second.
@@ -229,16 +635,7 @@ function ContextState(settings::Dict; kwargs...)
     client_settings = get(settings, "ClientState", Dict{String, Any}())
     context_path = get(client_settings, "context_path", "")
 
-    node_positions = Dict{String, Point2d}()
-    contexts = get(client_settings, "contexts", Dict())
-    if haskey(contexts, context_path)
-        saved_positions = get(contexts[context_path], "node_positions", Dict())
-        for (name, pos) in saved_positions
-            node_positions[name] = Point2d(pos[1], pos[2])
-        end
-    end
-
-    ContextState(; context_path, node_positions, kwargs...)
+    ContextState(; context_path, kwargs...)
 end
 
 Base.lock(ctx::ContextState) = lock(ctx.lock)
@@ -263,12 +660,33 @@ EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(tim
 
 # Per-variable subscription state. `count` tracks open plots referencing the
 # variable; when it drops to zero we flip `active` off (so the engine stops
-# streaming) but keep the entry around to remember the user's chosen
-# `precision` for the next time a plot of this variable is opened.
+# streaming) but keep the entry around to remember the user's chosen zfp
+# accuracy `k` for the next time a plot of this variable is opened. `k = 0`
+# means lossless, `k < 0` lets the engine pick its default, `k > 0` sets the
+# fixed-accuracy tolerance.
 @kwdef mutable struct SubscriptionState
     count::Int = 0
-    precision::Int = -1
+    k::Float64 = -1
     active::Bool = true
+end
+
+# A not-yet-committed node being assembled in the add-variable flow. It's drawn
+# as a real node in the main dag-editor (via the shared draw_variable machinery)
+# but held here rather than in the context's ctx_state, so its edits stay local
+# until the user commits and the source is written. `id` is a synthetic node id
+# (unique per pending node, unrelated to any real variable) that all its derived
+# pin/attr ids key off. `dep_values` maps each of the spec's dependency args to
+# the dependency the user has wired it to.
+@kwdef mutable struct PendingNode
+    id::UInt
+    spec::VariableSpec
+    name::String
+    dep_values::OrderedDict{String, Dependency} = OrderedDict{String, Dependency}()
+    param_values::OrderedDict{Symbol, Parameter} = OrderedDict{Symbol, Parameter}()
+    centered::Bool = false
+    # The var_data dict built for this node this frame (see spec_to_var_data),
+    # rebuilt each frame from the fields above.
+    var_data::Dict{String, Any} = Dict{String, Any}()
 end
 
 @kwdef mutable struct ClientState
@@ -284,6 +702,7 @@ end
     sftp::Maybe{ssh.SftpSession} = nothing
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
     remote_engine_dir::String = ""
+    remote_context_dir::String = ""
 
     cmd_output::String = ""
     last_error::String = ""
@@ -291,7 +710,6 @@ end
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
 
-    webproxy_status::RequestStatus = RequestStatus_Idle
     remoterepl_mode::Ref{Bool} = Ref(false)
     remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
@@ -300,8 +718,37 @@ end
     context_path_valid::Bool = true
     context::ContextState = ContextState()
 
+    available_variables::Vector{VariableSpec} = VariableSpec[]
+    # Nodes being assembled in the add-variable flow, not yet written to source.
+    pending_nodes::Vector{PendingNode} = PendingNode[]
+    # Monotonic counter for minting unique pending-node ids.
+    pending_node_counter::UInt = 0
+
+    ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
+    ne_editor_path::String = ""
+    ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
+    ne_settings::String = ""
+
+    # Pin registries for link dragging, keyed by pin id. Pins that can't take part
+    # in a link (the output pins of input nodes, whose Karabo property can't be
+    # recovered from the pin) are absent from both.
+    ne_dep_pins::Dict{UInt, DepPinInfo} = Dict{UInt, DepPinInfo}()
+    ne_output_pins::Dict{UInt, OutputPinInfo} = Dict{UInt, OutputPinInfo}()
+    # Dep pins belonging to pending nodes, keyed by pin id -> (node id, arg name).
+    # A link accepted onto one of these updates the pending node's dep locally
+    # instead of rewriting source. Rebuilt each frame from the pending nodes.
+    pending_dep_pins::Dict{UInt, Tuple{UInt, String}} = Dict{UInt, Tuple{UInt, String}}()
+    # Scratch slots that QueryNewLink() writes the dragged pin ids into.
+    ne_new_link_start::Base.RefValue{ne.PinId} = Ref(ne.PinId(0))
+    ne_new_link_end::Base.RefValue{ne.PinId} = Ref(ne.PinId(0))
+    # Scratch slot that QueryDeletedLink() writes the deleted link id into.
+    ne_deleted_link::Base.RefValue{ne.LinkId} = Ref(ne.LinkId(0))
+
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
+    # The trainmatchers as a source list, which is what Parameter{KaraboDevice}
+    # (i.e. an input's trainmatcher) is completed against.
+    trainmatcher_sources::Vector{SourceInfo} = SourceInfo[]
     whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
     trainmatchers_request_status::RequestStatus = RequestStatus_Idle
     routing_rules::Vector{RoutingRule} = RoutingRule[]
@@ -313,24 +760,29 @@ end
     remap_rules::Vector{RemapRule} = RemapRule[]
     # Per-row source-autocomplete state for the rules table, keyed by row index.
     routing_rule_source_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
-    karabo_devices::Dict{String, Dict{String, Any}} = Dict()
-    devices_request::Maybe{Int} = nothing
-    # Pre-sorted for display: [(topic, [(device_name, sorted_info_pairs), ...]), ...]
-    device_tree::Vector{Tuple{String, Vector{Tuple{String, Vector{Pair{String, Any}}}}}} = []
-    # Flat list of sources for autocompletion. Sources include both devices and
-    # their pipeline outputs (e.g. "foo" and "foo:output"). The ambiguous flag
-    # indicates that the source name appears in more than one topic.
+    # The sources reported by the inputs of the loaded context, sorted by name
+    # and flattened across the inputs. This is the only source list the GUI
+    # completes Karabo dependencies against.
     source_list::Vector{SourceInfo} = SourceInfo[]
     # source_list grouped by topic. Rebuilt alongside source_list so the routing
     # rules table can look up its per-topic source list without rescanning.
     sources_by_topic::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
+    sources_by_input::Dict{String, Vector{SourceInfo}} = Dict{String, Vector{SourceInfo}}()
 
     # Parameter widget states, keyed by parameter name
     parameter_states::Dict{String, AbstractParameterState} = Dict{String, AbstractParameterState}()
     # KaraboDepText widget state, keyed by dependency ID (used for Parameter{KaraboDevice})
-    karabo_dep_states::Dict{Int, KaraboDepTextState} = Dict{Int, KaraboDepTextState}()
+    karabo_dep_states::Dict{UInt, KaraboDepTextState} = Dict{UInt, KaraboDepTextState}()
     # DepText widget state, keyed by dependency ID
-    dep_text_states::Dict{Int, DepTextState} = Dict{Int, DepTextState}()
+    dep_text_states::Dict{UInt, DepTextState} = Dict{UInt, DepTextState}()
+    dep_kind_popup::Maybe{Tuple{String, DepTextState}} = nothing
+    dep_kind_popup_trigger::Bool = false
+    # The KaraboDepText editor window currently open, or nothing. Drawn once at
+    # the top level of the frame; the inline widgets set this to request it.
+    karabo_editor::Maybe{KaraboDepTextState} = nothing
+    # CopyableCombo dropdown deferred out of the node canvas. Only one is open at a time.
+    combo_popup::CopyableComboPopup = CopyableComboPopup()
+    completion_popup::CompletionPopup = CompletionPopup()
     # Variable names available for autocompletion (including subvariable outputs)
     variable_names::Vector{String} = String[]
     source_properties::Dict{Tuple{String, String}, DeviceProperties} = Dict{Tuple{String, String}, DeviceProperties}()
@@ -340,11 +792,11 @@ end
     variable_data::Dict{String, VariableStore} = Dict()
     variable_gui_states::Dict{String, Any} = Dict()
     plot_counter::Int = 0
-    plots::Vector{Union{Plot, CorrelationPlot}} = Union{Plot, CorrelationPlot}[]
+    plots::Vector{Plot} = Plot[]
 
     # Variable subscriptions, keyed by fully-qualified name. Entries are
     # removed when the open-plot count drops to zero. The keys (and each
-    # entry's precision) get sent to the engine via SetVariableSubscriptions.
+    # entry's zfp accuracy k) get sent to the engine via SetVariableSubscriptions.
     subscriptions::Dict{String, SubscriptionState} = Dict{String, SubscriptionState}()
 
     # One zfp workspace per qualified variable name, reused across trains so
@@ -369,6 +821,8 @@ end
     # widget that initiated the edit, applied (write file, no reload) on the
     # matching ParameterChanged echo, dropped on error.
     pending_source_edit::Maybe{String} = nothing
+
+    callback_requests::Dict{String, Int} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end
@@ -428,8 +882,21 @@ function Base.close(client::ClientState)
     empty!(client.variable_data)
 end
 
+# A baked soft drop-shadow texture plus the 9-slice geometry to draw it around a
+# window. Built lazily (needs a live GL context); see build_window_shadow!.
+struct WindowShadow
+    tex::GLuint
+    size::Int
+    cell::Int
+    margin::Float32
+    corner::Float32
+end
+
 @kwdef mutable struct GuiState
     disable_rendering::Bool = false
+
+    # Baked drop-shadow for the Karabo source editor, built on first use.
+    window_shadow::Maybe{WindowShadow} = nothing
 
     # Showing external tool windows
     show_imgui_demo::Bool = false

@@ -1,28 +1,33 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetDevices, GetTrainmatchers, LoadContext, ReviseCode,
+    GetTrainmatchers, GetInputSources, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
-    GetEngineDir, EngineDir,
+    GetPackageDirs, PackageDirs,
+    GetVariables, AvailableVariables,
     GetRoutingRules, SetRoutingRules, RoutingRules,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
-    ChangeParameter, Start, Stop,
+    ChangeParameter, InvokeCallback, Start, Stop,
     SetDebugMode, SetRemoteRepl,
     Pong, AvailableTrainmatchers,
-    Started, Stopped, Devices,
-    ContextInfo, ParameterChanged, TrainData, RemoteReplState,
+    Started, Stopped, InputSources,
+    ContextInfo, ParameterChanged, DisplayableChanged, TrainData, RemoteReplState,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
 
 import HTTP: WebSockets
 
-import ..Context
-using ..Context: XfaContext, VariableData, Parameter
+import XfaContext
+using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec
 using ..XfaEngine: RoutingRule, RemapRule
 
+
+# Max websocket frame size for client-engine traffic. The HTTP.jl default of
+# 16 MiB is too small so we effectively disable the limit.
+const MAX_FRAME_SIZE = typemax(Int)
 
 abstract type AbstractMessage end
 
@@ -38,11 +43,6 @@ ExceptionMessage(ex::Exception) = ExceptionMessage(sprint(showerror, ex))
 # Messages that a client can send
 struct Ping <: AbstractMessage end
 struct Shutdown <: AbstractMessage end
-
-struct GetDevices <: AbstractMessage
-    topic::Union{String, Nothing}
-end
-GetDevices() = GetDevices(nothing)
 
 struct GetDeviceSchema <: AbstractMessage
     topic::String
@@ -65,6 +65,10 @@ struct ChangeParameter <: AbstractMessage
     parameter::Parameter
 end
 
+struct InvokeCallback <: AbstractMessage
+    name::String
+end
+
 struct GetRoutingRules <: AbstractMessage end
 
 struct GetRemapRules <: AbstractMessage end
@@ -76,10 +80,11 @@ end
 # Tells the engine which array-valued variables this client wants forwarded.
 # Scalar variables are always sent; everything else is suppressed unless its
 # fully-qualified name (e.g. "var", "var.subvar") is a key in this dict.
-# The value is the requested zfp precision for the compressed payload; -1
-# means "use the engine default".
+# The value is the noise multiplier k for fixed-accuracy compression
+# (tol = k * per-frame noise sigma); 0 means lossless and -1 means "use the
+# engine default".
 struct SetVariableSubscriptions <: AbstractMessage
-    variables::Dict{String, Int}
+    variables::Dict{String, Float64}
 end
 
 struct Start <: AbstractMessage end
@@ -95,7 +100,11 @@ end
 
 struct GetTrainmatchers <: AbstractMessage end
 
-struct GetEngineDir <: AbstractMessage end
+struct GetInputSources <: AbstractMessage end
+
+struct GetPackageDirs <: AbstractMessage end
+
+struct GetVariables <: AbstractMessage end
 
 # Messages that the server can send
 struct Pong <: AbstractMessage end
@@ -112,21 +121,27 @@ struct RemapRules <: AbstractMessage
     rules::Vector{RemapRule}
 end
 
-struct EngineDir <: AbstractMessage
-    path::String
+struct PackageDirs <: AbstractMessage
+    engine::String
+    context::String
+end
+
+struct AvailableVariables <: AbstractMessage
+    variables::Union{Vector{VariableSpec}, ExceptionMessage}
 end
 
 struct Started <: AbstractMessage end
 struct Stopped <: AbstractMessage end
 
-struct Devices <: AbstractMessage
-    device_names::Union{Dict{String, Dict{String, Any}}, ExceptionMessage}
+# The sources reported by each input of the loaded context, keyed by input name.
+struct InputSources <: AbstractMessage
+    input_sources::Union{Dict{String, Vector{SourceInfo}}, ExceptionMessage}
 end
 
 struct DeviceSchema <: AbstractMessage
     topic::String
     name::String
-    schema::Dict{String, Dict}
+    schema::Union{Dict{String, Dict}, ExceptionMessage}
 end
 
 struct DeviceProperty <: AbstractMessage
@@ -142,10 +157,14 @@ struct ContextInfo <: AbstractMessage
     source::String
 end
 
-ContextInfo(ctx::XfaContext, source::String) = ContextInfo(Context.to_dict(ctx), ctx.is_running[], source)
+ContextInfo(ctx::ContextState, source::String) = ContextInfo(XfaContext.to_dict(ctx), ctx.is_running[], source)
 
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter
+end
+
+struct DisplayableChanged <: AbstractMessage
+    displayable::Displayable
 end
 
 struct TrainData <: AbstractMessage
@@ -163,7 +182,7 @@ end
 # the downstream variable name. `input_rates` is the smoothed Hz at which
 # each input is pushing data, keyed by input name.
 struct PipelineStats <: AbstractMessage
-    channel_stats::Dict{Tuple{String, String}, Context.ChannelStat}
+    channel_stats::Dict{Tuple{String, String}, XfaContext.ChannelStat}
     input_rates::Dict{String, Float64}
 end
 

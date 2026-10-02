@@ -1,5 +1,5 @@
 import HTTP
-import JSON3
+import JSON
 
 # @sum_type WebProxyClientStatus :hidden begin
 #     UNCONNECTED
@@ -79,11 +79,11 @@ end
 # node.
 function strip_metadata!(x)
     for key in keys(x)
-        if x[key] isa Dict && keys(x[key]) == Set(["value", "timestamp", "tid"])
+        if x[key] isa AbstractDict && keys(x[key]) == Set(["value", "timestamp", "tid"])
             x[key] = x[key]["value"]
         end
 
-        if x[key] isa Dict || x[key] isa Vector
+        if x[key] isa AbstractDict || x[key] isa Vector
             strip_metadata!(x[key])
         end
     end
@@ -91,16 +91,16 @@ end
 
 function get_json(wp, path; timeout=5)
     res = HTTP.get(wp.address * path;
-                   connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+                   connect_timeout=timeout, read_idle_timeout=timeout)
+    return JSON.parse(res.body, Dict{String, Any})
 end
 
 function put_json(wp, path, body; timeout=5)
     res = HTTP.put(wp.address * path,
                    ["Content-Type" => "application/json"],
-                   JSON3.write(body);
-                   connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+                   JSON.json(body);
+                   connect_timeout=timeout, read_idle_timeout=timeout)
+    return JSON.parse(res.body, Dict{String, Any})
 end
 
 function get_topology(wp; timeout=5, max_age=10)
@@ -121,15 +121,6 @@ function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     devices = wp.devices_cache.value
     if !isnothing(classId)
         devices = filter(p -> p.second["classId"] == classId, devices)
-    end
-
-    return devices
-end
-
-function get_all_devices(webproxies; classId=nothing)
-    devices = Dict{String, Dict{String, Any}}()
-    for (topic, wp) in webproxies
-        devices[topic] = get_devices(wp; classId)
     end
 
     return devices
@@ -184,11 +175,34 @@ function get_schema(device::KaraboDevice; timeout=5)
     return get_json(wp, "/devices/$(device.name)/schema.json"; timeout)
 end
 
+# Call a device slot and return its reply Hash as a Dict (or nothing for
+# slots that don't take arguments, which reply with null).
 function call_slot(wp, device, slot, params=HTTP.nobody; timeout=5)
     url = wp.address * "/devices/$(device)/slot/$(slot).json"
-    body = params isa Dict ? JSON3.write(params) : params
-    res = HTTP.put(url, nothing, body; connect_timeout=timeout, readtimeout=timeout)
-    return JSON3.read(res.body, Dict{String, Any})
+    # The webproxy rejects the arguments with a 422 unless they're explicitly
+    # marked as JSON.
+    local body, headers
+    if params isa Dict
+        body = JSON.json(params)
+        headers = ["Content-Type" => "application/json"]
+    else
+        body = params
+        headers = nothing
+    end
+    res = HTTP.put(url, headers, body; connect_timeout=timeout, read_idle_timeout=timeout,
+                   retry_non_idempotent=true, retry_bucket=false)
+    response = JSON.parse(res.body, Dict{String, Any})
+    if !response["success"]
+        error("Calling slot '$(slot)' on '$(device)' failed: $(response["reason"])")
+    end
+
+    # The device's reply Hash is nested under "reply", with each value wrapped
+    # in the same {value, timestamp, tid} format as config.json.
+    reply = response["reply"]
+    if !isnothing(reply)
+        strip_metadata!(reply)
+    end
+    return reply
 end
 
 function get_trainmatcher_address(address, device::String; index=1)

@@ -51,7 +51,7 @@ Base.string(dep::Dependency) = dep.name
 Dependency(name::String) = Dependency(kind=DepKind_Variable, name=name)
 
 # Subvariable dependency
-subvariable_dependency(parent::String, name::String) = Dependency(kind=DepKind_Subvariable, name="$parent.$name", parent=parent)
+subvariable_dependency(parent::AbstractString, name::AbstractString) = Dependency(kind=DepKind_Subvariable, name="$parent.$name", parent=parent)
 
 # Group dependency
 group_dependency(type::DataType) = Dependency(kind=DepKind_Group, name="", group_type=type)
@@ -62,23 +62,150 @@ group_dependency(name::String, type::DataType) = Dependency(kind=DepKind_Group, 
 # one of its group's Parameter fields (e.g. `@Variable foo(::MyGroup, data ->
 # MyGroup.data_param)`). At load time this is resolved to the actual dependency
 # value held by the parameter.
-group_parameter_dependency(group_type::String, parameter::String) = Dependency(kind=DepKind_GroupParameter,
-                                                                               name="$group_type.$parameter",
-                                                                               group_type_name=group_type,
-                                                                               parameter=parameter)
+function group_parameter_dependency(group_type::AbstractString, parameter::AbstractString)
+    Dependency(kind=DepKind_GroupParameter,
+               name="$group_type.$parameter",
+               group_type_name=group_type,
+               parameter=parameter)
+end
+
+@kwdef mutable struct Parameter{T}
+    name::String = ""
+    value::Union{T, Nothing} = nothing
+    set_by_user::Bool = false
+
+    update_handler::Union{Function, Nothing} = nothing
+    initializer::Union{Function, Nothing} = nothing
+    optional::Bool = false
+end
+
+@enum VariableKind VariableKind_Variable VariableKind_Group VariableKind_Input
+
+# Wire-safe description of an available @Variable/@Group/@Input for the GUI's
+# add-variable dialog (see `available_variables`). `dependencies` are the args to
+# wire (empty for groups/inputs); `group_parameters` holds the default Parameter
+# object for each Parameter-typed group field (handlers stripped for wire safety).
+struct VariableSpec
+    name::String
+    kind::VariableKind
+    origin::String                              # module-qualified ref, e.g. "XfaContext.scan"
+    dependencies::OrderedDict{String, Dependency}
+    subvariables::Vector{String}
+    postprocessors::Vector{String}
+    group_parameters::OrderedDict{Symbol, Parameter}
+end
+
+# Build a spec from a registered @Variable function.
+function VariableSpec(func::Function)
+    dependencies = OrderedDict{String, Dependency}()
+    for (arg_name, dep) in variable_dependencies(func)
+        if isnothing(arg_name) || !(dep isa Dependency)
+            continue
+        end
+        # Strip group_type: it may name a module the client hasn't loaded.
+        dependencies[arg_name] = isnothing(dep.group_type) ? dep : @set dep.group_type = nothing
+    end
+
+    VariableSpec(string(nameof(func)), VariableKind_Variable, origin_path(func),
+                 dependencies, variable_subvariables(func),
+                 [pp[1] for pp in variable_postprocessors(func)], OrderedDict{Symbol, Parameter}())
+end
+
+# Whether a @Group type backs an @Input, making it an input source not a plain group.
+function is_input_group(T::DataType)
+    for m in methods(input_dependencies)
+        F = m.sig.parameters[2]
+        if !isdefined(F, :instance)
+            continue
+        end
+        deps = input_dependencies(F.instance)
+        if !isempty(deps) && deps[1][2] isa Dependency && deps[1][2].group_type === T
+            return true
+        end
+    end
+    return false
+end
+
+# Build a spec from a registered @Group type, deriving its kind (Group/Input).
+function VariableSpec(T::DataType)
+    kind = is_input_group(T) ? VariableKind_Input : VariableKind_Group
+    # Strip the update handlers/initializers so the spec stays wire-safe (they
+    # may be closures or functions the client doesn't have). The defaults are
+    # freshly built each call, so mutating them is safe.
+    params = group_default_parameters(T)
+    for p in values(params)
+        p.update_handler = nothing
+        p.initializer = nothing
+    end
+    VariableSpec(string(nameof(T)), kind, origin_path(T),
+                 OrderedDict{String, Dependency}(), String[], String[], params)
+end
 
 abstract type AbstractPostprocessor end
 function default_name end
+
+# Region-of-interest Parameter value types. The GUI overlays an ROI-valued
+# Parameter on its variable's plot when the variable declares it via
+# `@display`. Zero-initialized ROIs are treated as unassigned by the GUI, which
+# seeds a default extent from the data being plotted.
+abstract type AbstractROI end
+
+struct RectROI <: AbstractROI
+    corner_x::Float64
+    corner_y::Float64
+    width::Float64
+    height::Float64
+end
+
+RectROI() = RectROI(0.0, 0.0, 0.0, 0.0)
+
+Base.isassigned(roi::RectROI) = !(roi.corner_x == 0 && roi.corner_y == 0 && roi.width == 0 && roi.height == 0)
+
+# A range along one plot axis spanning the full extent of the other. On images
+# `:x` selects a column range (drawn as a vertical band) and `:y` a row range
+# (a horizontal band); on vectors the range is applied directly.
+struct LinearROI <: AbstractROI
+    start::Float64
+    length::Float64
+    axis::Symbol
+end
+
+function LinearROI(start=0.0, length=0.0; axis=:x)
+    if axis != :x && axis != :y
+        throw(ArgumentError("LinearROI axis must be :x or :y, got :$(axis)"))
+    end
+    LinearROI(start, length, axis)
+end
+
+Base.isassigned(roi::LinearROI) = !(roi.start == 0 && roi.length == 0)
+
+# Clamp the index range [start, start + length] onto the axis `r`.
+function roi_range(start, length, r)
+    lo = clamp(round(Int, start), r)
+    hi = clamp(lo + round(Int, length), r)
+    lo:hi
+end
+
+# Slice the first two dimensions with the ROI and keep all remaining dimensions
+# in full (e.g. a 3D stack yields a stack of cropped images).
+function (r::RectROI)(image::AbstractArray)
+    x_range = roi_range(r.corner_x, r.width, axes(image, 2))
+    y_range = roi_range(r.corner_y, r.height, axes(image, 1))
+    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
+    @view image[y_range, x_range, trailing...]
+end
+
+function (r::LinearROI)(image::AbstractArray)
+    trailing = ntuple(_ -> Colon(), ndims(image) - 2)
+    @view image[roi_range(r.start, r.length, axes(image, 1)), :, trailing...]
+end
+
+(r::LinearROI)(v::AbstractVector) = @view v[roi_range(r.start, r.length, axes(v, 1))]
 
 struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
 end
 OptionalDims() = OptionalDims(Int[])
-
-struct FunctionArgument
-    name::String
-    type::Union{Nothing, Type}
-end
 
 const slow_data_re = r"^(\S+?)\.([\w|\.]+)$"
 const fast_data_re = r"^(\S+):(\S+)\[(\S+)\]$"
@@ -167,9 +294,13 @@ function _parse_function_args(args; is_input=false)
                         value = MacroTools.unblock(value)
 
                         if @capture(value, head_.tail_)
-                            if !isnothing(group_type_name) && "$head" == group_type_name
-                                # Group parameter reference: e.g. MyGroup.data_param
-                                value = :(Context.group_parameter_dependency($("$head"), $("$tail")))
+                            value_str = "$value"
+                            if !isnothing(group_type_name) && startswith(value_str, "$(group_type_name).")
+                                # Reference to a member of the surrounding group's type:
+                                # a Parameter field, another @Variable, or a subvariable
+                                # of one. Resolved at group instantiation time.
+                                path = chopprefix(value_str, "$(group_type_name).")
+                                value = :(Context.group_parameter_dependency($("$group_type_name"), $path))
                             else
                                 # Subvariable reference: e.g. var.subvar
                                 value = :(Context.subvariable_dependency($("$head"), $("$tail")))
@@ -190,17 +321,17 @@ function _parse_function_args(args; is_input=false)
                         return arg_name
 
                     elseif @capture(arg_expr, (::T_) | (arg_name_::T_))
-                        arg_name_expr = isnothing(arg_name) ? :(nothing) : :($("$arg_name"))
-
                         if !is_input || (is_input && i == 1 && length(args) == 2)
                             # If the first argument has a type and no explicit
                             # dependency, then we assume it belongs to a group.
+                            # A @Variable's typed args always land here.
+                            arg_name_expr = isnothing(arg_name) ? :(nothing) : :($("$arg_name"))
                             group_type_name = "$T"
                             push!(dependencies, :(($arg_name_expr, Context.group_dependency($T))))
-                        else
-                            # Otherwise it's just a regular function argument
-                            push!(dependencies, :(($arg_name_expr, Context.FunctionArgument($arg_name_expr, $T))))
                         end
+                        # Otherwise (only reachable for an @Input) it's a plain
+                        # positional argument such as the output channel, supplied
+                        # at call time and not tracked as a dependency.
 
                         return arg_expr
                     else
@@ -269,6 +400,10 @@ function _variable_reference(new_name, ref_expr, side_effects)
         Context.variable_postprocessors(::typeof($new_name)) = [(replace(pp[1], $orig_name_str => $new_name_str, count=1), pp[2])
                                                                 for pp in Context.variable_postprocessors($orig_func_expr)]
     end
+    displays_code = quote
+        Context.variable_displays(::typeof($new_name)) = [replace(target, $orig_name_str => $new_name_str; count=1) => param
+                                                          for (target, param) in Context.variable_displays($orig_func_expr)]
+    end
 
     return esc(quote
         function $new_name(args...)
@@ -280,6 +415,7 @@ function _variable_reference(new_name, ref_expr, side_effects)
             $deps_code
             $subvars_code
             $postprocessors_code
+            $displays_code
         end
     end)
 end
@@ -323,13 +459,28 @@ function _variable(ctx_module, expr, side_effects)
         # Extract dependency information
         dependencies, new_args = _parse_function_args(args)
 
-        # Look through the body for @add_subvariable and @postprocess
-        # calls to register them. Only toplevel calls are allowed. Note that
-        # we capture the macro name and check it explicitly because MacroTools
-        # doesn't handle the underscore in the name properly.
+        # Identify the first typed arg, which (per _parse_function_args) is
+        # treated as a group binding. Its name lets @display g.field resolve
+        # to the right group type.
+        group_arg_name = nothing
+        group_type_name = nothing
+        for arg in args
+            if @capture(arg, (::T_) | (arg_name_::T_))
+                group_arg_name = isnothing(arg_name) ? nothing : string(arg_name)
+                group_type_name = string(T)
+                break
+            end
+        end
+
+        # Look through the body for @add_subvariable, @postprocess, and
+        # @display calls to register them. Only toplevel calls are allowed.
+        # Note that we capture the macro name and check it explicitly because
+        # MacroTools doesn't handle the underscore in the name properly.
         subvariables = String[]
         postprocessors = []  # (name_expr, pp_expr) tuples
         postprocessor_indices = Int[]
+        displays = Pair{String, String}[]  # plot target => fully-qualified parameter name
+        display_indices = Int[]
         for (i, body_expr) in enumerate(body.args)
             if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
@@ -340,6 +491,34 @@ function _variable(ctx_module, expr, side_effects)
             elseif @capture(body_expr, @macroname_(pp_expr_)) && macroname == Symbol("@postprocess")
                 push!(postprocessors, (nothing, pp_expr))
                 push!(postprocessor_indices, i)
+            elseif @capture(body_expr, @macroname_(disp_args__)) && macroname == Symbol("@display")
+                push!(display_indices, i)
+                if length(disp_args) == 1
+                    targets = ["$(func_name)"]
+                    disp_expr = disp_args[1]
+                elseif length(disp_args) == 2 && disp_args[1] isa String
+                    targets = ["$(func_name).$(disp_args[1])"]
+                    disp_expr = disp_args[2]
+                elseif length(disp_args) == 2 && @capture(disp_args[1], (subvar_names__,)) && all(n -> n isa String, subvar_names)
+                    targets = ["$(func_name).$(n)" for n in subvar_names]
+                    disp_expr = disp_args[2]
+                else
+                    throw(ArgumentError("@display takes an optional subvariable name (or tuple of names) and a parameter, got: $(join(disp_args, ' '))"))
+                end
+
+                param_ref = if @capture(disp_expr, head_.tail_)
+                    if isnothing(group_arg_name) || string(head) != group_arg_name
+                        throw(ArgumentError("@display: '$(head)' is not the group argument of this @Variable"))
+                    end
+                    "$(group_type_name).$(tail)"
+                elseif disp_expr isa Symbol
+                    string(disp_expr)
+                else
+                    throw(ArgumentError("@display takes a parameter name or group.field, got: $(disp_expr)"))
+                end
+                for target in targets
+                    push!(displays, target => param_ref)
+                end
             end
         end
 
@@ -353,8 +532,8 @@ function _variable(ctx_module, expr, side_effects)
             body_expr
         end
 
-        # Strip @postprocess calls from the body (they're metadata, not runtime code)
-        deleteat!(body.args, postprocessor_indices)
+        # Strip @postprocess and @display calls from the body (they're metadata, not runtime code)
+        deleteat!(body.args, sort!(vcat(postprocessor_indices, display_indices)))
 
         # Build the postprocessors expression. Each entry evaluates the
         # constructor once, then resolves the name — either from the
@@ -371,6 +550,7 @@ function _variable(ctx_module, expr, side_effects)
         # get interpolated/evaluated properly.
         dependencies_expr = Expr(:vect, dependencies...)
         subvariables_expr = Expr(:vect, subvariables...)
+        displays_expr = Expr(:ref, :(Pair{String, String}), [:($target => $param) for (target, param) in displays]...)
         new_function = quote
             function $func_name($(new_args...))
                 $body
@@ -380,6 +560,7 @@ function _variable(ctx_module, expr, side_effects)
                 Context.variable_dependencies(::typeof($func_name)) = $dependencies_expr
                 Context.variable_subvariables(::typeof($func_name)) = $subvariables_expr
                 Context.variable_postprocessors(::typeof($func_name)) = $postprocessors_expr
+                Context.variable_displays(::typeof($func_name)) = $displays_expr
             end
         end
 
@@ -411,8 +592,57 @@ macro add_subvariable(name, value)
     end)
 end
 
+"""
+    @get_scratch(name, ex; key=nothing)
+
+Return the object cached under `name` in `Meta.scratch[]`, evaluating `ex` to
+create it if it doesn't exist or if `key` has changed since it was created.
+Names are namespaced by `Meta.name[]` so a variable's postprocessors can't
+collide with it.
+"""
+macro get_scratch(args...)
+    positional = []
+    kwargs = []
+    for arg in args
+        if Base.Meta.isexpr(arg, :parameters)
+            append!(kwargs, arg.args)
+        elseif Base.Meta.isexpr(arg, :(=))
+            push!(kwargs, arg)
+        else
+            push!(positional, arg)
+        end
+    end
+
+    if length(positional) != 2
+        throw(ArgumentError("@get_scratch expects a name and an expression, got: $(args)"))
+    end
+    name, ex = positional
+
+    key = nothing
+    for kw in kwargs
+        if Base.Meta.isexpr(kw, (:kw, :(=))) && kw.args[1] == :key
+            key = kw.args[2]
+        else
+            throw(ArgumentError("@get_scratch only supports a `key` keyword argument, got: $(kw)"))
+        end
+    end
+
+    quote
+        let s = $Meta.scratch[], name = string($Meta.name[], '/', $(esc(name))), k = $(esc(key))
+            if !haskey(s, name) || !isequal(first(s[name]), k)
+                s[name] = (k, $(esc(ex)))
+            end
+            last(s[name])
+        end
+    end
+end
+
 macro postprocess(args...)
     error("The @postprocess macro may only be used inside of a @Variable block.")
+end
+
+macro display(args...)
+    error("The @display macro may only be used inside of a @Variable block.")
 end
 
 """
@@ -422,21 +652,12 @@ macro Variable(expr)
     _variable(__module__, expr, true)
 end
 
-@kwdef mutable struct Parameter{T}
-    name::String
-    value::Union{T, Nothing}
-    set_by_user::Bool = false
-
-    update_handler::Union{Function, Nothing} = nothing
-    initializer::Union{Function, Nothing} = nothing
-end
-
 function Base.:(==)(one::Parameter{T}, two::Parameter{T}) where T
     one.name == two.name && one.value == two.value && one.set_by_user == two.set_by_user
 end
 
-Parameter(name::String, value) = Parameter(; name, value)
-Parameter(value) = Parameter(; name="", value)
+Parameter(name::String, value; optional=false) = Parameter(; name, value, optional)
+Parameter(value; optional=false) = Parameter(; name="", value, optional)
 
 # Used by @Group to allow passing raw values for Parameter fields
 _wrap_param(val::Parameter) = val
@@ -444,14 +665,15 @@ _wrap_param(val) = Parameter(val)
 # Merge a raw value into a default Parameter, preserving handlers
 _wrap_param(val::Parameter, ::Parameter) = val
 _wrap_param(val, default::Parameter) = Parameter(default.name, val, default.set_by_user,
-                                                  default.update_handler, default.initializer)
+                                                  default.update_handler, default.initializer,
+                                                  default.optional)
 
-function Parameter(f::Base.Callable, value)
+function Parameter(f::Base.Callable, value; optional=false)
     if !isnothing(f) && !any(m -> m.nargs in (2, 3), methods(f))
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
-    Parameter("", value, false, f, f)
+    Parameter("", value, false, f, f, optional)
 end
 
 function tryset(param::Parameter, value; force=false)
@@ -460,7 +682,11 @@ function tryset(param::Parameter, value; force=false)
     end
 
     if !param.set_by_user
-        remote_do(set_parameter, 1, param.name, value, Meta.name[])
+        param.value = value
+        requestor = Base.ScopedValues.get(Meta.name)
+        if !isnothing(requestor)
+            remote_do(set_parameter, 1, param.name, value, something(requestor))
+        end
         return true
     else
         return false
@@ -470,8 +696,64 @@ end
 Base.getindex(param::Parameter) = param.value
 Base.setindex!(param::Parameter, value) = param.value = value
 
+Base.isassigned(param::Parameter) = !isnothing(param.value)
+
+# A group field that the pipeline updates and clients display, but that isn't
+# user-editable or saved in the context file. `d[] = value` forwards the new
+# value to proc 1 and from there to the clients.
+@kwdef mutable struct Displayable{T}
+    name::String = ""
+    value::T
+end
+
+Displayable(value) = Displayable(; value)
+
+function Base.:(==)(one::Displayable{T}, two::Displayable{T}) where T
+    one.name == two.name && one.value == two.value
+end
+
+Base.getindex(d::Displayable) = d.value
+
+function Base.setindex!(d::Displayable, value)
+    d.value = value
+    if !isempty(d.name)
+        if myid() == 1
+            set_displayable(d)
+        else
+            remote_do(set_displayable, 1, d)
+        end
+    end
+end
+
+# A group field drawn as a button in the GUI. Clicking it calls `f(group)` on
+# proc 1 with the pipeline paused, like a parameter update handler.
+struct Callback
+    title::String
+    f::Function
+end
+
+# Runs on proc 1 in response to a worker's `tryset`. Mirrors the new value
+# into the coordinator's parameter dict and notifies the context's
+# `on_parameter_changed` hook so the engine can broadcast it to clients.
 function set_parameter(name::String, value, requestor::String)
     @info "Setting parameter '$(name)' to $(value) as requested by '$(requestor)'"
+
+    if haskey(worker_state.parameters, name)
+        pause_pipeline() do
+            worker_state.parameters[name].value = value
+        end
+    end
+
+    current_ctx.on_parameter_changed(name, value)
+end
+
+# Runs on proc 1 when a Displayable is set, mirroring `set_parameter`.
+function set_displayable(d::Displayable)
+    if haskey(current_ctx.displayables, d.name)
+        current_ctx.displayables[d.name].value = d.value
+    end
+
+    current_ctx.on_displayable_changed(d)
 end
 
 function _input(ctx_module, expr, side_effects)
@@ -572,7 +854,19 @@ function _kwdef_group(name, struct_expr, fields)
         end)
     end
 
-    return struct_def, ctor
+    # Default Parameter objects for the Parameter-typed fields, keyed by field
+    # name. Fields with a default reuse it (via _wrap_param); fields without one
+    # get an empty Parameter of the declared type. Used to build a VariableSpec.
+    param_pairs = [:($(QuoteNode(f.name)) => let p = $(isnothing(f.default) ?
+                         :($(f.typed_field.args[2])()) :
+                         :(Context._wrap_param($(f.default))))
+                         p.name = $(string(f.name))
+                         p
+                     end)
+                   for f in parsed if f.is_param]
+    param_defaults = :(Context.OrderedDict{Symbol, Context.Parameter}($(param_pairs...)))
+
+    return struct_def, ctor, param_defaults
 end
 
 function _group(ctx_module, expr, side_effects)
@@ -585,7 +879,7 @@ function _group(ctx_module, expr, side_effects)
     end
 
     if @capture(expr, struct name_ fields__ end) || @capture(expr, mutable struct name_ fields__ end)
-        struct_def, ctor = _kwdef_group(name, expr, fields)
+        struct_def, ctor, param_defaults = _kwdef_group(name, expr, fields)
 
         new_expr = quote
             $struct_def
@@ -593,6 +887,7 @@ function _group(ctx_module, expr, side_effects)
 
             if $side_effects
                 Context.group_fields(::Type{$name}) = []
+                Context.group_default_parameters(::Type{$name}) = $param_defaults
             end
 
             $name

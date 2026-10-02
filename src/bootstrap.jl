@@ -1,7 +1,7 @@
 import TOML
 using Printf: @sprintf
 
-environment = ENV["XFA_ENVIRONMENT"]
+environment = dirname(Base.active_project())
 working_dir = ENV["XFA_WORKING_DIR"]
 julia_binary = joinpath(Sys.BINDIR, "julia")
 
@@ -23,7 +23,8 @@ end
 # Launch the engine if necessary
 if !isfile(toml_path)
     import XfaEngine
-    launcher_script = joinpath(dirname(pathof(XfaEngine)), "launcher.jl")
+    engine_dir = pkgdir(XfaEngine)
+    launcher_script = joinpath(engine_dir, "src", "launcher.jl")
     mkpath(working_dir)
     nthreads = max(10, cld(Sys.CPU_THREADS, 8))
     cd(working_dir) do

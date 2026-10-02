@@ -1,20 +1,20 @@
 module XfaEngine
 
-# Capacity of the per-train variable channels (see Context.variable_channel).
-# Used as the depth of the Karabo recv buffer pool too, so a recycled buffer
-# has had a full window of trains to drain through every consumer.
-const VARIABLE_CHANNEL_SIZE = 100
+# The pipeline core. `Context` is kept as a back-compat alias for the module so
+# existing `Context.foo` references (here and in macro-generated code) resolve.
+using XfaContext
+using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter, Displayable
+const Context = XfaContext
 
 include("zfp_workspace.jl")
 include("karabo_bridge.jl")
-include("context.jl")
 
 import TOML
 import Glob
 include("settings.jl")
 include("protocol.jl")
 
-using .Context: KaraboDevice
+using .KaraboBridge: KaraboBridgeClient, BufferPool
 include("webproxy.jl")
 
 import TOML
@@ -31,7 +31,11 @@ using DimensionalData: DimArray
 
 using .Protocol
 using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
-import .Context: XfaContext, VariableData, ArrayMetadata
+using Accessors: @set
+
+# The KaraboInput @Group/@Input lives here (not in Context) because it depends
+# on the engine's webproxy/device discovery and the ZMQ KaraboBridge transport.
+include("karabo_input.jl")
 
 
 """Find the closest available port to `port_hint`."""
@@ -66,9 +70,9 @@ end
     # heartbeat_task::Task
 
     # Fully-qualified names of array-valued variables this client wants
-    # forwarded, mapped to the requested zfp precision (-1 for default).
+    # forwarded, mapped to the noise multiplier k (0 lossless, -1 for default).
     # Updated via `SetVariableSubscriptions`.
-    subscriptions::Dict{String, Int} = Dict{String, Int}()
+    subscriptions::Dict{String, Float64} = Dict{String, Float64}()
 end
 
 @kwdef mutable struct EngineState
@@ -84,10 +88,13 @@ end
     remoterepl_server::TCPServer = TCPServer()
     remoterepl_task::Union{Task, Nothing} = nothing
 
-    ctx::XfaContext = XfaContext()
+    ctx::ContextState = ContextState()
+    # Keeps the pipeline running across rewires, see start_pipeline(::EngineState).
+    pipeline_task::Union{Task, Nothing} = nothing
+    stop_requested::Bool = false
 
     # One zfp workspace per qualified variable name. Sized to the variable's
-    # data on first use and reused across trains; switching precision on the
+    # data on first use and reused across trains; switching k on the
     # same variable just runs zfp again over the same buffers.
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
@@ -103,66 +110,60 @@ current_engine_state::Union{EngineState, Nothing} = nothing
 # forwarded; multi-element arrays must be opted into via subscription.
 is_scalar_data(x) = !(x isa AbstractArray) || ndims(x) == 0
 
-# Sentinel precision used to cache the metadata-only view of a non-subscribed
-# array payload. Real precisions are >= 0 (and -1 maps to the per-eltype
-# default inside compress_array), so this never collides with a real client request.
-const METADATA_PRECISION = typemin(Int)
+# Sentinel k used to cache the metadata-only view of a non-subscribed array
+# payload. Real k values are finite (>= -1), so -Inf never collides with a real
+# client request while still comparing equal for cache hits.
+const METADATA_K = -Inf
 
 # Build (or fetch from `cache`) the per-client view of a single (sub)variable:
 # scalars pass through, non-subscribed arrays become ArrayMetadata, subscribed
-# compressible arrays become a CompressedArray at the requested precision, and
+# compressible arrays become a CompressedArray at the requested k, and
 # subscribed non-compressible arrays pass through raw. The cache stores at most
-# one (precision, VariableData) per qualified name; if a client asks for a
-# different precision than the cached one we just recompress and overwrite.
+# one (k, VariableData) per qualified name; if a client asks for a different k
+# than the cached one we just recompress and overwrite.
 function client_view_for(state::EngineState, variable::VariableData, qualified::String,
-                         subscriptions::Dict{String, Int},
-                         cache::Dict{String, Tuple{Int, VariableData}})
-    data = variable.data
+                         subscriptions::Dict{String, Float64},
+                         cache::Dict{String, Tuple{Float64, VariableData}})
+    data = @invokelatest Context.unwrap_python(variable.data)
     requested = get(subscriptions, qualified, nothing)
 
-    precision = if is_scalar_data(data)
+    k = if is_scalar_data(data)
         nothing
     elseif isnothing(requested)
-        METADATA_PRECISION
+        METADATA_K
     elseif should_compress(data)
-        Int(requested)
+        # Compress losslessly (k=0) when the variable opted out of lossy
+        # compression. A client that needs exact data (e.g. to plot a matrix
+        # as lines) requests k=0 itself.
+        variable.compress ? requested : 0.0
     else
         nothing
     end
 
-    if !isnothing(precision)
+    if !isnothing(k)
         hit = get(cache, qualified, nothing)
-        if !isnothing(hit) && hit[1] == precision
+        if !isnothing(hit) && hit[1] == k
             return hit[2]
         end
     end
 
-    new_data = if precision == METADATA_PRECISION
+    new_data = if k == METADATA_K
         ArrayMetadata(eltype(data), collect(size(data)))
-    elseif !isnothing(precision)
+    elseif !isnothing(k)
         ws = get!(() -> ZfpWorkspace(), state.zfp_workspaces, qualified)
-        compress_array(ws, data; precision)
+        compress_array(ws, data; k)
     else
         data
     end
 
-    view = if precision == METADATA_PRECISION
-        # Strip down to identity + shape; keep update_rate / subvariables but
-        # drop labels, axes etc. since the client only renders metadata.
-        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
-                     subvariables=variable.subvariables, update_rate=variable.update_rate)
-    elseif new_data === data
+    view = if new_data === variable.data
         variable
     else
-        VariableData(; tid=variable.tid, name=variable.name, data=new_data,
-                     subvariables=variable.subvariables,
-                     title=variable.title, x_axis=variable.x_axis, y_axis=variable.y_axis,
-                     xlabel=variable.xlabel, ylabel=variable.ylabel, unit=variable.unit,
-                     fixed_aspect=variable.fixed_aspect, update_rate=variable.update_rate)
+        @set variable.data = new_data
     end
 
-    if !isnothing(precision)
-        cache[qualified] = (precision, view)
+    if !isnothing(k)
+        cache[qualified] = (k, view)
     end
     return view
 end
@@ -171,8 +172,8 @@ end
 # from the shared cache. Falls through to the parent's existing subvariables
 # dict when nothing actually changed for any subvar (avoids an allocation).
 function build_client_view!(state::EngineState, variable::VariableData,
-                            subscriptions::Dict{String, Int},
-                            cache::Dict{String, Tuple{Int, VariableData}})
+                            subscriptions::Dict{String, Float64},
+                            cache::Dict{String, Tuple{Float64, VariableData}})
     parent_view = client_view_for(state, variable, variable.name, subscriptions, cache)
 
     if isempty(variable.subvariables)
@@ -191,26 +192,125 @@ function build_client_view!(state::EngineState, variable::VariableData,
         return variable
     end
 
-    return VariableData(; tid=parent_view.tid, name=parent_view.name, data=parent_view.data,
-                        subvariables=new_subvars,
-                        title=parent_view.title, x_axis=parent_view.x_axis,
-                        y_axis=parent_view.y_axis, xlabel=parent_view.xlabel,
-                        ylabel=parent_view.ylabel, unit=parent_view.unit,
-                        fixed_aspect=parent_view.fixed_aspect, update_rate=parent_view.update_rate)
+    return @set parent_view.subvariables = new_subvars
 end
 
-function forward_output(state::EngineState, stream_output)
-    cache = Dict{String, Tuple{Int, VariableData}}()
-    for data in stream_output
-        empty!(cache)
-        for (id, client) in state.clients
+function forward_output(state::EngineState, data::VariableData, cache)
+    if isnothing(data.data)
+        return
+    end
+
+    empty!(cache)
+    # The views may alias Python-backed arrays in `data`
+    GC.@preserve data for (id, client) in state.clients
+        try
+            view = build_client_view!(state, data, client.subscriptions, cache)
+            Protocol.server_send(client.websocket, TrainData([view]))
+        catch ex
+            @warn "Couldn't forward data to client '$(id)'" exception=ex
+        end
+    end
+end
+
+# Installed as the context's on_parameter_changed hook: broadcast an
+# engine-initiated parameter change to every connected client so their GUIs
+# stay in sync. Runs on proc 1 (where set_parameter calls the hook).
+function broadcast_parameter_changed(state::EngineState, name, value)
+    param = state.ctx.parameters[name]
+    msg = Protocol.ParameterChanged(typeof(param)(; name, value))
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
+        end
+    end
+end
+
+function broadcast_displayable_changed(state::EngineState, displayable::Displayable)
+    msg = Protocol.DisplayableChanged(displayable)
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast DisplayableChanged to client '$(id)'" exception=ex
+        end
+    end
+end
+
+# Resend the context to every client, e.g. after a rewire changed its edges.
+function broadcast_context_info(state::EngineState)
+    msg = ContextInfo(state.ctx, read(state.ctx.path, String))
+    for (id, client) in state.clients
+        try
+            Protocol.server_send(client.websocket, msg)
+        catch ex
+            @warn "Failed to broadcast ContextInfo to client '$(id)'" exception=ex
+        end
+    end
+end
+
+# Start the pipeline, and the task that restarts it whenever a group rewires
+# its dependencies (see Context.wait_pipeline). Starting synchronously lets
+# callers report a failed start; the task only ever restarts.
+function start_pipeline(state::EngineState)
+    @invokelatest Context.start_pipeline(state.ctx; offline=has_offline_input(state.ctx))
+    state.stop_requested = false
+
+    state.pipeline_task = Threads.@spawn :samepool begin
+        while Context.wait_pipeline(state.ctx)
             try
-                view = build_client_view!(state, data, client.subscriptions, cache)
-                Protocol.server_send(client.websocket, TrainData([view]))
+                @invokelatest Context.start_pipeline(state.ctx; offline=has_offline_input(state.ctx))
             catch ex
-                @warn "Couldn't forward data to client '$(id)'" exception=ex
+                @error "Failed to restart the pipeline after rewiring" exception=(ex, catch_backtrace())
+                break
+            end
+            broadcast_context_info(state)
+        end
+
+        # A requested stop is acknowledged by its own handler; only a pipeline
+        # that ended on its own (e.g. an offline run finishing) is unannounced.
+        if !state.stop_requested
+            for (id, client) in state.clients
+                try
+                    Protocol.server_send(client.websocket, Stopped())
+                catch ex
+                    @warn "Failed to broadcast Stopped to client '$(id)'" exception=ex
+                end
             end
         end
+    end
+    errormonitor(state.pipeline_task)
+end
+
+function device_schema(ctx::ContextState, topic, name)
+    if has_offline_input(ctx)
+        for input_name in keys(ctx.inputs)
+            group = Context.get_input_group(ctx, input_name)
+            if group isa KaraboInput && any(s -> s.topic == topic && s.name == name, Context.get_sources(group))
+                return @invokelatest Context.data_collection_schema(data_collection(group), name)
+            end
+        end
+        error("No offline input serves $(topic)//$(name)")
+    else
+        return get_schema(KaraboDevice(topic, name))
+    end
+end
+
+function has_offline_input(ctx::ContextState)
+    return any(keys(ctx.inputs)) do input_name
+        group = Context.get_input_group(ctx, input_name)
+        group isa KaraboInput && group.offline[]
+    end
+end
+
+# Stop the pipeline through its task, so the restart loop ends with it.
+function stop_pipeline(state::EngineState)
+    if !isnothing(state.pipeline_task)
+        state.stop_requested = true
+        Context.request_stop(state.ctx)
+        wait(state.pipeline_task)
+        state.pipeline_task = nothing
     end
 end
 
@@ -223,7 +323,7 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
     while !state.stop_event.set
         sleep(period)
         # Re-read state.ctx each iteration — LoadContext swaps it for a fresh
-        # XfaContext, so capturing it outside the loop would leave us pinned
+        # ContextState, so capturing it outside the loop would leave us pinned
         # to the never-running default context.
         ctx = state.ctx
         if !ctx.is_running[] || isempty(state.clients)
@@ -272,6 +372,8 @@ function shutdown(state::EngineState, ws_server=nothing)
         close(ws_server)
     end
 
+    stop_pipeline(state)
+
     for client in values(state.clients)
         close(client.websocket)
     end
@@ -315,24 +417,31 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             end
         end
 
-    elseif msg isa GetDevices
+    elseif msg isa GetInputSources
         try
-            devices = if isnothing(msg.topic)
-                get_all_devices(state.webproxies)
-            else
-                Dict(msg.topic => get_devices(state.webproxies[msg.topic]))
+            input_sources = Dict{String, Vector{SourceInfo}}()
+            for input_name in keys(state.ctx.inputs)
+                group = Context.get_input_group(state.ctx, input_name)
+                if !isnothing(group)
+                    input_sources[input_name] = Context.get_sources(group)
+                end
             end
-            Protocol.server_send(ws, Devices(devices); reply_to)
-            @info "Responded to 'GetDevices' from $(id)"
+            Protocol.server_send(ws, InputSources(input_sources); reply_to)
+            @info "Responded to 'GetInputSources' from $(id)"
         catch ex
-            @error "Error in 'GetDevices', requested by $(id)" exception=(ex, catch_backtrace())
-            Protocol.server_send(ws, Devices(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+            @error "Error in 'GetInputSources', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, InputSources(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
 
     elseif msg isa GetDeviceSchema
-        schema = get_schema(KaraboDevice(msg.topic, msg.name))
-        Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
-        @info "Responded to 'GetDeviceSchema' from $(id)"
+        try
+            schema = Dict{String, Dict}(device_schema(state.ctx, msg.topic, msg.name))
+            Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, schema); reply_to)
+            @info "Responded to 'GetDeviceSchema' ($(msg.topic)//$(msg.name)) from $(id)"
+        catch ex
+            @error "Error in 'GetDeviceSchema', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, DeviceSchema(msg.topic, msg.name, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
 
     elseif msg isa GetDeviceProperty
         try
@@ -344,8 +453,18 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Error in 'GetDeviceProperty', requested by $(id)" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, DeviceProperty(msg.topic, msg.device, msg.property, Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
-    elseif msg isa GetEngineDir
-        Protocol.server_send(ws, EngineDir(pkgdir(XfaEngine)); reply_to)
+    elseif msg isa GetPackageDirs
+        Protocol.server_send(ws, PackageDirs(pkgdir(XfaEngine), pkgdir(Context)); reply_to)
+
+    elseif msg isa GetVariables
+        try
+            variables = Context.available_variables()
+            Protocol.server_send(ws, AvailableVariables(variables); reply_to)
+            @info "Responded to 'GetVariables' from $(id)" n=length(variables)
+        catch ex
+            @error "Error in 'GetVariables', requested by $(id)" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, AvailableVariables(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
 
     elseif msg isa GetTrainmatchers
         trainmatchers = get_all_trainmatchers(state.webproxies)
@@ -356,21 +475,34 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
 
         was_running = state.ctx.is_running[]
         if was_running
-            Context.stop_pipeline(state.ctx)
+            stop_pipeline(state)
         end
 
         new_ctx_or_ex = try
-            ctx = Context.load_from_file(path; routing_rules=state.routing_rules)
-            ctx.forwarder = Base.Fix1(forward_output, state)
+            dep_router = (topic, source) -> match_rule(state.routing_rules, topic, source)
+            prelude = [:(using XfaEngine: KaraboInput)]
+            ctx = Context.load_from_file(path; dep_router, prelude)
+            cache = Dict{String, Tuple{Float64, VariableData}}()
+            ctx.on_output = data -> forward_output(state, data, cache)
+            inputs = [Context.get_input_group(ctx, name) for name in keys(ctx.inputs)]
+
+            karabo_inputs = KaraboInput[group for group in inputs if group isa KaraboInput]
+            if length(unique(group.offline[] for group in karabo_inputs)) > 1
+                throw(Context.XfaContextException("A context cannot mix online and offline KaraboInputs"))
+            end
+
+            ctx.on_train_processed = tid -> foreach(group -> release_train(group, tid), karabo_inputs)
+            ctx.on_parameter_changed = (name, value) -> broadcast_parameter_changed(state, name, value)
+            ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
             ctx
         catch ex
             Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
-        if new_ctx_or_ex isa XfaContext
+        if new_ctx_or_ex isa ContextState
             state.ctx = new_ctx_or_ex
             if was_running
-                @invokelatest Context.start_pipeline(state.ctx)
+                start_pipeline(state)
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
@@ -405,10 +537,19 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Failed to change parameter '$(param.name)'" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
+    elseif msg isa InvokeCallback
+        try
+            Context.invoke_callback(state.ctx, msg.name)
+            @info "Invoked callback $(msg.name)"
+            Protocol.server_send(ws, Ack(); reply_to)
+        catch ex
+            @error "Callback '$(msg.name)' failed" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
     elseif msg isa Start
         @info "Starting pipeline..."
         try
-            Context.start_pipeline(state.ctx)
+            start_pipeline(state)
             Protocol.server_send(ws, Ack(); reply_to)
         catch ex
                 @error "Failed to start pipeline" exception=(ex, catch_backtrace())
@@ -417,7 +558,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         @info "Started"
     elseif msg isa Stop
         @info "Stopping pipeline..."
-        Context.stop_pipeline(state.ctx)
+        stop_pipeline(state)
         Protocol.server_send(ws, Stopped(); reply_to)
         @info "Stopped"
     elseif msg isa SetVariableSubscriptions
@@ -524,7 +665,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     state.remap_rules = load_remap_rules()
     @info "Loaded remap rules" n=length(state.remap_rules) path=engine_settings_path()
 
-    ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port) do ws
+    ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port; maxframesize=Protocol.MAX_FRAME_SIZE) do ws
         id = create_id()
         try
             # Select their identifier
@@ -582,9 +723,6 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         end
     finally
         shutdown(state, ws_server)
-        if isopen(ws_server)
-            HTTP.forceclose(ws_server)
-        end
     end
 
     if wait
