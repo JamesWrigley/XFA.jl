@@ -24,9 +24,9 @@ SourceInfo(topic, name, class_id) = SourceInfo(topic, name, class_id, false)
 function KaraboDevice(str::AbstractString)
     m = match(Context.topic_prefix_re, str)
     if !isnothing(m)
-        return KaraboDevice(m.captures[1], m.captures[2])
+        return KaraboDevice(String(m[1]), String(m[2]))
     end
-    return KaraboDevice("", str)
+    return KaraboDevice("", String(str))
 end
 
 ## Correlation group

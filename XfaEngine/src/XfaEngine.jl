@@ -733,4 +733,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     return state
 end
 
+
+precompile(Context.get_sources, (KaraboInput,))
+
 end # module XfelAnalyserEngine

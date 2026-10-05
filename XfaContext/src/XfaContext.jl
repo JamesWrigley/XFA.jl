@@ -100,6 +100,14 @@ on_properties_changed(::Any, changed) = false
 # when they are already represented by a reference wrapper.
 variable_origin(f) = f
 
+# These trait functions will be added to at runtime so they should have
+# concrete_only set, otherwise the first few new methods would invalidate
+# callers.
+for f in (variable_subvariables, variable_postprocessors, variable_displays, input_topic, input_device,
+          get_sources, monitored_properties, on_properties_changed, variable_origin)
+    typeof(f).name.concrete_only = true
+end
+
 struct Neighbour
     name::String
     channel::Union{RemoteChannel, Channel}
@@ -142,45 +150,45 @@ include("context_builtins.jl")
 end
 
 @kwdef mutable struct ContextState
-    functions::Dict{String, Any} = Dict()
-    group_types::Dict{DataType, Group} = Dict()
-    groups::Dict{String, Any} = Dict()
-    dag::Dict{String, OrderedDict} = Dict()
-    subvariables::Dict{String, Vector{String}} = Dict()
-    variable_postprocessors::Dict{String, Vector{String}} = Dict()
+    functions::Dict{String, Any} = Dict{String, Any}()
+    group_types::Dict{DataType, Group} = Dict{DataType, Group}()
+    groups::Dict{String, Any} = Dict{String, Any}()
+    dag::Dict{String, OrderedDict} = Dict{String, OrderedDict}()
+    subvariables::Dict{String, Vector{String}} = Dict{String, Vector{String}}()
+    variable_postprocessors::Dict{String, Vector{String}} = Dict{String, Vector{String}}()
     # Variable name -> list of fully-qualified parameter names to overlay
     # on the variable's plot. Populated from @display declarations.
-    displays::Dict{String, Vector{String}} = Dict()
-    postprocessors::Dict{String, AbstractPostprocessor} = Dict()
-    parameters::Dict{String, Parameter} = Dict()
-    displayables::Dict{String, Displayable} = Dict()
-    callbacks::OrderedDict{String, Callback} = OrderedDict()
+    displays::Dict{String, Vector{String}} = Dict{String, Vector{String}}()
+    postprocessors::Dict{String, AbstractPostprocessor} = Dict{String, AbstractPostprocessor}()
+    parameters::Dict{String, Parameter} = Dict{String, Parameter}()
+    displayables::Dict{String, Displayable} = Dict{String, Displayable}()
+    callbacks::OrderedDict{String, Callback} = OrderedDict{String, Callback}()
     exprs::Vector{Expr} = Expr[]
 
-    inputs::Dict{String, Any} = Dict()
+    inputs::Dict{String, Any} = Dict{String, Any}()
     prelude::Vector{Expr} = Expr[]
-    input_channels::Dict{String, Channel} = Dict()
-    input_tasks::Dict{String, Task} = Dict()
+    input_channels::Dict{String, Channel} = Dict{String, Channel}()
+    input_tasks::Dict{String, Task} = Dict{String, Task}()
     available_sources::Base.Lockable{Dict{String, Vector{SourceInfo}}, ReentrantLock} = Base.Lockable(Dict{String, Vector{SourceInfo}}())
 
-    dep_to_input::Dict{String, String} = Dict()
+    dep_to_input::Dict{String, String} = Dict{String, String}()
     # Maps (topic, source) to the input device serving it, see build_dep_routing.
     # Kept so `rewire!` can re-route with the same rules as the initial load.
     dep_router::Function = Returns(nothing)
 
-    input_variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
-    input_variables_tasks::Dict{String, Task} = Dict()
+    input_variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict{String, Dict{String, Union{RemoteChannel, Channel}}}()
+    input_variables_tasks::Dict{String, Task} = Dict{String, Task}()
 
-    external_dependency_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
-    external_dependency_tasks::Dict{String, Task} = Dict()
+    external_dependency_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict{String, Dict{String, Union{RemoteChannel, Channel}}}()
+    external_dependency_tasks::Dict{String, Task} = Dict{String, Task}()
 
-    variable_tasks::Dict{String, Task} = Dict()
-    variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict()
+    variable_tasks::Dict{String, Task} = Dict{String, Task}()
+    variable_channels::Dict{String, Dict{String, Union{RemoteChannel, Channel}}} = Dict{String, Dict{String, Union{RemoteChannel, Channel}}}()
 
     # Smoothed Hz at which inputs and external dependencies are pushing data,
     # keyed by input/dep name. Variable rates are sent piggy-backed on
     # `VariableData.update_rate` instead.
-    input_rates::Dict{String, Float64} = Dict()
+    input_rates::Dict{String, Float64} = Dict{String, Float64}()
 
     stream_output::Union{RemoteChannel, Channel, Nothing} = nothing
     on_output::Union{Function, Nothing} = nothing
@@ -208,7 +216,7 @@ end
     # dependencies cut (so its upstream is pruned unless separately requested)
     # and is driven as a root by `matched_tids`, the run's train list.
     input_feeder::Union{Function, Nothing} = nothing
-    variable_overrides::Dict{String, Any} = Dict()
+    variable_overrides::Dict{String, Any} = Dict{String, Any}()
     matched_tids::Vector{Int} = Int[]
 
     is_running::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
@@ -282,9 +290,9 @@ end
 # 2. Topic match: dep has a topic, input group's input_topic() matches
 # 3. Source match: dep's source is in the input group's get_sources() result
 # 4. Single input fallback: only one input exists
-function build_dep_routing(ctx::ContextState, dep_router=Returns(nothing))
+function build_dep_routing(ctx::ContextState, @nospecialize(dep_router=Returns(nothing)))
     dep_to_input = Dict{String, String}()
-    deps = external_dependencies(ctx)
+    deps = external_dependencies(ctx)::Vector{Dependency}
 
     if isempty(ctx.inputs) || isempty(deps)
         return dep_to_input
@@ -300,17 +308,17 @@ function build_dep_routing(ctx::ContextState, dep_router=Returns(nothing))
             continue
         end
 
-        topic = input_topic(group)
+        topic = input_topic(group)::Union{String, Nothing}
         if !isnothing(topic)
             topic_map[topic] = input_name
         end
 
-        device = input_device(group)
+        device = input_device(group)::Union{KaraboDevice, Nothing}
         if !isnothing(device)
             device_map[device] = input_name
         end
 
-        for source in get_sources(group)
+        for source in get_sources(group)::Vector{SourceInfo}
             source_map[source.name] = input_name
         end
     end
@@ -323,7 +331,7 @@ function build_dep_routing(ctx::ContextState, dep_router=Returns(nothing))
         # topic-qualified ("T//DEV") matches exactly, bare ("DEV") matches by
         # name only (first-hit wins if multiple topics share a device name).
         dep_topic = isnothing(dep.topic) ? "" : dep.topic
-        matched = dep_router(dep_topic, dep.source)
+        matched = dep_router(dep_topic, dep.source)::Union{String, Nothing}
         if !isnothing(matched)
             target = KaraboDevice(matched)
             input_name = if !isempty(target.topic)
@@ -1448,10 +1456,8 @@ function _cleanup_context_methods()
     end
 end
 
-function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), prelude=Expr[])
-    _cleanup_context_methods()
-
-    ctx_module = Module(Symbol(:UserContext, gensym()))
+# Evaluate a context file's source into `ctx_module`, returning its parsed expressions.
+function eval_context(ctx_module::Module, ctx_str::AbstractString, prelude::Vector{Expr})
     init_expr = quote
         using XfaContext.NaNStatistics
         using XfaContext.DimensionalData
@@ -1484,10 +1490,18 @@ function load_from_string(ctx_str::AbstractString; dep_router=Returns(nothing), 
         end
     end
 
+    return exprs
+end
+
+function load_from_string(ctx_str::AbstractString; @nospecialize(dep_router=Returns(nothing)), prelude=Expr[])
+    _cleanup_context_methods()
+
+    ctx_module = Module(Symbol(:UserContext, gensym()))
+    exprs = eval_context(ctx_module, ctx_str, prelude)
     @invokelatest load_from_module(ctx_module, exprs; dep_router, prelude)
 end
 
-function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Returns(nothing), prelude=Expr[])
+function load_from_module(ctx_module::Module, exprs::Vector{Expr}; @nospecialize(dep_router=Returns(nothing)), prelude=Expr[])
     parameters = Dict{String, Parameter}()
     displayables = Dict{String, Displayable}()
     callbacks = OrderedDict{String, Callback}()
@@ -1536,7 +1550,8 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     for m in methods(input_dependencies)
         F = m.sig.parameters[2]
         func = F.instance
-        ctx_inputs[func] = input_dependencies(func)
+        # Opaque to inference, so new @Input's don't invalidate this function
+        ctx_inputs[func] = @invokelatest input_dependencies(func)
     end
 
     # Associate variables with their group types
@@ -1549,7 +1564,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     end
 
     # Check if there are any parameters with the same name as a variable
-    ctx_variable_names = string.(nameof.(keys(ctx_variables)))
+    ctx_variable_names = String[string(nameof(func)::Symbol) for func in keys(ctx_variables)]
     common_var_param_names = intersect(ctx_variable_names,
                                        keys(parameters))
     if !isempty(common_var_param_names)
@@ -1560,12 +1575,12 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     # Look up all the functions that will be called
     functions = Dict{String, Any}()
     for func in keys(ctx_variables)
-        functions[string(nameof(func))] = func
+        functions[string(nameof(func)::Symbol)] = func
     end
 
     # Check for duplicate variable/input names
-    ctx_variable_names = Set(nameof.(keys(ctx_variables)))
-    ctx_input_names = Set(nameof.(keys(ctx_inputs)))
+    ctx_variable_names = Set{Symbol}(nameof(func)::Symbol for func in keys(ctx_variables))
+    ctx_input_names = Set{Symbol}(nameof(func)::Symbol for func in keys(ctx_inputs))
     if !isdisjoint(ctx_variable_names, ctx_input_names)
         throw(XfaContextException("Found Variable's and Input's with duplicate names"))
     end
@@ -1573,7 +1588,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     # Create the DAG (it's just an adjaceny list)
     dag = Dict{String, OrderedDict}()
     for (func, deps) in merge(ctx_variables, ctx_inputs)
-        name = nameof(func)
+        name = nameof(func)::Symbol
 
         # If it's a group dependency, we don't schedule it yet. That's done at
         # the end only for the instantiated group structs.
@@ -1607,7 +1622,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
             # A field and a variable of the same name would both claim
             # "$group_name.$field", and GroupType.<name> would silently mean the
             # field.
-            field = Symbol(nameof(variable_func))
+            field = nameof(variable_func)::Symbol
             if hasfield(group_type, field) && fieldtype(group_type, field) <: Union{Parameter, Displayable, Callback}
                 throw(XfaContextException("'$(field)' is both a field and a @Variable of $(nameof(group_type))"))
             end
@@ -1628,7 +1643,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 end
             end
 
-            func_name = string(nameof(variable_func))
+            func_name = string(nameof(variable_func)::Symbol)
             group_var_name = "$group_name.$func_name"
             dag[group_var_name] = dag_deps
             functions[group_var_name] = variable_func
@@ -1641,21 +1656,21 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
         # end
         for field in fieldnames(group_type)
             if fieldtype(group_type, field) <: Parameter
-                param = getproperty(object, field)
+                param = getproperty(object, field)::Parameter
                 param.name = "$(group_name).$(field)"
                 parameters[param.name] = param
             elseif fieldtype(group_type, field) <: Displayable
-                displayable = getproperty(object, field)
+                displayable = getproperty(object, field)::Displayable
                 displayable.name = "$(group_name).$(field)"
                 displayables[displayable.name] = displayable
             elseif fieldtype(group_type, field) <: Callback
-                callbacks["$(group_name).$(field)"] = getproperty(object, field)
+                callbacks["$(group_name).$(field)"] = getproperty(object, field)::Callback
             end
         end
 
         # And all the inputs
         for (input_func, deps) in ctx_inputs
-            input_name = string(nameof(input_func))
+            input_name = string(nameof(input_func)::Symbol)
 
             if length(deps) == 1
                 input_group_type = deps[1][2].group_type
@@ -1675,7 +1690,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
 
     for (func, deps) in ctx_inputs
         if isempty(deps) || !(deps[1][2] isa Dependency && deps[1][2].kind == DepKind_Group)
-            name = string(nameof(func))
+            name = string(nameof(func)::Symbol)
             throw(XfaContextException("'$(name)' must belong to a Group to be a valid Input"))
         end
     end
@@ -1700,16 +1715,16 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
         # For grouped variables the DAG name (e.g. "my_corr.correlate")
         # differs from the bare function name used in the trait methods
         # (e.g. subvariable "correlate.avg"), so we remap.
-        func_base = string(nameof(functions[name]))
-        ctx_subvariables[name] = [replace(s, func_base => name; count=1)
-                                  for s in variable_subvariables(functions[name])]
+        func_base = string(nameof(functions[name])::Symbol)
+        ctx_subvariables[name] = String[replace(s::String, func_base => name; count=1)
+                                         for s in variable_subvariables(functions[name])]
 
         pps = variable_postprocessors(functions[name])
         if !isempty(pps)
             ctx_variable_postprocessors[name] = String[]
 
             for (pp_name, processor) in pps
-                pp_name = replace(pp_name, func_base => name; count=1)
+                pp_name = replace(pp_name::String, func_base => name; count=1)
                 ctx_postprocessors[pp_name] = processor
                 push!(ctx_variable_postprocessors[name], pp_name)
 
@@ -1722,7 +1737,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 # Register Parameter fields from postprocessor instances
                 for field in fieldnames(typeof(processor))
                     if fieldtype(typeof(processor), field) <: Parameter
-                        param = getproperty(processor, field)
+                        param = getproperty(processor, field)::Parameter
                         param.name = "$(pp_name).$(field)"
                         parameters[param.name] = param
                     end
@@ -1744,9 +1759,9 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     # result is keyed by plot target: the variable or one of its subvariables.
     ctx_displays = Dict{String, Vector{String}}()
     for var_name in keys(dag)
-        func_base = string(nameof(functions[var_name]))
+        func_base = string(nameof(functions[var_name])::Symbol)
         for (target, ref) in variable_displays(functions[var_name])
-            target = replace(target, func_base => var_name; count=1)
+            target = replace(target::String, func_base => var_name; count=1)
             if target != var_name && target ∉ ctx_subvariables[var_name]
                 throw(XfaContextException("@display targets unknown subvariable '$(target)' (on variable '$(var_name)')"))
             end
@@ -1756,7 +1771,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
                 group_name, _ = split(var_name, '.'; limit=2)
                 "$(group_name).$(field)"
             else
-                ref
+                ref::String
             end
             if !haskey(parameters, param_name)
                 throw(XfaContextException("@display references unknown parameter '$(param_name)' (from '$(ref)' on variable '$(var_name)')"))
@@ -1776,7 +1791,7 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; dep_router=Re
     return ctx
 end
 
-function load_from_file(ctx_path::AbstractString; dep_router=Returns(nothing), prelude=Expr[])
+function load_from_file(ctx_path::AbstractString; @nospecialize(dep_router=Returns(nothing)), prelude=Expr[])
     if !isfile(ctx_path)
         throw(ArgumentError("$(ctx_path) is not a file!"))
     end
@@ -1839,9 +1854,12 @@ function _get_group_objects(ctx_module, group_types)
 
     for name in names(ctx_module; all=true)
         object = getproperty(ctx_module, name)
-        group_type = findfirst(g -> object isa g.type, group_types)
-        if group_type != nothing
-            push!(group_objects, (string(name), group_type, object))
+        # A closure capturing `object` would be compiled for each object's type
+        for group_type in keys(group_types)
+            if object isa group_type
+                push!(group_objects, (string(name), group_type, object))
+                break
+            end
         end
     end
 
@@ -1881,6 +1899,53 @@ function Base.empty!(data::DD.DimVector)
     empty!(parent(DD.lookup(data, DD.dims(data)[1])))
 
     return DD.rebuild(data)
+end
+
+using PrecompileTools: @setup_workload, @compile_workload
+
+# Precompilation can only eval into submodules of the package, so the workload
+# context is loaded into this instead of an anonymous module.
+module _InternalPrecompileModule end
+
+@setup_workload begin
+    ctx_str = raw"""
+    using XfaContext: Mean
+
+    @Input function input(::Context.MockInput, output) end
+    mock = Context.MockInput()
+
+    foo_scale = Parameter(1.0)
+
+    @Variable function foo(data -> karabo"FOO/BAR/BAZ:output[data.image]")
+        @postprocess Mean()
+        data .* foo_scale[]
+    end
+
+    @Variable function bar(x -> foo, y -> foo.mean)
+        x .+ y
+    end
+
+    @Group struct Filter
+        source::Parameter{Dependency}
+        threshold::Parameter{Float64} = Parameter(1.0)
+        roi::Parameter{RectROI} = Parameter(RectROI())
+    end
+
+    @Variable function filtered(group::Filter, data -> Filter.source)
+        @display group.roi
+        data
+    end
+
+    filt = Filter(; source=karabo"FOO/BAR/BAZ:output[data.image]")
+    """
+
+    @compile_workload begin
+        exprs = eval_context(_InternalPrecompileModule, ctx_str, Expr[])
+        @invokelatest load_from_module(_InternalPrecompileModule, exprs; dep_router=(topic, source) -> nothing)
+    end
+
+    global current_ctx = nothing
+    global worker_state = WorkerState()
 end
 
 end # module XfaContext
