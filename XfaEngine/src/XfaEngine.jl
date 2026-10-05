@@ -733,4 +733,44 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     return state
 end
 
+using PrecompileTools: @compile_workload
+using Base.CoreLogging: with_logger, NullLogger
+
+# Source discovery pulls in the webproxy/HTTP stack, which is slow to infer on
+# the first context load.
+precompile(Context.get_sources, (KaraboInput,))
+
+# Note that the routing rules file is pre-written and the webproxies cleared so
+# that nothing touches the network during precompilation.
+@compile_workload begin
+    mktempdir() do dir
+        cd(dir) do
+            write_routing_rules(RoutingRule[])
+            with_logger(NullLogger()) do
+                state = withenv("SASE" => nothing) do
+                    main(Base.Event(); info_path=joinpath(dir, "worker-info.toml"), wait=false)
+                end
+                empty!(state.webproxies)
+
+                # Bypass any HTTP_PROXY from the environment, it can't reach localhost
+                WebSockets.open("ws://localhost:$(state.websocket_port)"; proxy=nothing,
+                                maxframesize=Protocol.MAX_FRAME_SIZE) do ws
+                    WebSockets.receive(ws)
+                    for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetTrainmatchers(),
+                                GetRoutingRules(), GetRemapRules())
+                        Protocol.client_send(ws, msg)
+                        Protocol.receive(ws)
+                    end
+                end
+
+                notify(state.stop_event)
+                wait(state.stop_task)
+                wait(state.channel_stats_task)
+            end
+        end
+    end
+
+    global current_engine_state = nothing
+end
+
 end # module XfelAnalyserEngine

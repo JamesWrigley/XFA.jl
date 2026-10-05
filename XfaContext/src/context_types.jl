@@ -503,7 +503,7 @@ function _variable(ctx_module, expr, side_effects)
                     targets = ["$(func_name).$(n)" for n in subvar_names]
                     disp_expr = disp_args[2]
                 else
-                    throw(ArgumentError("@display takes an optional subvariable name (or tuple of names) and a parameter, got: $(join(disp_args, ' '))"))
+                    throw(ArgumentError("@display takes an optional subvariable name (or tuple of names) and a parameter, got: $(join(disp_args::AbstractVector, ' '))"))
                 end
 
                 param_ref = if @capture(disp_expr, head_.tail_)
@@ -517,7 +517,7 @@ function _variable(ctx_module, expr, side_effects)
                     throw(ArgumentError("@display takes a parameter name or group.field, got: $(disp_expr)"))
                 end
                 for target in targets
-                    push!(displays, target => param_ref)
+                    push!(displays, target::String => param_ref)
                 end
             end
         end

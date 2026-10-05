@@ -160,7 +160,7 @@ end
             Protocol.client_send(ws, Protocol.GetPackageDirs())
             package_dirs = Protocol.receive(ws).msg
             @test package_dirs isa Protocol.PackageDirs
-            @test (package_dirs.engine, package_dirs.context) == (pkgdir(XfaEngine), pkgdir(XfaContext))
+            @test (package_dirs.engine, package_dirs.context) == (pkgdir(XfaEngine), pkgdir(Context))
 
             Protocol.client_send(ws, Protocol.GetTrainmatchers())
             @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers

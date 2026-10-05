@@ -1183,8 +1183,10 @@ function handle_server(state)
             # Note that we only support websockets available on localhost, either
             # because the server is running locally or because it's running remotely
             # and we've forwarded the port. Connecting to open servers is not
-            # support for the moment.
-            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true, maxframesize=Protocol.MAX_FRAME_SIZE) do ws
+            # support for the moment. Any HTTP_PROXY from the environment is
+            # bypassed since it can't reach localhost.
+            WebSockets.open("ws://localhost:$(port)"; suppress_close_error=true, proxy=nothing,
+                            maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                 client.websocket = ws
 
                 # The first message we receive is our client ID
