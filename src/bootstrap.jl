@@ -36,14 +36,18 @@ end
 
 # Wait for up to 60s for it to start
 start = time()
+last_print = -Inf
 while !isfile(toml_path) || filesize(toml_path) == 0
     elapsed = time() - start
     if elapsed > 60
         error("Timeout while waiting for engine to start in $(working_dir)")
     else
-        elapsed_str = @sprintf "%.2fs" elapsed
-        println("Waiting for engine to start... $(elapsed_str)")
-        sleep(2)
+        if elapsed - last_print >= 2
+            elapsed_str = @sprintf "%.2fs" elapsed
+            println("Waiting for engine to start... $(elapsed_str)")
+            global last_print = elapsed
+        end
+        sleep(0.1)
     end
 end
 

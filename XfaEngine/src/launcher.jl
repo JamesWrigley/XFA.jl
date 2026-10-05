@@ -18,8 +18,11 @@ Base.exit_on_sigint(false)
 
 try
     # Redirect their IO
-    @everywhere workers() include("launcher_utils.jl")
-    @everywhere workers() redirect_io()
+    # workers() is [1] if none were added, which is already set up
+    if extra_workers() > 0
+        @everywhere workers() include("launcher_utils.jl")
+        @everywhere workers() redirect_io()
+    end
 
     @everywhere import Revise
     @everywhere import XfaEngine as Engine

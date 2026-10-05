@@ -8,7 +8,9 @@ import LoggingExtras: TransformerLogger, DatetimeRotatingFileLogger, MinLevelLog
 """Redirect stdout and stderr to files based on the worker ID"""
 function redirect_io()
     log_name = "worker-$(myid())-stdio.log"
+    redirected = Base.Event()
     Threads.@spawn :interactive redirect_stdio(stdout=log_name, stderr=log_name) do
+        notify(redirected)
         while true
             sleep(10)
             flush(stdout)
@@ -16,8 +18,7 @@ function redirect_io()
         end
     end
 
-    # Sleep for a bit to wait for the task to launch and the redirect to kick in
-    sleep(0.5)
+    wait(redirected)
 
     dt = Dates.format(Dates.now(), "HH:MM:SS on yyyy-mm-dd")
     info_str = "Starting at $(dt) on $(gethostname()) with PID $(getpid())"
