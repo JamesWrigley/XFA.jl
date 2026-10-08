@@ -2118,7 +2118,7 @@ function setup_sentry(settings)
     end
 end
 
-function main(; test_engine=nothing)
+function main(; test_engine=nothing, fps_limit=nothing)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
     if !haskey(ENV, "XCURSOR_PATH")
@@ -2200,7 +2200,7 @@ function main(; test_engine=nothing)
         close(gui_state)
     end
 
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
+    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine, fps_limit) do
         # Bake GL-backed resources on the first frame, once a GL context exists.
         if isnothing(gui_state.window_shadow)
             gui_state.window_shadow = build_window_shadow()

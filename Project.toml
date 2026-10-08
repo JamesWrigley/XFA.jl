@@ -40,7 +40,7 @@ XfaEngine = {path = "XfaEngine"}
 
 [compat]
 Accessors = "0.1.45"
-CImGui = "9"
+CImGui = "9.1"
 CRC32c = "1"
 CurveFit = "1.9.1"
 DataStructures = "0.19"
