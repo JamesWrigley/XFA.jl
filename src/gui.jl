@@ -2112,6 +2112,41 @@ function timestamped_metafmt(level, _module, group, id, file, line)
     return color, "$(ts) $(prefix)", suffix
 end
 
+# glibc's struct mallinfo2
+struct Mallinfo2
+    arena::Csize_t
+    ordblks::Csize_t
+    smblks::Csize_t
+    hblks::Csize_t
+    hblkhd::Csize_t
+    usmblks::Csize_t
+    fsmblks::Csize_t
+    uordblks::Csize_t
+    fordblks::Csize_t
+    keepcost::Csize_t
+end
+
+function rss_mib()
+    rss = Ref{Csize_t}(0)
+    @ccall uv_resident_set_memory(rss::Ref{Csize_t})::Cint
+    return round(Int, rss[] / 2^20)
+end
+
+# malloc_trim() returns freed arena memory to the OS, so the RSS drop measures
+# how much of the RSS is memory retained by glibc rather than leaked.
+function log_memory_stats(client, trim::Bool)
+    mi = @ccall mallinfo2()::Mallinfo2
+    gc = Base.gc_num()
+    queued = sum(store -> Base.n_avail(store.updates), values(client.variable_data); init=0)
+    @info "Memory stats" rss_mib=rss_mib() live_mib=round(Int, Base.gc_live_bytes() / 2^20) malloc_used_mib=round(Int, mi.uordblks / 2^20) malloc_free_mib=round(Int, mi.fordblks / 2^20) malloc_arena_mib=round(Int, mi.arena / 2^20) malloc_mmap_mib=round(Int, mi.hblkhd / 2^20) full_sweeps=gc.full_sweep collections=gc.pause plots=length(client.plots) variables=length(client.variable_data) queued
+
+    if trim
+        rss_before = rss_mib()
+        elapsed = @elapsed @ccall malloc_trim(0::Csize_t)::Cint
+        @info "malloc_trim" rss_before rss_after=rss_mib() seconds=round(elapsed; digits=3)
+    end
+end
+
 """Start the XFA GUI."""
 # Reports exceptions to Sentry when a DSN is configured
 function setup_sentry(settings)
@@ -2124,7 +2159,7 @@ function setup_sentry(settings)
     end
 end
 
-function main(; test_engine=nothing, fps_limit=nothing)
+function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
     if !haskey(ENV, "XCURSOR_PATH")
@@ -2208,7 +2243,9 @@ function main(; test_engine=nothing, fps_limit=nothing)
         close(gui_state)
     end
 
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine, fps_limit) do
+    last_memory_log = Ref(0.0)
+    last_malloc_trim = Ref(time())
+    t =ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine, fps_limit) do
         # Bake GL-backed resources on the first frame, once a GL context exists.
         if isnothing(gui_state.window_shadow)
             gui_state.window_shadow = build_window_shadow()
@@ -2232,6 +2269,14 @@ function main(; test_engine=nothing, fps_limit=nothing)
 
         try
             @lock gui_state begin
+                if memory_log && time() - last_memory_log[] >= 60
+                    trim = time() - last_malloc_trim[] >= 30 * 60
+                    log_memory_stats(gui_state.client, trim)
+                    last_memory_log[] = time()
+                    if trim
+                        last_malloc_trim[] = time()
+                    end
+                end
                 @with state => gui_state @invokelatest draw_gui()
             end
         catch ex
