@@ -2106,6 +2106,12 @@ function draw_gui()
     update_viewport_cursors()
 end
 
+function timestamped_metafmt(level, _module, group, id, file, line)
+    color, prefix, suffix = Base.CoreLogging.default_metafmt(level, _module, group, id, file, line)
+    ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    return color, "$(ts) $(prefix)", suffix
+end
+
 """Start the XFA GUI."""
 # Reports exceptions to Sentry when a DSN is configured
 function setup_sentry(settings)
@@ -2124,6 +2130,8 @@ function main(; test_engine=nothing, fps_limit=nothing)
     if !haskey(ENV, "XCURSOR_PATH")
         ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
     end
+
+    Base.CoreLogging.global_logger(Base.CoreLogging.ConsoleLogger(; meta_formatter=timestamped_metafmt))
 
     settings = load_settings()
     setup_sentry(settings)
