@@ -2218,13 +2218,13 @@ function image_bounds(frame::Image)
     x_max = isnothing(frame.x_axis) ? cols : last(frame.x_axis)
     y_min = isnothing(frame.y_axis) ? 0 : first(frame.y_axis)
     y_max = isnothing(frame.y_axis) ? rows : last(frame.y_axis)
-    # A degenerate range (all lookup values equal) would give the image zero
-    # extent and divide by zero in the hover index math, so fall back to plain
-    # pixel indices for that axis.
-    if x_max == x_min
+    # A degenerate (all lookup values equal) or non-finite range would break the
+    # image extent and the hover index math, so fall back to plain pixel indices
+    # for that axis.
+    if !isfinite(x_min) || !isfinite(x_max) || x_max == x_min
         x_min, x_max = 0, cols
     end
-    if y_max == y_min
+    if !isfinite(y_min) || !isfinite(y_max) || y_max == y_min
         y_min, y_max = 0, rows
     end
     return (rows, cols, x_min, x_max, y_min, y_max)
