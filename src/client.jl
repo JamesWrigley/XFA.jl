@@ -30,9 +30,21 @@ function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
 
-# Single ping with a 1s timeout; used to detect whether we can skip bastion/gateway jumps.
+# Try connecting to the SSH port with a 1s timeout; used to detect whether we
+# can skip bastion/gateway jumps. Some hosts answer pings but firewall SSH.
 function is_directly_reachable(address::AbstractString)
-    success(pipeline(`ping -c 1 -W 1 $address`; stdout=devnull, stderr=devnull))
+    sock = Sockets.TCPSocket()
+    timer = Timer(_ -> close(sock), 1)
+    try
+        Sockets.connect(sock, address, 22)
+        # A timed-out connect returns normally with the socket closed
+        isopen(sock)
+    catch
+        false
+    finally
+        close(timer)
+        close(sock)
+    end
 end
 
 function ssh_initialize(state::GuiState)
