@@ -745,8 +745,9 @@ function draw_variable(name, var_data)
             new_gui_state = try
                 draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
             catch ex
-                @error "Error while drawing node '$(name)'" exception=(ex, catch_backtrace())
-                state[].disable_rendering = true
+                bt = catch_backtrace()
+                @error "Error while drawing node '$(name)'" exception=(ex, bt)
+                state[].render_error = sprint(showerror, ex, bt)
                 nothing
             end
             if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
@@ -2251,7 +2252,7 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
             gui_state.window_shadow = build_window_shadow()
         end
 
-        if gui_state.disable_rendering
+        if !isnothing(gui_state.render_error)
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
             # below. So here we check if we're currently disabled and end it if
@@ -2260,10 +2261,14 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
                 ig.igEndDisabled()
             end
 
-            ig.Text("Render loop crashed, continue when ready:")
+            message = gui_state.render_error
             @with state => gui_state draw_revise()
             ig.SameLine()
-            gui_state.disable_rendering = !ig.Button("Continue")
+            if ig.Button("Continue")
+                gui_state.render_error = nothing
+            end
+            ig.Text("Render loop crashed, continue when ready:")
+            BoxedText("##render-error", message)
             return
         end
 
@@ -2280,8 +2285,9 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
                 @with state => gui_state @invokelatest draw_gui()
             end
         catch ex
-            @error "Error while rendering:" exception=(ex, catch_backtrace())
-            gui_state.disable_rendering = true
+            bt = catch_backtrace()
+            @error "Error while rendering:" exception=(ex, bt)
+            gui_state.render_error = sprint(showerror, ex, bt)
         end
     end
 

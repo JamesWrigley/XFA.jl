@@ -894,7 +894,7 @@ struct WindowShadow
 end
 
 @kwdef mutable struct GuiState
-    disable_rendering::Bool = false
+    render_error::Maybe{String} = nothing
 
     # Baked drop-shadow for the Karabo source editor, built on first use.
     window_shadow::Maybe{WindowShadow} = nothing
