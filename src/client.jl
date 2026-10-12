@@ -1,5 +1,6 @@
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
+const DISPLAY_JUMP = "max-exfl-display003.desy.de"
 
 function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
     push!(state.client.engine_logs, EngineLog(message, extra_details))
@@ -44,11 +45,16 @@ function ssh_initialize(state::GuiState)
     end
 
     if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
-        push!(client.ssh_hops, SshState(; address=BASTION))
-        # Maxwell nodes (max-*) are reachable from bastion, the online cluster
-        # needs the gateway hop too.
-        if !startswith(address, "max-")
-            push!(client.ssh_hops, SshState(; address=GATEWAY))
+        local_host = first(split(gethostname(), "."))
+        if startswith(local_host, "max-exfl-display") && local_host != first(split(DISPLAY_JUMP, "."))
+            push!(client.ssh_hops, SshState(; address=DISPLAY_JUMP))
+        else
+            push!(client.ssh_hops, SshState(; address=BASTION))
+            # Maxwell nodes (max-*) are reachable from bastion, the online cluster
+            # needs the gateway hop too.
+            if !startswith(address, "max-")
+                push!(client.ssh_hops, SshState(; address=GATEWAY))
+            end
         end
     end
 
