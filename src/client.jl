@@ -299,7 +299,12 @@ function initialize_engine(state)
 
             bootstrap_env = Dict("XFA_WORKING_DIR" => remote_working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
+            project_arg = if isempty(state.engine_environment)
+                ""
+            else
+                "--project=$(state.engine_environment)"
+            end
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia $(project_arg) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)

@@ -1952,7 +1952,7 @@ function draw_gui()
                     ig.Text("Use environment:")
                     ig.TableNextColumn()
                     ig.SetNextItemWidth(-1)
-                    env_edited, new_environment = SafeInputText("##engine-environment";
+                    env_edited, new_environment = SafeInputText("##engine-environment"; hint="(optional)",
                                                                 current_text=default(state[].engine_environment))
                     if env_edited
                         state[].engine_environment = new_environment

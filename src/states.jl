@@ -914,7 +914,7 @@ end
     address::String = "$(Sys.username())@sa2-onc-mid.desy.de"
     client::ClientState = ClientState()
     julia_module::String = "exfel xfa"
-    engine_environment::String = "@xfa-default"
+    engine_environment::String = ""
     engine_working_dir::String = "~/xfa"
     client_type_current_item::Cint = Cint(0)
 
@@ -930,7 +930,7 @@ function GuiState(settings::Dict; kwargs...)
 
     address = get(gui, "address", "$(Sys.username())@sa2-onc-mid.desy.de")
     julia_module = get(gui, "julia_module", "exfel xfa")
-    engine_environment = get(gui, "engine_environment", "@xfa-default")
+    engine_environment = get(gui, "engine_environment", "")
     engine_working_dir = get(gui, "engine_working_dir", "~/xfa")
     client_type_current_item = Cint(get(gui, "client_type", 0))
     saved_contexts = Dict{String, Dict{String, Any}}(
