@@ -284,7 +284,12 @@ function initialize_engine(state)
             session = ssh_state.session
 
             working_dir = is_local ? pwd() : state.engine_working_dir
-            bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
+            remote_working_dir = if working_dir == "~" || startswith(working_dir, "~/")
+                homedir(client.sftp) * working_dir[2:end]
+            else
+                working_dir
+            end
+            bootstrap_jl = joinpath(remote_working_dir, "bootstrap.jl")
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
             mkpath(dirname(bootstrap_jl), client.sftp)
@@ -292,7 +297,7 @@ function initialize_engine(state)
                 write(f, code)
             end
 
-            bootstrap_env = Dict("XFA_WORKING_DIR" => working_dir)
+            bootstrap_env = Dict("XFA_WORKING_DIR" => remote_working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
             bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
