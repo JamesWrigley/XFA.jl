@@ -344,6 +344,7 @@ end
     const log_y::Ref{Bool} = Ref(false)
     const show_side_panel::Ref{Bool} = Ref(false)
     dock_id::UInt32 = 0
+    error::Maybe{String} = nothing
 end
 
 ### GUI state types

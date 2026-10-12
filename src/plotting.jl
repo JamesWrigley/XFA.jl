@@ -1840,6 +1840,7 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
     spec = layer.spec
     name = spec.data
     store = view_store(view, name)
+
     if !isempty(spec.lookups)
         push!(frames, lookup_frame(view, layer, updated_variables))
     elseif isnothing(store) || store.data isa ArrayMetadata
@@ -2422,46 +2423,40 @@ function image_state(view::SpecView)
     isnothing(i) ? nothing : view.layers[i].image
 end
 
-function draw_plot(plot::Plot, updated_variables)
-    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+function draw_plot_contents(plot::Plot, updated_variables)
     side_panel_width = 320f0
     colorbar_width = 100f0
-
     view = plot.view
-    title = isnothing(view.spec) ? "" : view.spec.title
-    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
 
-    if ig.Begin(win_id, plot.open)
-        plot.dock_id = ig.GetWindowDockID()
+    top_controls(view.source, view.id)
 
-        top_controls(view.source, view.id)
+    plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
 
-        plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
+    frames = prepare!(view, plot, updated_variables)
+    all_empty = all(f -> f isa Empty, frames)
+    # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
+    has_image = any(f -> f isa Image, frames)
 
-        frames = prepare!(view, plot, updated_variables)
-        all_empty = all(f -> f isa Empty, frames)
-        # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
-        has_image = any(f -> f isa Image, frames)
-
-        if all_empty
-            for f in frames
-                if !isempty(f.message)
-                    ig.TextWrapped(f.message)
-                end
+    if all_empty
+        for f in frames
+            if !isempty(f.message)
+                ig.TextWrapped(f.message)
             end
-        else
-            apply_autoscale(plot)
+        end
+    else
+        apply_autoscale(plot)
 
-            # Reserve room on the right for the side-panel tab button.
-            tab_w = 14.0f0
-            spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
-            img = image_state(view)
-            reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
-            plot_width = max(plot_size.x - reserved, 100f0)
-            plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
-                         ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
+        # Reserve room on the right for the side-panel tab button.
+        tab_w = 14.0f0
+        spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+        img = image_state(view)
+        reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
+        plot_width = max(plot_size.x - reserved, 100f0)
+        plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
+                     ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
 
-            if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+        if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+            try
                 ImPlot.SetupAxis(ImPlot.ImAxis_X1, axis_label(view.spec, view.spec.xlabel, :x))
                 ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view.spec, view.spec.ylabel, :y))
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
@@ -2476,32 +2471,62 @@ function draw_plot(plot::Plot, updated_variables)
                 end
                 draw_view_overlays(view, frames)
                 check_plot_interaction!(plot)
+            finally
                 ImPlot.EndPlot()
             end
-
-            if !isnothing(img)
-                ig.SameLine()
-                if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
-                   !isnothing(img.gpu_heatmap)
-                    cb = img.colorbar
-                    update_colormap!(get_heatmap_context(), img.colormap)
-                    render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
-                                        cb.clip_min[], cb.clip_max[], img.log_scale[])
-                end
-            end
-
-            side_panel_tab(plot, tab_w, plot_size.y)
         end
 
-        end_plot_area!(plot, side_panel_width, plot_area_h, () -> side_panel(view))
-
-        if !all_empty
-            autoscale_buttons(plot)
-            if !has_image
-                ig.SameLine()
-                log_scale_buttons(plot)
+        if !isnothing(img)
+            ig.SameLine()
+            if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
+               !isnothing(img.gpu_heatmap)
+                cb = img.colorbar
+                update_colormap!(get_heatmap_context(), img.colormap)
+                render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
+                                    cb.clip_min[], cb.clip_max[], img.log_scale[])
             end
-            bottom_controls(view)
+        end
+
+        side_panel_tab(plot, tab_w, plot_size.y)
+    end
+
+    end_plot_area!(plot, side_panel_width, plot_area_h, () -> side_panel(view))
+
+    if !all_empty
+        autoscale_buttons(plot)
+        if !has_image
+            ig.SameLine()
+            log_scale_buttons(plot)
+        end
+        bottom_controls(view)
+    end
+end
+
+function draw_plot(plot::Plot, updated_variables)
+    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+
+    view = plot.view
+    title = isnothing(view.spec) ? "" : view.spec.title
+    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
+
+    if ig.Begin(win_id, plot.open)
+        plot.dock_id = ig.GetWindowDockID()
+
+        if isnothing(plot.error)
+            try
+                @imgui_recover draw_plot_contents(plot, updated_variables)
+            catch err
+                bt = catch_backtrace()
+                @error "Error drawing plot $(plot.id)" exception=(err, bt)
+                plot.error = sprint(showerror, err, bt)
+            end
+        else
+            message = plot.error
+            if ig.Button("Retry")
+                plot.error = nothing
+            end
+            ig.Text("Error drawing plot:")
+            BoxedText("##plot-error-$(plot.id)", message)
         end
     end
 

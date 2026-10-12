@@ -25,6 +25,7 @@ using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
     LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
 include("states.jl")
+include("imgui_helpers.jl")
 
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
@@ -44,7 +45,6 @@ using XfaContext: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvaria
     subvariable_dependency,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
-include("imgui_helpers.jl")
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")

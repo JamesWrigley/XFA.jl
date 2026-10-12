@@ -140,8 +140,8 @@ function BoxedText(label, text)
         CopyButton("$label-copy", text)
         ig.SetCursorPos(ImVec2(0, 0))
         ig.TextUnformatted(text)
-        ig.EndChild()
     end
+    ig.EndChild()
 end
 
 # Diabolically stolen from: https://github.com/ocornut/imgui/issues/1901#issuecomment-400563921
@@ -195,6 +195,29 @@ macro NodeEditor(editor, name, expr)
             ne.End()
             ig.SetFontRasterizerDensity(1f0)
             ne.SetCurrentEditor(C_NULL)
+        end
+    end
+end
+
+# Runs `expr` and, if it throws, unwinds the ImGui stacks (windows, IDs, styles
+# etc.) back to how they were before rethrowing. The assert and tooltip ImGui
+# raises for each missing End/Pop it fixes up are silenced.
+macro imgui_recover(expr)
+    quote
+        local recovery = Ref{ig.lib.ImGuiErrorRecoveryState}()
+        ig.ErrorRecoveryStoreState(recovery)
+        try
+            $(esc(expr))
+        catch
+            local io = ig.GetIO()
+            local enable_assert = unsafe_load(io.ConfigErrorRecoveryEnableAssert)
+            local enable_tooltip = unsafe_load(io.ConfigErrorRecoveryEnableTooltip)
+            io.ConfigErrorRecoveryEnableAssert = false
+            io.ConfigErrorRecoveryEnableTooltip = false
+            ig.ErrorRecoveryTryToRecoverState(recovery)
+            io.ConfigErrorRecoveryEnableAssert = enable_assert
+            io.ConfigErrorRecoveryEnableTooltip = enable_tooltip
+            rethrow()
         end
     end
 end
