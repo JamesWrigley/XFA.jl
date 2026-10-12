@@ -24,13 +24,14 @@ function save_section(section::String, data::Dict)
 end
 
 function save_settings(state::GuiState, updated_field=nothing)
-    fields_to_save = (:address, :engine_environment, :engine_working_dir, :client_type_current_item)
+    fields_to_save = (:address, :julia_module, :engine_environment, :engine_working_dir, :client_type_current_item)
     if !isnothing(updated_field) && updated_field ∉ fields_to_save
         return
     end
 
     save_section("GuiState", Dict(
         "address" => state.address,
+        "julia_module" => state.julia_module,
         "engine_environment" => state.engine_environment,
         "engine_working_dir" => state.engine_working_dir,
         "client_type" => state.client_type_current_item,

@@ -1920,33 +1920,56 @@ function draw_gui()
 
                 ig.Spacing()
 
-                if !state[].client.embedded_engine
+                if !state[].client.embedded_engine && ig.BeginTable("##connection-settings", 2, 0,
+                                                                    (ig.GetFontSize() * 40, 0f0))
+                    ig.TableSetupColumn("label", ig.ImGuiTableColumnFlags_WidthFixed)
+                    ig.TableSetupColumn("input", ig.ImGuiTableColumnFlags_WidthStretch)
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
                     ig.Text("Connect to node:")
-
-                    ig.SameLine()
-
-                    edited, new_address = SafeInputText("##client"; hint="exflonc24.desy.de",
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    edited, new_address = SafeInputText("##client"; hint="sa2-onc-mid.desy.de",
                                                         current_text=default(state[].address))
-
-                    ig.Text("Use environment:")
-                    ig.SameLine()
-                    env_edited, new_environment = SafeInputText("##engine-environment";
-                                                                current_text=default(state[].engine_environment))
-
-                    ig.Text("Working directory:")
-                    ig.SameLine()
-                    wd_edited, new_working_dir = SafeInputText("##engine-working-dir";
-                                                               current_text=default(state[].engine_working_dir))
-
                     if edited
                         state[].address = new_address
                     end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Julia module:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    module_edited, new_module = SafeInputText("##julia-module";
+                                                              current_text=default(state[].julia_module))
+                    if module_edited
+                        state[].julia_module = new_module
+                    end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Use environment:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    env_edited, new_environment = SafeInputText("##engine-environment";
+                                                                current_text=default(state[].engine_environment))
                     if env_edited
                         state[].engine_environment = new_environment
                     end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Working directory:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    wd_edited, new_working_dir = SafeInputText("##engine-working-dir";
+                                                               current_text=default(state[].engine_working_dir))
                     if wd_edited
                         state[].engine_working_dir = new_working_dir
                     end
+
+                    ig.EndTable()
                 end
             end
 
