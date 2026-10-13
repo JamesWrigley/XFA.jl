@@ -2282,7 +2282,11 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
 
         # Clean up GPU heatmap resources before destroying contexts
         for plot in client.plots
-            close(plot)
+            for layer in plot.view.layers
+                if !isnothing(layer.image)
+                    close(layer.image)
+                end
+            end
         end
         destroy_heatmap_context!()
 
