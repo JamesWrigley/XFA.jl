@@ -1146,6 +1146,8 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
                                   "no input: $(join(unrouted, ", "))"))
     end
 
+    update_input_sources(ctx)
+
     # Start the input functions to feed the DAG
     for (name, deps) in ctx.inputs
         group = nothing
@@ -1214,9 +1216,6 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
-
-    # Update the inputs
-    update_input_sources(ctx)
 
     # Offline drops nothing: keep partial trains indefinitely (see Trainmatcher).
     max_train_latency = offline ? -1 : 20

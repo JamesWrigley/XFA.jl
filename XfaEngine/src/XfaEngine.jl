@@ -502,13 +502,24 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
 
         if new_ctx_or_ex isa ContextState
             state.ctx = new_ctx_or_ex
+            start_error = nothing
             if was_running
-                start_pipeline(state)
+                try
+                    start_pipeline(state)
+                catch ex
+                    @error "Failed to restart the pipeline after loading $(path)" exception=(ex, catch_backtrace())
+                    start_error = Protocol.ExceptionMessage(ex, catch_backtrace())
+                end
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
             source = read(path, String)
             Protocol.server_send(ws, ContextInfo(state.ctx, source); reply_to)
+
+            # The context itself loaded, so the start failure is reported separately
+            if !isnothing(start_error)
+                Protocol.server_send(ws, Ack(start_error))
+            end
         else
             @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
             Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[], ""); reply_to)

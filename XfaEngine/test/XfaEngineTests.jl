@@ -382,6 +382,50 @@ end
             end
         end
     end
+
+    @testset "Failed restart after loading" begin
+        mktemp() do path, io
+            write(path, raw"""
+            @Input function input(::Context.MockInput, output)
+                for tid in 1:1_000_000
+                    put!(output, (tid, Dict()))
+                    sleep(0.01)
+                end
+            end
+            x = Context.MockInput()
+            # Without any variables the pipeline finishes immediately
+            @Variable foo -> karabo"foo.x"
+            """)
+
+            temp_engine(; log=TestLogger()) do address, stop_event, info_path
+                WebSockets.open(address) do ws
+                    WebSockets.receive(ws) # client id
+
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                    Protocol.client_send(ws, Protocol.Start())
+                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                    # Reloading restarts the pipeline, which fails here
+                    write(path, raw"""
+                    @Group struct Rejecting end
+                    Context.update_sources(::Rejecting, _) = error("Sources rejected")
+                    @Input function input(::Rejecting, output) end
+                    r = Rejecting()
+                    """)
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    @test msg.info isa Dict
+                    @test !msg.is_running
+
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.Ack); msg = Protocol.receive(ws).msg end
+                    @test contains(msg.error.text, "Sources rejected")
+                end
+            end
+        end
+    end
 end
 
 @testset "Message tracking" begin
