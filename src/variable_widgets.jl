@@ -108,7 +108,7 @@ function draw_online_bridge(name, params, gui_state)
     client = state[].client
 
     tm_param = params["trainmatcher"]
-    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param, client.trainmatcher_sources)
+    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
     if tm_modified
         tm_param[] = new_tm
         @guiasync set_group_param(state[], name, "trainmatcher",
@@ -203,10 +203,7 @@ function draw_variable_content(::Val{Symbol("XfaContext.Scan")}, name, var_data,
 
     ig.Text("Parameters:")
     for (param_name, param) in params
-        if param_name == "scantool"
-            scantools = filter(s -> s.class_id == "Karabacon", state[].client.source_list)
-            draw_parameter(param_name, param, scantools)
-        elseif !(automatic && param_name in ("resolution", "position_property"))
+        if !(automatic && param_name in ("resolution", "position_property"))
             draw_parameter(param_name, param)
         end
     end

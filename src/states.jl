@@ -388,6 +388,9 @@ end
     # topic-filtered) source list to complete against.
     label::String = ""
     source_list::Vector{SourceInfo} = SourceInfo[]
+    device_classes::Vector{String} = String[]
+    qualify_topics::Bool = false
+    initial_source::String = ""
     device_only::Bool = false
     allow_slow::Bool = true
     # One-shot flag to open/focus the window on its first drawn frame.
@@ -607,6 +610,7 @@ end
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     source::String = ""
+    input_topics::Dict{String, Union{String, Nothing}} = Dict()
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 
@@ -747,11 +751,9 @@ end
 
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
-    # The trainmatchers as a source list, which is what Parameter{KaraboDevice}
-    # (i.e. an input's trainmatcher) is completed against.
-    trainmatcher_sources::Vector{SourceInfo} = SourceInfo[]
-    whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
-    trainmatchers_request_status::RequestStatus = RequestStatus_Idle
+    device_list::Vector{SourceInfo} = SourceInfo[]
+    whitelisted_devices::Set{KaraboDevice} = Set{KaraboDevice}()
+    devices_request_status::RequestStatus = RequestStatus_Idle
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     routing_rules_request_status::RequestStatus = RequestStatus_Idle
     routing_rules_set_request::Maybe{Int} = nothing

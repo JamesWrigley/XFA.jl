@@ -126,31 +126,36 @@ function get_devices(wp; timeout=5, max_age=10, classId=nothing)
     return devices
 end
 
-# This takes in a dict from topic to webproxy
-function get_all_trainmatchers(webproxies::Dict)
-    trainmatchers = Dict{String, Vector{Tuple{String, Bool}}}()
-
-    try
-        for (topic, wp) in webproxies
-            devices = get_devices(wp; classId="TrainMatcher")
-            whitelisted = try
-                get_property(wp, "karabo/WebProxy/device", "devices")
-            catch ex
-                @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
-                String[]
+# Every device known to the webproxies, takes in a dict from topic to webproxy
+function get_all_devices(webproxies::Dict; classId=nothing)
+    devices = SourceInfo[]
+    for (topic, wp) in webproxies
+        try
+            for (name, info) in get_devices(wp; classId)
+                push!(devices, SourceInfo(topic, name, info["classId"]))
             end
-            names = sort!(collect(keys(devices)))
-            trainmatchers[topic] = [(name, name in whitelisted) for name in names]
-        end
-    catch ex
-        if ex isa HTTP.ConnectError
-            @warn "Couldn't get trainmatchers" exception=ex
-        else
-            rethrow()
+        catch ex
+            @warn "Failed to get the devices for $topic" exception=(ex, catch_backtrace())
         end
     end
 
-    return trainmatchers
+    return devices
+end
+
+# The devices whitelisted in each webproxy, takes in a dict from topic to webproxy
+function get_device_whitelist(webproxies::Dict)
+    whitelisted = Set{KaraboDevice}()
+    for (topic, wp) in webproxies
+        try
+            for name in get_property(wp, "karabo/WebProxy/device", "devices")
+                push!(whitelisted, KaraboDevice(topic, name))
+            end
+        catch ex
+            @warn "Failed to query webproxy whitelist for $topic" exception=(ex, catch_backtrace())
+        end
+    end
+
+    return whitelisted
 end
 
 function get_config(device::KaraboDevice; timeout=5)

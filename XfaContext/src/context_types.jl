@@ -77,6 +77,9 @@ end
     update_handler::Union{Function, Nothing} = nothing
     initializer::Union{Function, Nothing} = nothing
     optional::Bool = false
+
+    filter_topics::Bool = true
+    filter_device_classes::Vector{String} = String[]
 end
 
 @enum VariableKind VariableKind_Variable VariableKind_Group VariableKind_Input
@@ -664,16 +667,14 @@ _wrap_param(val::Parameter) = val
 _wrap_param(val) = Parameter(val)
 # Merge a raw value into a default Parameter, preserving handlers
 _wrap_param(val::Parameter, ::Parameter) = val
-_wrap_param(val, default::Parameter) = Parameter(default.name, val, default.set_by_user,
-                                                  default.update_handler, default.initializer,
-                                                  default.optional)
+_wrap_param(val, default::Parameter) = @set default.value = val
 
 function Parameter(f::Base.Callable, value; optional=false)
     if !isnothing(f) && !any(m -> m.nargs in (2, 3), methods(f))
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
-    Parameter("", value, false, f, f, optional)
+    Parameter(; value, update_handler=f, initializer=f, optional)
 end
 
 function tryset(param::Parameter, value; force=false)

@@ -466,9 +466,10 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             Protocol.server_send(ws, AvailableVariables(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
 
-    elseif msg isa GetTrainmatchers
-        trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
+    elseif msg isa GetDevices
+        devices = get_all_devices(state.webproxies)
+        whitelisted = get_device_whitelist(state.webproxies)
+        Protocol.server_send(ws, AvailableDevices(devices, whitelisted); reply_to)
 
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
@@ -643,15 +644,11 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         # First run: seed one {topic, "*", first_matcher} rule per discovered
         # topic and persist, so subsequent runs read the file verbatim.
         rules = RoutingRule[]
-        if !isempty(state.webproxies)
-            try
-                for (topic, matchers) in get_all_trainmatchers(state.webproxies)
-                    if !isempty(matchers)
-                        push!(rules, RoutingRule(topic, "*", first(matchers)[1]))
-                    end
-                end
-            catch ex
-                @warn "Failed to query trainmatchers while seeding routing rules" exception=(ex, catch_backtrace())
+        trainmatchers = get_all_devices(state.webproxies; classId="TrainMatcher")
+        for topic in keys(state.webproxies)
+            names = sort!([d.name for d in trainmatchers if d.topic == topic])
+            if !isempty(names)
+                push!(rules, RoutingRule(topic, "*", first(names)))
             end
         end
         write_routing_rules(rules)
@@ -756,7 +753,7 @@ precompile(Context.get_sources, (KaraboInput,))
                 WebSockets.open("ws://localhost:$(state.websocket_port)"; proxy=nothing,
                                 maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                     WebSockets.receive(ws)
-                    for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetTrainmatchers(),
+                    for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetDevices(),
                                 GetRoutingRules(), GetRemapRules())
                         Protocol.client_send(ws, msg)
                         Protocol.receive(ws)

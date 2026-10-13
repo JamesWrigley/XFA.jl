@@ -1,7 +1,7 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetTrainmatchers, GetInputSources, LoadContext, ReviseCode,
+    GetDevices, GetInputSources, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
     GetPackageDirs, PackageDirs,
@@ -11,7 +11,7 @@ export AbstractMessage, Ping, Shutdown,
     SetVariableSubscriptions,
     ChangeParameter, InvokeCallback, Start, Stop,
     SetDebugMode, SetRemoteRepl,
-    Pong, AvailableTrainmatchers,
+    Pong, AvailableDevices,
     Started, Stopped, InputSources,
     ContextInfo, ParameterChanged, DisplayableChanged, TrainData, RemoteReplState,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
@@ -21,7 +21,7 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import XfaContext
-using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec
+using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec, KaraboDevice
 using ..XfaEngine: RoutingRule, RemapRule
 
 
@@ -98,7 +98,7 @@ struct SetRemoteRepl <: AbstractMessage
     enable::Bool
 end
 
-struct GetTrainmatchers <: AbstractMessage end
+struct GetDevices <: AbstractMessage end
 
 struct GetInputSources <: AbstractMessage end
 
@@ -109,8 +109,9 @@ struct GetVariables <: AbstractMessage end
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
-struct AvailableTrainmatchers <: AbstractMessage
-    topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
+struct AvailableDevices <: AbstractMessage
+    devices::Vector{SourceInfo}
+    whitelisted::Set{KaraboDevice}
 end
 
 struct RoutingRules <: AbstractMessage

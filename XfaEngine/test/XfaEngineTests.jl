@@ -162,8 +162,8 @@ end
             @test package_dirs isa Protocol.PackageDirs
             @test (package_dirs.engine, package_dirs.context) == (pkgdir(XfaEngine), pkgdir(Context))
 
-            Protocol.client_send(ws, Protocol.GetTrainmatchers())
-            @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
+            Protocol.client_send(ws, Protocol.GetDevices())
+            @test Protocol.receive(ws).msg isa Protocol.AvailableDevices
 
             # Test Ping
             Protocol.client_send(ws, Protocol.Ping())
@@ -1032,6 +1032,7 @@ end
         """; prelude=KARABO_PRELUDE)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
+                                       "input_topics" => Dict("bridge.stream" => nothing),
                                        "groups" => ["bridge", "resettable"],
                                        "dag" =>          Dict("xgm" => OD("data" => karabo"xgm.intensity"),
                                                               "foo" => OD(),

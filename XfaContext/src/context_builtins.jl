@@ -470,7 +470,8 @@ end
     # Optional so the pipeline can start before a scantool has assigned a motor.
     position1::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
     position2::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
-    scantool::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; update_handler=scantool_changed, optional=true)
+    scantool::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; update_handler=scantool_changed, optional=true,
+                                                                                      filter_device_classes=["Karabacon"])
     # The motors' position property. Karabacon's motor interfaces differ here
     # (e.g. slits use actualPositionX, monochromators actualEnergy).
     position_property::Parameter{String} = Parameter("actualPosition")

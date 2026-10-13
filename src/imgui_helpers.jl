@@ -779,7 +779,8 @@ committed result (running the remap) on the following frame.
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
                        source_list, client::ClientState;
                        device_only::Bool=false, allow_slow::Bool=true,
-                       focus::Bool=false)
+                       focus::Bool=false, device_classes::Vector{String}=String[],
+                       qualify_topics::Bool=false)
     # If a previous commit kicked off an async remap, either resolve it now or
     # show a disabled spinner placeholder until the request lands.
     if !isnothing(dep_state.pending_remap_id)
@@ -817,8 +818,11 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
     clicked = KaraboDepDisplay(label, text)
     if clicked || focus
         seed_karabo_editor!(dep_state, text, device_only)
+        dep_state.initial_source = dep_state.source
         dep_state.label = label
         dep_state.source_list = source_list
+        dep_state.device_classes = device_classes
+        dep_state.qualify_topics = qualify_topics
         dep_state.device_only = device_only
         dep_state.allow_slow = allow_slow
         dep_state.trigger = true
@@ -1053,9 +1057,13 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
 
     result = nothing
     if field_state.edit != ElidedEditState_NoEdit
-        result, hovered = draw_source_completions(popup_id, field_state, dep_state.source,
+        # Offer every device until a device-only field is edited, rather than
+        # just the current one.
+        unedited = dep_state.device_only && dep_state.source == dep_state.initial_source
+        result, hovered = draw_source_completions(popup_id, field_state, unedited ? "" : dep_state.source,
                                                   dep_state.source_list, dep_state.allow_slow, client;
-                                                  device_only=dep_state.device_only)
+                                                  device_only=dep_state.device_only,
+                                                  dep_state.device_classes, dep_state.qualify_topics)
         dep_state.ac_hovered |= hovered
         dep_state.ac_active = true
         if !ig.IsItemActive() && !hovered

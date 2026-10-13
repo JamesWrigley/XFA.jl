@@ -437,7 +437,8 @@ function to_dict(ctx::ContextState)
         # Preserve the concrete type so an unassigned (nothing-valued) parameter
         # keeps its element type instead of failing to infer it.
         parameters[name] = typeof(param)(; name=param.name, value=param.value,
-                                         set_by_user=param.set_by_user, optional=param.optional)
+                                         set_by_user=param.set_by_user, optional=param.optional,
+                                         param.filter_topics, param.filter_device_classes)
     end
 
     # group_type holds a DataType that may live in the context's anonymous
@@ -490,6 +491,9 @@ function to_dict(ctx::ContextState)
     # Only the titles, the functions live in the context module
     callbacks = OrderedDict{String, String}(name => cb.title for (name, cb) in ctx.callbacks)
 
+    input_topics = Dict{String, Union{String, Nothing}}(name => input_topic(get_input_group(ctx, name))
+                                                        for name in keys(ctx.inputs))
+
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
@@ -499,6 +503,7 @@ function to_dict(ctx::ContextState)
                 "displayables" => displayables,
                 "callbacks" => callbacks,
                 "inputs" => inputs,
+                "input_topics" => input_topics,
                 "groups" => groups,
                 "origins" => origins,
                 "dep_to_input" => ctx.dep_to_input,
@@ -1442,8 +1447,11 @@ function _is_context_method(m::Method)
         return false      # not a concrete singleton (e.g. the default method)
     end
 
-    mod_names = string.(fullname(parentmodule(owner)))
-    return any(startswith.(mod_names, "UserContext"))
+    # The precompile workload's context is loaded into _InternalPrecompileModule,
+    # and its methods survive into the package image.
+    mod = parentmodule(owner)
+    mod_names = string.(fullname(mod))
+    return mod === _InternalPrecompileModule || any(startswith.(mod_names, "UserContext"))
 end
 
 function _cleanup_context_methods()

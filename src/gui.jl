@@ -341,19 +341,22 @@ function draw_parameter_widget(name, param::Parameter{OptionalDims})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{KaraboDevice}, sources)
+function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     client = state[].client
     dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
 
+    sources = param.filter_topics ? client.source_list : client.device_list
+    classes = param.filter_device_classes
     device = param.value
     text = isnothing(device) ? "" : "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     sources, client; device_only=true)
+                                     sources, client; device_only=true, device_classes=classes)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
-            idx = findfirst(s -> s.name == new_device.name, sources)
+            idx = findfirst(s -> s.name == new_device.name && (isempty(classes) || s.class_id in classes),
+                            sources)
             if !isnothing(idx)
                 new_device = KaraboDevice(sources[idx].topic, new_device.name)
             end
@@ -512,11 +515,7 @@ function draw_parameters(var_data; pending=false)
     if haskey(var_data, "parameters")
         ig.Text("Parameters:")
         for (param_name, param) in var_data["parameters"]
-            if param isa Parameter{KaraboDevice}
-                draw_parameter(param_name, param, state[].client.source_list; pending)
-            else
-                draw_parameter(param_name, param; pending)
-            end
+            draw_parameter(param_name, param; pending)
         end
     end
 end
@@ -1110,10 +1109,10 @@ function draw_routing_rules()
             set_routing_rules(client, client.routing_rules)
         end
         ig.SameLine()
-        if ig.Button("Refresh trainmatchers")
-            get_trainmatchers(client)
+        if ig.Button("Refresh devices")
+            get_devices(client)
         end
-        if client.trainmatchers_request_status == RequestStatus_Waiting
+        if client.devices_request_status == RequestStatus_Waiting
             ig.SameLine()
             Spinner()
         end
@@ -1205,9 +1204,9 @@ function draw_routing_rules()
                 # A yellow warning icon appears when the selected device isn't whitelisted
                 # in the topic's webproxy.
                 ig.TableNextColumn()
-                tm_names = sort!(get(client.trainmatchers, rule.topic, String[]))
+                tm_names = get(client.trainmatchers, rule.topic, String[])
                 tm_warn = rule.input in tm_names &&
-                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_trainmatchers)
+                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_devices)
 
                 # Reserve space at the right edge of the cell for the warning icon
                 # so the combo doesn't push it out of the column.

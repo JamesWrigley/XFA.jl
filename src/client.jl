@@ -289,6 +289,7 @@ function initialize_engine(state)
             else
                 working_dir
             end
+            client.remote_working_dir = remote_working_dir
             bootstrap_jl = joinpath(remote_working_dir, "bootstrap.jl")
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
@@ -1043,25 +1044,19 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.available_variables = msg.variables
         end
 
-    elseif msg isa AvailableTrainmatchers
+    elseif msg isa AvailableDevices
         trainmatchers = Dict{String, Vector{String}}()
-        whitelisted = Set{KaraboDevice}()
-        for (topic, ms) in msg.topic_trainmatchers
-            names = String[]
-            for (name, in_whitelist) in ms
-                push!(names, name)
-                if in_whitelist
-                    push!(whitelisted, KaraboDevice(topic, name))
-                end
+        for device in msg.devices
+            if device.class_id == "TrainMatcher"
+                push!(get!(Vector{String}, trainmatchers, device.topic), device.name)
             end
-            trainmatchers[topic] = names
         end
+        foreach(sort!, values(trainmatchers))
+
+        client.device_list = build_source_list(msg.devices)
         client.trainmatchers = trainmatchers
-        client.trainmatcher_sources = build_source_list(
-            [SourceInfo(topic, name, "TrainMatcher")
-             for (topic, names) in trainmatchers for name in names])
-        client.whitelisted_trainmatchers = whitelisted
-        client.trainmatchers_request_status = RequestStatus_Idle
+        client.whitelisted_devices = msg.whitelisted
+        client.devices_request_status = RequestStatus_Idle
 
     elseif msg isa RoutingRules
         client.routing_rules = msg.rules
@@ -1086,6 +1081,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
             client.context.source = msg.source
+            client.context.input_topics = msg.info["input_topics"]
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
             # The new context has its own inputs, so the sources we complete
@@ -1222,10 +1218,11 @@ function handle_server(state)
                 client.client_id = id
 
                 client.status = RemoteStatus_Connected
+                @guiasync check_context_path(client)
                 send(client, GetPackageDirs())
                 get_input_sources(client)
                 get_available_variables(client)
-                get_trainmatchers(client)
+                get_devices(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
 
@@ -1304,9 +1301,9 @@ function get_available_variables(client)
     send(client, GetVariables())
 end
 
-function get_trainmatchers(client)
-    send(client, GetTrainmatchers())
-    client.trainmatchers_request_status = RequestStatus_Waiting
+function get_devices(client)
+    send(client, GetDevices())
+    client.devices_request_status = RequestStatus_Waiting
 end
 
 function get_routing_rules(client)

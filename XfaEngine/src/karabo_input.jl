@@ -6,7 +6,8 @@
 
 @Group mutable struct KaraboInput
     manual_configuration::Parameter{Bool} = Parameter(false)
-    trainmatcher::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true)
+    trainmatcher::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true, filter_topics=false,
+                                                                    filter_device_classes=["TrainMatcher"])
     address::Parameter{String} = Parameter("")
 
     offline::Parameter{Bool} = Parameter{Bool}(; value=false, update_handler=run_changed)
