@@ -505,6 +505,26 @@ end
         @Variable my_scan -> XfaContext.scan(x -> karabo"C/D.prop", y -> foo, z -> foo.mean)
         """
 
+        # Without an origin the variable is defined as a function returning its dependency
+        @test add(variable_spec(""), "camera"; deps=Context.OrderedDict("data" => karabo"CAM/DET:output[data.image]")) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable function camera(data -> karabo"CAM/DET:output[data.image]")
+            data
+        end
+        """
+
+        # Sources without a topic get one, the rest are left alone
+        @test XFA.add_karabo_topics("""
+        @Variable foo -> karabo"A/B.prop"
+        @Variable bar -> karabo"SA2//C:out[d]"
+        g = Group(; s=karabo"D/E.prop")
+        """, "SA1") == """
+        @Variable foo -> karabo"SA1//A/B.prop"
+        @Variable bar -> karabo"SA2//C:out[d]"
+        g = Group(; s=karabo"SA1//D/E.prop")
+        """
+
         # Unwired and group deps are left off, so a bare reference is emitted
         deps = Context.OrderedDict("x" => Dependency(""),
                                    "group" => Context.group_dependency(Context.RectROI))
@@ -628,10 +648,11 @@ end
                    SI("SA2", "MID_DET/CAM/1", true)]
 
     # A device is inserted bare when its name is unique, and topic-qualified
-    # when the same name exists under more than one topic.
-    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
-    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
-    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
+    # when asked to or when the same name exists under more than one topic.
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false), false) == "MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false), true) == "MID//MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true), false) == "MID//MID_DET/CAM/1"
+    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true), false) == "SA2//MID_DET/CAM/1"
 
     # A "TOPIC//" prefix splits off as the fixed topic, leaving the fuzzy query
     @test XFA.split_topic("MID//DET") == ("MID", "DET")

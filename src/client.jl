@@ -1430,6 +1430,67 @@ function karabo_property_valid(client::ClientState, source::AbstractString, prop
     return false
 end
 
+# Resolve the context path the same way the engine does, relative to its
+# working directory.
+function resolve_context_path(client)
+    path = client.context_path
+    if client.embedded_engine
+        abspath(expanduser(path))
+    elseif path == "~" || startswith(path, "~/")
+        homedir(client.sftp) * path[2:end]
+    else
+        joinpath(client.remote_working_dir, path)
+    end
+end
+
+function check_context_path(client)
+    path = client.context_path
+    valid = if isempty(path)
+        false
+    elseif client.embedded_engine
+        isfile(resolve_context_path(client))
+    else
+        isfile(resolve_context_path(client), client.sftp)
+    end
+
+    # The path may have been edited again while we were checking
+    if path == client.context_path
+        client.context_path_valid = valid
+    end
+end
+
+# Write the default context to the context path, or to context.jl in the
+# engine working directory if no path is set.
+function initialize_context_file(client)
+    path = resolve_context_path(client)
+
+    if isempty(client.context_path)
+        path = joinpath(path, "context.jl")
+        client.context_path = path
+    end
+
+    code = read(joinpath(@__DIR__, "default_context.jl"))
+    if client.embedded_engine
+        if isfile(path)
+            @warn "Not overwriting existing context file" path
+        else
+            mkpath(dirname(path))
+            write(path, code)
+        end
+    else
+        if isfile(path, client.sftp)
+            @warn "Not overwriting existing context file" path
+        else
+            mkpath(dirname(path), client.sftp)
+            open(path, client.sftp; write=true) do f
+                write(f, code)
+            end
+        end
+    end
+
+    check_context_path(client)
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))

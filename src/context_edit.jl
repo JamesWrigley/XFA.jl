@@ -70,7 +70,7 @@ end
 # the current source and returns the modified source (or the same source if
 # nothing changed). On change, writes the result to the context file and either
 # reloads the context or just updates the in-memory source.
-function apply_source_edit(state, transform; reload::Bool=true)
+function apply_source_edit(transform, state; reload::Bool=true)
     client = state.client
     source = client.context.source
 
@@ -100,7 +100,7 @@ function apply_source_edit(state, transform; reload::Bool=true)
 end
 
 rename_variable(state, old_name::String, new_name::String) =
-    apply_source_edit(state, s -> replace_variable_name(s, old_name, new_name))
+    apply_source_edit(s -> replace_variable_name(s, old_name, new_name), state)
 
 """
 Find all descendant nodes matching a predicate.
@@ -457,15 +457,21 @@ end
 
 # Source for a new variable: a @Variable reference to the origin function, with
 # each wired dependency passed as an override. Group deps are skipped since the
-# origin's own definition supplies them.
+# origin's own definition supplies them. A spec without an origin (e.g. the
+# GUI's Karabo property entry) becomes a function returning its dependency.
 function variable_source(spec::VariableSpec, name::String, dep_values)
-    overrides = ["$(arg) -> $(dep_to_source(dep))" for (arg, dep) in dep_values
-                 if dep.kind != DepKind_Group && !isempty(dep.name)]
-
-    if isempty(overrides)
-        "@Variable $(name) -> $(spec.origin)"
+    if isempty(spec.origin)
+        arg, dep = only(dep_values)
+        "@Variable function $(name)($(arg) -> $(dep_to_source(dep)))\n    $(arg)\nend"
     else
-        "@Variable $(name) -> $(spec.origin)($(join(overrides, ", ")))"
+        overrides = ["$(arg) -> $(dep_to_source(dep))" for (arg, dep) in dep_values
+                     if dep.kind != DepKind_Group && !isempty(dep.name)]
+
+        if isempty(overrides)
+            "@Variable $(name) -> $(spec.origin)"
+        else
+            "@Variable $(name) -> $(spec.origin)($(join(overrides, ", ")))"
+        end
     end
 end
 
@@ -499,6 +505,31 @@ function group_source(spec::VariableSpec, name::String, dep_values, param_values
     else
         "$(name) = $(spec.origin)(; $(join(kwargs, ", ")))"
     end
+end
+
+# Prefix `topic//` to every karabo"..." source that doesn't set a topic.
+function add_karabo_topics(source::String, topic::String)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    strings = find_nodes(tree) do node
+        if kind(node) == K"macrocall"
+            name = children(node)[1]
+            string(kind(name)) == "StrMacroName" && name.val == :karabo
+        else
+            false
+        end
+    end
+
+    # Insert in reverse byte order to preserve offsets
+    sort!(strings; by=n -> first(byte_range(n)), rev=true)
+    for node in strings
+        br = byte_range(children(node)[2])
+        content = source[first(br)+1:last(br)-1]
+        if isempty(first(split_topic(content)))
+            source = source[1:first(br)] * "$(topic)//" * source[first(br)+1:end]
+        end
+    end
+
+    return source
 end
 
 # Append a definition for a new variable/group/input built from `spec` to the
@@ -545,12 +576,12 @@ function remove_variable_source(source::String, name::String)
 end
 
 set_group_param(state, var_name::AbstractString, kwarg_name::AbstractString, new_value::AbstractString; reload::Bool=true) =
-    apply_source_edit(state, s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value);
+    apply_source_edit(s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value), state;
                       reload)
 
 set_parameter_value(state, var_name::String, new_value::String; reload::Bool=true) =
-    apply_source_edit(state, s -> replace_parameter_value(s, var_name, new_value); reload)
+    apply_source_edit(s -> replace_parameter_value(s, var_name, new_value), state; reload)
 
 # Replace a dependency (Karabo or variable) in the source code and reload.
 rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency) =
-    apply_source_edit(state, s -> replace_dep(s, variable_name, arg_name, new_dep))
+    apply_source_edit(s -> replace_dep(s, variable_name, arg_name, new_dep), state)

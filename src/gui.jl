@@ -18,7 +18,7 @@ using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
+    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
@@ -661,8 +661,20 @@ end
 # triggers clears the pending nodes, and the committed node comes back through
 # the normal ContextInfo path.
 function commit_pending_node(state, pending)
-    apply_source_edit(state, source -> add_variable_source(source, pending.spec, pending.name,
-                                                          pending.dep_values, pending.param_values))
+    # Once there's a second input, pin the existing sources to the first one's topic
+    topics = state.client.context.input_topics
+    topic = if pending.spec.kind == VariableKind_Input && length(topics) == 1
+        only(values(topics))
+    else
+        nothing
+    end
+
+    apply_source_edit(state) do source
+        if !isnothing(topic)
+            source = add_karabo_topics(source, topic)
+        end
+        add_variable_source(source, pending.spec, pending.name, pending.dep_values, pending.param_values)
+    end
 end
 
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
@@ -1316,6 +1328,11 @@ function draw_dag()
         end
     end
     if ig.BeginPopup("add_variable_popup")
+        if ig.Selectable("Karabo property ($(VariableKind_Variable))")
+            add_pending_node!(client, VariableSpec("karabo_property", VariableKind_Variable, "",
+                                                   OrderedDict("data" => Dependency(; kind=DepKind_Karabo, name="")),
+                                                   String[], String[], OrderedDict{Symbol, Parameter}()))
+        end
         for spec in client.available_variables
             if ig.Selectable("$(spec.name) ($(spec.kind))")
                 add_pending_node!(client, spec)
@@ -2064,13 +2081,24 @@ function draw_gui()
                                                          current_text=default(client.context_path))
                 if edited
                     client.context_path = new_context_path
+                    @guiasync check_context_path(client)
                 end
 
                 if !client.context_path_valid
-                    ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
+                    if !isempty(client.context_path)
+                        ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
+                        ig.SameLine()
+                    end
+                    ig.Text("(would you like to")
+                    ig.SameLine()
+                    if ig.SmallButton("initialize a context file")
+                        @guiasync initialize_context_file(client)
+                    end
+                    ig.SameLine(0, 0)
+                    ig.Text("?)")
                 end
 
-                ig.Dummy(0, 10)
+                ig.Dummy(0, 30)
 
                 draw_routing_rules()
             end

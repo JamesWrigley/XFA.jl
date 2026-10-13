@@ -677,17 +677,12 @@ strip_channel(s) = (i = findfirst(':', s); isnothing(i) ? s : s[1:i-1])
 # source names a slow device.
 source_channel(s) = (i = findfirst(':', s); isnothing(i) ? "" : s[i+1:end])
 
-# Resolve the (topic, device) schema key for a source string, honouring an
-# explicit "topic//" prefix and otherwise looking the device up in the source
-# list. Returns nothing if the device isn't known.
+# The (topic, device) schema key for a source string, or nothing if the device
+# isn't in the source list.
 function source_key(client, source)
     topic, device = split_topic(strip_channel(source))
-    if isempty(topic)
-        idx = findfirst(s -> s.name == device, client.source_list)
-        isnothing(idx) ? nothing : (client.source_list[idx].topic, device)
-    else
-        (topic, device)
-    end
+    idx = findfirst(s -> s.name == device && (isempty(topic) || s.topic == topic), client.source_list)
+    isnothing(idx) ? nothing : (client.source_list[idx].topic, device)
 end
 
 # DeviceProperties for a source, honouring an explicit "topic//" prefix so the
@@ -1084,8 +1079,9 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
     end
 end
 
-# The source string for a device, topic-qualified when its name is ambiguous.
-source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
+# The source string for a device, topic-qualified when asked to or when its name
+# is ambiguous.
+source_base(dev::SourceInfo, qualify::Bool) = qualify || dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
 
 # Draw the source completion popup: a fuzzy-matched device list on the left, and
 # the selected device's pipeline channels in a column on the right (menu style,
@@ -1095,10 +1091,18 @@ source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev
 # bare devices: no channel column, no schema fetches. Returns (selected, hovered).
 function draw_source_completions(popup_id, field_state::ElidedTextState, text::AbstractString,
                                  source_list::Vector{SourceInfo}, allow_slow::Bool,
-                                 client::ClientState; device_only::Bool=false)
+                                 client::ClientState; device_only::Bool=false,
+                                 device_classes::Vector{String}=String[], qualify_topics::Bool=false)
     topic_fixed, query = split_topic(strip_channel(text))
-    sources = isempty(topic_fixed) ? source_list :
-              filter(s -> s.topic == topic_fixed, source_list)
+    # Keep a topic the user typed
+    qualify = qualify_topics || !isempty(topic_fixed)
+    sources = if isempty(topic_fixed) && isempty(device_classes)
+        source_list
+    else
+        filter(source_list) do s
+            (isempty(topic_fixed) || s.topic == topic_fixed) && (isempty(device_classes) || s.class_id in device_classes)
+        end
+    end
 
     now = ig.GetTime()
     if text != field_state.last_query
@@ -1229,7 +1233,7 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
                 end
                 if picked
                     if allow_slow
-                        result = source_base(dev)
+                        result = source_base(dev, qualify)
                     elseif has_channels
                         field_state.channel_idx = 1
                     end
@@ -1266,7 +1270,7 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
                         picked = true
                     end
                     if picked
-                        result = "$(source_base(selected_dev)):$(ch)"
+                        result = "$(source_base(selected_dev, qualify)):$(ch)"
                     end
                     if ig.IsItemHovered()
                         field_state.channel_idx = ci
@@ -1427,9 +1431,11 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
     if dep_state.is_karabo
         text = dep.kind == DepKind_Karabo ? string(dep) : ""
         focus &= isempty(text)
+        # With several inputs the topic decides which one serves the dependency
         edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
                                          source_list, client;
-                                         device_only, focus)
+                                         device_only, focus,
+                                         qualify_topics=length(client.sources_by_input) > 1)
         if edited
             return true, karabo_dependency(new_text)
         end
