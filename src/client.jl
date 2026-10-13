@@ -1226,29 +1226,43 @@ function handle_server(state)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
 
-                for msg_bytes in ws
-                    buffer = IOBuffer(msg_bytes)
-                    envelope::Envelope = deserialize(buffer)
+                # The SFTP session is otherwise idle for long stretches, which
+                # lets something on the network drop the connection.
+                sftp_keepalive = if client.embedded_engine
+                    nothing
+                else
+                    Timer(_ -> ispath(".", client.sftp), 60; interval=60)
+                end
 
-                    replied_to = if !isnothing(envelope.reply_to)
-                        pop!(client.pending_requests, envelope.reply_to, nothing)
-                    else
-                        nothing
-                    end
+                try
+                    for msg_bytes in ws
+                        buffer = IOBuffer(msg_bytes)
+                        envelope::Envelope = deserialize(buffer)
 
-                    callback = if !isnothing(envelope.reply_to)
-                        pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
-                    else
-                        nothing
-                    end
-
-                    try
-                        @invokelatest handle_msg(state, envelope.msg, replied_to)
-                        if !isnothing(callback)
-                            @invokelatest callback(envelope.msg)
+                        replied_to = if !isnothing(envelope.reply_to)
+                            pop!(client.pending_requests, envelope.reply_to, nothing)
+                        else
+                            nothing
                         end
-                    catch ex
-                        @error "Error handling message!" exception=(ex, catch_backtrace())
+
+                        callback = if !isnothing(envelope.reply_to)
+                            pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
+                        else
+                            nothing
+                        end
+
+                        try
+                            @invokelatest handle_msg(state, envelope.msg, replied_to)
+                            if !isnothing(callback)
+                                @invokelatest callback(envelope.msg)
+                            end
+                        catch ex
+                            @error "Error handling message!" exception=(ex, catch_backtrace())
+                        end
+                    end
+                finally
+                    if !isnothing(sftp_keepalive)
+                        close(sftp_keepalive)
                     end
                 end
 
