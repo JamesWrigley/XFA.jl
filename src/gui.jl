@@ -159,25 +159,17 @@ function node_tooltip(text)
     ig.PopClipRect(draw_list)
 end
 
-# Node names in front-to-back order so the top node under the mouse wins input on
-# overlapping widgets: ImGui gives the first-submitted overlapping item the click,
-# and the editor keeps the active/selected node last in its order. New nodes the
-# editor hasn't seen yet are appended.
-function node_draw_order(ctx_state)
-    id_to_name = Dict{UInt, String}(UInt(var_data["id"]) => name for (name, var_data) in ctx_state)
-    ordered = String[]
-    for id in Iterators.reverse(ne.GetOrderedNodeIds())
-        name = get(id_to_name, id.value, nothing)
-        if !isnothing(name)
-            push!(ordered, name)
-        end
+# The topmost node under the mouse (in canvas coordinates inside the editor).
+# `node_order` is the editor's back-to-front order from the last frame.
+# ne.GetHoveredNode() isn't used since it's empty while an item is active.
+function node_under_mouse(node_order)
+    mouse = ig.GetMousePos()
+    idx = findlast(node_order) do id
+        pos = ne.GetNodePosition(id)
+        size = ne.GetNodeSize(id)
+        pos.x <= mouse.x < pos.x + size.x && pos.y <= mouse.y < pos.y + size.y
     end
-    for name in keys(ctx_state)
-        if !(name in ordered)
-            push!(ordered, name)
-        end
-    end
-    return ordered
+    return isnothing(idx) ? ne.NodeId(0) : node_order[idx]
 end
 
 ## Helper functions for the GUI
@@ -694,6 +686,16 @@ function draw_variable(name, var_data)
     handle = ne.NodeId(var_data["id"])
     ne.BeginNode(handle)
 
+    # Disable nodes behind the front one so clicks don't go through the front
+    # node, without dimming them.
+    occluded = client.ne_front_node != ne.NodeId(0) && client.ne_front_node != handle
+    if occluded
+        hovered_id = unsafe_load(ig.GetCurrentContext().HoveredId)
+        ig.PushStyleVar(ig.ImGuiStyleVar_DisabledAlpha, 1f0)
+        ig.BeginDisabled()
+        ig.PopStyleVar()
+    end
+
     # Right-align the output/postprocessor pins to the widest left-anchored row.
     # `content_measured` accumulates each row's width (via origin-independent
     # GetItemRectSize) this frame; `content_width` reuses last frame's value to
@@ -986,6 +988,14 @@ function draw_variable(name, var_data)
     # would feed the imposed width back and re-introduce the ratchet.
     client.ne_node_content_widths[var_data["id"]] = content_measured
 
+    if occluded
+        ig.EndDisabled()
+        # Disabled items still claim the hover, which would block the front
+        # node's drag area (submitted in ne.End()).
+        if unsafe_load(ig.GetCurrentContext().HoveredId) != hovered_id
+            ig.SetHoveredID(hovered_id)
+        end
+    end
     ne.EndNode()
 
     # Dark blue header background behind the title (following builders.cpp
@@ -1365,8 +1375,13 @@ function draw_dag()
         magnification = ne.current_scale()
         ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
 
-        for name in node_draw_order(ctx_state)
-            var_data = ctx_state[name]
+        # Keep the front node from before a click or edit started, so the node
+        # being interacted with isn't disabled partway through.
+        if !ig.IsAnyMouseDown() && !ig.IsAnyItemActive()
+            client.ne_front_node = ig.IsWindowHovered() ? node_under_mouse(client.ne_node_order) : ne.NodeId(0)
+        end
+
+        for (name, var_data) in ctx_state
             ig.PushID(name)
 
             draw_variable(name, var_data)
@@ -1404,6 +1419,9 @@ function draw_dag()
                 pending.centered = true
             end
         end
+
+        # Only submitted nodes are reported, so this has to wait until after drawing
+        ne.GetOrderedNodeIds!(client.ne_node_order)
 
         # The dep-kind and CopyableCombo dropdowns are drawn here, after all nodes,
         # under Suspend/Resume so they escape the node canvas and position in screen
