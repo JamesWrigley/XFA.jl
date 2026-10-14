@@ -1252,7 +1252,11 @@ end
     @testset "Topological sort" begin
         # Test sorting a DAG with a cycle
         dag = Dict("foo" => ["bar"], "bar" => ["foo"])
-        @test_throws XfaContextException Context.topological_sort(dag)
+        @test_throws r"cycle" Context.topological_sort(dag)
+
+        # Unknown dependencies are reported as such rather than as a cycle
+        dag = Dict("foo" => [Dependency("bar")])
+        @test_throws r"'foo' depends on unknown variable 'bar'" Context.topological_sort(dag)
 
         # Sort an empty DAG
         @test Context.topological_sort(Dict("foo" => [])) == ["foo"]

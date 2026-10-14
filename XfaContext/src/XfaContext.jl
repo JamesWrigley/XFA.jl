@@ -566,6 +566,14 @@ function topological_sort(dag)
                               if !(x isa Dependency && x.kind ∈ (DepKind_Karabo, DepKind_Group)) && !(x isa Parameter)]
     end
 
+    for (name, deps) in internal_dag
+        for dep in deps
+            if !haskey(internal_dag, dep)
+                throw(XfaContextException("Variable '$(name)' depends on unknown variable '$(dep)'"))
+            end
+        end
+    end
+
     sorted_graph = String[]
     working_set = Set([name for (name, deps) in internal_dag if isempty(deps)])
 
