@@ -336,6 +336,16 @@ end
         end
         """
 
+        # Dependency("...") strings are renamed, including subvariable references
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        my_group = MyGroup(; x=Dependency("foo"), y=Dependency("foo.mean"), z=Dependency("foobar"))
+        """
+        @test XFA.replace_variable_name(source, "foo", "baz") == """
+        @Variable baz -> karabo"A/B.prop"
+        my_group = MyGroup(; x=Dependency("baz"), y=Dependency("baz.mean"), z=Dependency("foobar"))
+        """
+
         # Unknown names still warn and change nothing
         @test_logs (:warn, r"No occurrences") begin
             @test XFA.replace_variable_name(source, "nonexistent", "baz") == source

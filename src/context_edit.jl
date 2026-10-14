@@ -37,18 +37,37 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
         end
     end
 
-    targets = SyntaxNode[]
+    targets = UnitRange{Int}[]
     for vm in variable_macros
-        append!(targets, find_nodes(vm) do node
+        append!(targets, byte_range.(find_nodes(vm) do node
             is_leaf(node) && kind(node) == K"Identifier" && node.val == Symbol(old_name)
-        end)
+        end))
     end
 
     # Groups and inputs are defined by assignment, so they have no @Variable to
     # rename; the references above still cover uses inside other variables.
     assign_node = find_assignment_call(tree, old_name)
     if !isnothing(assign_node)
-        push!(targets, children(assign_node)[1])
+        push!(targets, byte_range(children(assign_node)[1]))
+    end
+
+    # Dependency("old_name") or Dependency("old_name.sub") references, e.g. in
+    # group constructor kwargs. Only the old_name prefix of the string is replaced.
+    dep_strings = find_nodes(tree) do node
+        if kind(node) == K"call" && length(children(node)) == 2
+            func, arg = children(node)
+            if kind(func) == K"Identifier" && func.val == :Dependency &&
+                    kind(arg) == K"string" && length(children(arg)) == 1
+                str = children(arg)[1]
+                return kind(str) == K"String" &&
+                    (str.val == old_name || startswith(str.val, old_name * "."))
+            end
+        end
+        return false
+    end
+    for node in dep_strings
+        start = first(byte_range(children(children(node)[2])[1]))
+        push!(targets, start:start + ncodeunits(old_name) - 1)
     end
 
     if isempty(targets)
@@ -57,9 +76,8 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
     end
 
     # Replace in reverse byte order to preserve offsets
-    sort!(targets; by=n -> first(byte_range(n)), rev=true)
-    for node in targets
-        br = byte_range(node)
+    sort!(targets; by=first, rev=true)
+    for br in targets
         source = source[1:first(br)-1] * new_name * source[last(br)+1:end]
     end
 
