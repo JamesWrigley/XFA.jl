@@ -105,8 +105,10 @@ function apply_source_edit(transform, state; reload::Bool=true)
     if client.embedded_engine
         write(client.context_path, new_source)
     else
-        open(client.context_path, client.sftp; write=true) do f
-            write(f, new_source)
+        with_sftp(client) do sftp
+            open(client.context_path, sftp; write=true) do f
+                write(f, new_source)
+            end
         end
     end
 

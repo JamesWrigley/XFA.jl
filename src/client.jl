@@ -85,8 +85,7 @@ end
 # quieter than the first, which GUI/engine work lands on.
 ssh_pin_tid() = first(Threads.threadpooltids(:default))
 
-function ssh_initialize_hop(state, hop_idx, user)
-    client = state.client
+function ssh_open_session(client::ClientState, hop_idx, user)
     ssh_state = client.ssh_hops[hop_idx]
     forwarder_idx = findlast(x -> !isnothing(x.forwarder), client.ssh_hops)
 
@@ -99,13 +98,69 @@ function ssh_initialize_hop(state, hop_idx, user)
         # Reset the host so that GSSAPI auth works
         session.host = ssh_state.address
 
-        ssh_state.session = session
+        return session
     else
-        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port;
-                                        user, pin_tid=ssh_pin_tid())
+        return ssh.Session(ssh_state.address, ssh_state.port;
+                           user, pin_tid=ssh_pin_tid())
     end
+end
+
+function ssh_initialize_hop(state, hop_idx, user)
+    client = state.client
+    client.ssh_hops[hop_idx].session = ssh_open_session(client, hop_idx, user)
 
     ssh_authenticate_hop(state, hop_idx)
+end
+
+# Authenticate with GSSAPI, or `password` if the server asks for one and it's
+# been entered already.
+function ssh_authenticate_noninteractive(session, password)
+    status = ssh.authenticate(session; throw=false)
+    if status == ssh.AuthMethod_Password && !isempty(password)
+        status = ssh.authenticate(session; password, throw=false)
+    end
+
+    return status
+end
+
+# Replace a dropped SFTP session. The SFTP hop is behind the bastion's 2FA so it
+# only ever needs GSSAPI or the password the user already entered.
+function reconnect_sftp(client::ClientState)
+    hop_idx = lastindex(client.ssh_hops) - 1
+    ssh_state = client.ssh_hops[hop_idx]
+    user = ssh_state.session.user
+    close(ssh_state.session)
+
+    session = ssh_open_session(client, hop_idx, user)
+    ssh_state.session = session
+    status = ssh_authenticate_noninteractive(session, ssh_state.password[])
+    if status != ssh.AuthStatus_Success
+        error("Couldn't re-authenticate the SFTP session to $(ssh_state.address): $(status)")
+    end
+
+    client.sftp = ssh.SftpSession(session)
+    @info "Reconnected the SFTP session to $(ssh_state.address)"
+end
+
+# Call `f(sftp)`, reconnecting and retrying once if the SFTP connection has
+# dropped.
+function with_sftp(f, client::ClientState)
+    @lock client.ssh_hops[end - 1] begin
+        if !ssh.isconnected(client.sftp.session)
+            reconnect_sftp(client)
+        end
+
+        try
+            return f(client.sftp)
+        catch
+            if ssh.isconnected(client.sftp.session)
+                rethrow()
+            end
+        end
+
+        reconnect_sftp(client)
+        return f(client.sftp)
+    end
 end
 
 function ssh_fully_authenticated(client::ClientState)
@@ -121,7 +176,10 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
 
     ssh_state.auth_state = :authenticating
 
-    new_auth_state = if auth_method == ssh.AuthMethod_Password
+    new_auth_state = if hop_idx == lastindex(client.ssh_hops) && isnothing(auth_method)
+        # The last hop is the same host as the SFTP hop, so reuse its credentials
+        ssh_authenticate_noninteractive(session, client.ssh_hops[end - 1].password[])
+    elseif auth_method == ssh.AuthMethod_Password
         ssh.authenticate(session; password=ssh_state.password[], throw=false)
     elseif auth_method == ssh.AuthMethod_Interactive
         kbdint_answers = [prompt.answer for prompt in ssh_state.kbdint_prompts]
@@ -244,8 +302,10 @@ function sync_files()
                 # This to avoid the file getting truncated by `open(; write=true)`
                 # if we're SSH'ing locally.
                 data = read(local_path)
-                open(joinpath(remote_dir, path), client.sftp; write=true) do f
-                    write(f, data)
+                with_sftp(client) do sftp
+                    open(joinpath(remote_dir, path), sftp; write=true) do f
+                        write(f, data)
+                    end
                 end
                 synced += 1
             end
@@ -1226,43 +1286,29 @@ function handle_server(state)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
 
-                # The SFTP session is otherwise idle for long stretches, which
-                # lets something on the network drop the connection.
-                sftp_keepalive = if client.embedded_engine
-                    nothing
-                else
-                    Timer(_ -> ispath(".", client.sftp), 60; interval=60)
-                end
+                for msg_bytes in ws
+                    buffer = IOBuffer(msg_bytes)
+                    envelope::Envelope = deserialize(buffer)
 
-                try
-                    for msg_bytes in ws
-                        buffer = IOBuffer(msg_bytes)
-                        envelope::Envelope = deserialize(buffer)
-
-                        replied_to = if !isnothing(envelope.reply_to)
-                            pop!(client.pending_requests, envelope.reply_to, nothing)
-                        else
-                            nothing
-                        end
-
-                        callback = if !isnothing(envelope.reply_to)
-                            pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
-                        else
-                            nothing
-                        end
-
-                        try
-                            @invokelatest handle_msg(state, envelope.msg, replied_to)
-                            if !isnothing(callback)
-                                @invokelatest callback(envelope.msg)
-                            end
-                        catch ex
-                            @error "Error handling message!" exception=(ex, catch_backtrace())
-                        end
+                    replied_to = if !isnothing(envelope.reply_to)
+                        pop!(client.pending_requests, envelope.reply_to, nothing)
+                    else
+                        nothing
                     end
-                finally
-                    if !isnothing(sftp_keepalive)
-                        close(sftp_keepalive)
+
+                    callback = if !isnothing(envelope.reply_to)
+                        pop!(client.engine_request_callbacks, envelope.reply_to, nothing)
+                    else
+                        nothing
+                    end
+
+                    try
+                        @invokelatest handle_msg(state, envelope.msg, replied_to)
+                        if !isnothing(callback)
+                            @invokelatest callback(envelope.msg)
+                        end
+                    catch ex
+                        @error "Error handling message!" exception=(ex, catch_backtrace())
                     end
                 end
 
@@ -1451,7 +1497,7 @@ function resolve_context_path(client)
     if client.embedded_engine
         abspath(expanduser(path))
     elseif path == "~" || startswith(path, "~/")
-        homedir(client.sftp) * path[2:end]
+        with_sftp(homedir, client) * path[2:end]
     else
         joinpath(client.remote_working_dir, path)
     end
@@ -1464,7 +1510,8 @@ function check_context_path(client)
     elseif client.embedded_engine
         isfile(resolve_context_path(client))
     else
-        isfile(resolve_context_path(client), client.sftp)
+        resolved = resolve_context_path(client)
+        with_sftp(sftp -> isfile(resolved, sftp), client)
     end
 
     # The path may have been edited again while we were checking
@@ -1492,12 +1539,14 @@ function initialize_context_file(client)
             write(path, code)
         end
     else
-        if isfile(path, client.sftp)
-            @warn "Not overwriting existing context file" path
-        else
-            mkpath(dirname(path), client.sftp)
-            open(path, client.sftp; write=true) do f
-                write(f, code)
+        with_sftp(client) do sftp
+            if isfile(path, sftp)
+                @warn "Not overwriting existing context file" path
+            else
+                mkpath(dirname(path), sftp)
+                open(path, sftp; write=true) do f
+                    write(f, code)
+                end
             end
         end
     end
