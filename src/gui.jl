@@ -37,6 +37,8 @@ using Sockets: Sockets
 using CRC32c: crc32c
 using LibGit2: LibGit2
 using Sentry: Sentry
+using LoggingExtras: TeeLogger
+using Base.Filesystem: Filesystem, JL_O_WRONLY, JL_O_CREAT, JL_O_APPEND
 using XfaContext: XfaContext
 using Serialization
 using XfaEngine.Protocol
@@ -2252,7 +2254,11 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
         ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
     end
 
-    Base.CoreLogging.global_logger(Base.CoreLogging.ConsoleLogger(; meta_formatter=timestamped_metafmt))
+    # Append the logs to gui.log
+    mkpath(config_dir())
+    log_file = Filesystem.open(joinpath(config_dir(), "gui.log"), JL_O_WRONLY | JL_O_CREAT | JL_O_APPEND, 0o644)
+    Base.CoreLogging.global_logger(TeeLogger(Base.CoreLogging.ConsoleLogger(; meta_formatter=timestamped_metafmt),
+                                             Base.CoreLogging.ConsoleLogger(log_file; meta_formatter=timestamped_metafmt)))
 
     settings = load_settings()
     setup_sentry(settings)

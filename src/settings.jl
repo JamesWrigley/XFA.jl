@@ -1,7 +1,6 @@
-function settings_path()
-    config_dir = get(ENV, "XFA_CONFIG_DIR", joinpath(homedir(), ".xfa"))
-    joinpath(config_dir, "settings.toml")
-end
+config_dir() = get(ENV, "XFA_CONFIG_DIR", joinpath(homedir(), ".xfa"))
+
+settings_path() = joinpath(config_dir(), "settings.toml")
 
 # Settings are saved from both the GUI thread and client tasks
 const SETTINGS_LOCK = ReentrantLock()
