@@ -1288,17 +1288,25 @@ function draw_dag()
 
     ig.Dummy(0, 10)
     @Disabled isempty(ctx_state) || context.pipeline_status != PipelineStatus_Stopped begin
+        ig.PushStyleColor(ig.ImGuiCol_Button, ig.ImVec4(0.15, 0.55, 0.2, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ig.ImVec4(0.2, 0.7, 0.25, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonActive, ig.ImVec4(0.1, 0.45, 0.15, 1))
         if ig.Button(" Start ")
             start(state[])
         end
+        ig.PopStyleColor(3)
     end
 
     ig.SameLine()
 
     @Disabled context.pipeline_status != PipelineStatus_Started begin
+        ig.PushStyleColor(ig.ImGuiCol_Button, ig.ImVec4(0.65, 0.15, 0.15, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ig.ImVec4(0.8, 0.2, 0.2, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonActive, ig.ImVec4(0.55, 0.1, 0.1, 1))
         if ig.Button(" Stop ")
             stop(state[])
         end
+        ig.PopStyleColor(3)
     end
 
     ig.SameLine()
