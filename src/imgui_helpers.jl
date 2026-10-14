@@ -381,7 +381,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
         field_state.edit = ElidedEditState_WantEdit
     end
 
-    min_width = ig.CalcTextSize("m").x * 13  # minimum clickable width
+    char_width = ig.CalcTextSize("m").x
+    min_width = char_width * 3  # minimum clickable width
 
     if editable && field_state.edit != ElidedEditState_NoEdit
         just_started = field_state.edit == ElidedEditState_WantEdit
@@ -389,10 +390,13 @@ function ElidedText(label::AbstractString, text::AbstractString;
             ig.SetKeyboardFocusHere()
             field_state.edit = ElidedEditState_Edit
             field_state.selected_idx = 1
+            field_state.edit_text = text
         end
-        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
+        frame_padding = unsafe_load(ig.GetStyle().FramePadding.x)
+        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(field_state.edit_text).x + 2 * frame_padding + char_width))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
                                          callback, user_data, validator)
+        field_state.edit_text = new_text
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
         input_min, input_max = editor_item_rect()
 

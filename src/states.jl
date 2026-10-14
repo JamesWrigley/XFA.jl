@@ -456,6 +456,7 @@ end
 
 @kwdef mutable struct ElidedTextState
     edit::ElidedEditState = ElidedEditState_NoEdit
+    edit_text::String = ""
     selected_idx::Int = 1
     cached_query::String = ""
     cached_source::String = ""
