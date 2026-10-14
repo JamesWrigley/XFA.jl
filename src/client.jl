@@ -5,7 +5,7 @@ const DISPLAY_JUMP = "max-exfl-display003.desy.de"
 function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
     push!(state.client.engine_logs, EngineLog(message, extra_details))
     state.show_engine_logs = true
-    state.select_engine_logs = true
+    state.select_tab = MainTab_EngineLogs
 end
 
 function send(client::ClientState, msg::AbstractMessage)

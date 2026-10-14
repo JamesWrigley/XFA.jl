@@ -28,6 +28,12 @@ end
     PipelineStatus_Stopped
 end
 
+@enum MainTab begin
+    MainTab_Setup
+    MainTab_Pipeline
+    MainTab_EngineLogs
+end
+
 # This enum tracks the original type of the variables. We need to distinguish
 # this from how they're stored because both scalars and vectors are stored as
 # vectors.
@@ -914,7 +920,7 @@ end
     show_debug_log::Bool = false
     show_state_inspector::Bool = false
     show_engine_logs::Bool = false
-    select_engine_logs::Bool = false
+    select_tab::Maybe{MainTab} = nothing
 
     # Connections to remote things
     address::String = "$(Sys.username())@sa2-onc-mid.desy.de"

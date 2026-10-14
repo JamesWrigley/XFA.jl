@@ -215,7 +215,7 @@ function draw_main_menubar()
             @c MenuItem("Debug log", &state[].show_debug_log)
             @c MenuItem("State inspector", &state[].show_state_inspector)
             if @c MenuItem("Engine logs", &state[].show_engine_logs)
-                state[].select_engine_logs = true
+                state[].select_tab = MainTab_EngineLogs
             end
 
             ig.EndMenu()
@@ -1919,6 +1919,16 @@ function update_viewport_cursors()
     filter!(kv -> kv.first in windows, viewport_cursors)
 end
 
+# Consumes a pending state[].select_tab request for `tab`
+function tab_flags(tab::MainTab)
+    if state[].select_tab == tab
+        state[].select_tab = nothing
+        ig.ImGuiTabItemFlags_SetSelected
+    else
+        ig.ImGuiTabItemFlags_None
+    end
+end
+
 function draw_gui()
     # Dock the main window by default
     viewport = ig.igGetMainViewport()
@@ -1943,7 +1953,7 @@ function draw_gui()
         end
 
         ig.BeginTabBar("main-tab-bar")
-        if ig.BeginTabItem("Setup")
+        if ig.BeginTabItem("Setup", C_NULL, tab_flags(MainTab_Setup))
             ig.EndTabItem()
 
             initializing = client.status == RemoteStatus_Initializing
@@ -2118,7 +2128,11 @@ function draw_gui()
                     ig.Text("(would you like to")
                     ig.SameLine()
                     if ig.SmallButton("initialize a context file")
-                        @guiasync initialize_context_file(client)
+                        @guiasync begin
+                            initialize_context_file(client)
+                            load_context(state[])
+                            state[].select_tab = MainTab_Pipeline
+                        end
                     end
                     ig.SameLine(0, 0)
                     ig.Text("?)")
@@ -2131,19 +2145,14 @@ function draw_gui()
         end
 
         @Disabled client.status != RemoteStatus_Connected || isempty(client.context_path) begin
-            if ig.BeginTabItem("Analysis pipeline")
+            if ig.BeginTabItem("Analysis pipeline", C_NULL, tab_flags(MainTab_Pipeline))
                 draw_dag()
                 ig.EndTabItem()
             end
         end
 
         if state[].show_engine_logs
-            engine_log_flags = ig.ImGuiTabItemFlags_None
-            if state[].select_engine_logs
-                engine_log_flags |= ig.ImGuiTabItemFlags_SetSelected
-                state[].select_engine_logs = false
-            end
-            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, engine_log_flags)
+            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, tab_flags(MainTab_EngineLogs))
                 draw_engine_logs()
                 ig.EndTabItem()
             end
