@@ -74,7 +74,7 @@ function invalidate_histogram(corr::Correlation, _)
 end
 
 function compute_edges(samples, nbins)
-    lo, hi = floatmax(), floatmin()
+    lo, hi = Inf, -Inf
     any_seen = false
     for x in samples
         if !isfinite(x)
