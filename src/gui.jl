@@ -1534,6 +1534,49 @@ function draw_dag()
     end
 end
 
+function draw_jump_hops_editor()
+    gui = state[]
+    hops = gui.jump_hops
+    if isnothing(hops)
+        if !gui.detecting_jump_hops
+            gui.detecting_jump_hops = true
+            @guiasync detect_jump_hops(gui)
+        end
+        Spinner("Detecting...")
+        return
+    end
+
+    remove_idx = nothing
+    button_w = ig.GetFrameHeight()
+    for i in eachindex(hops)
+        ig.PushID(i)
+        ig.SetNextItemWidth(-(button_w + unsafe_load(ig.GetStyle().ItemSpacing.x)))
+        _, hops[i] = SafeInputText("##jump-hop"; hint="host", current_text=hops[i])
+        ig.SameLine()
+        if ig.Button("-", ImVec2(button_w, button_w))
+            remove_idx = i
+        end
+        ig.PopID()
+    end
+
+    if !isnothing(remove_idx)
+        deleteat!(hops, remove_idx)
+    end
+
+    if isempty(hops)
+        ig.AlignTextToFramePadding()
+        ig.TextDisabled("None (direct connection)")
+        ig.SameLine()
+    end
+    if ig.Button("Add jump")
+        push!(hops, "")
+    end
+    ig.SameLine()
+    if ig.Button("Reset")
+        gui.jump_hops = nothing
+    end
+end
+
 function draw_ssh_auth()
     client = state[].client
 
@@ -1986,9 +2029,16 @@ function draw_gui()
                     ig.SetNextItemWidth(-1)
                     edited, new_address = SafeInputText("##client"; hint="sa2-onc-mid.desy.de",
                                                         current_text=default(state[].address))
-                    if edited
+                    if edited && new_address != state[].address
                         state[].address = new_address
+                        state[].jump_hops = nothing
                     end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("SSH jumps:")
+                    ig.TableNextColumn()
+                    draw_jump_hops_editor()
 
                     ig.TableNextColumn()
                     ig.AlignTextToFramePadding()
@@ -2030,6 +2080,9 @@ function draw_gui()
             ig.Spacing()
 
             disable_connect = !can_connect || length(state[].address) == 0
+            if !client.embedded_engine && isnothing(state[].jump_hops)
+                disable_connect = true
+            end
             @Disabled disable_connect begin
                 if ig.Button("Connect")
                     client.cmd_output = ""

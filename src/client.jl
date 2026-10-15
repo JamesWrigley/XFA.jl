@@ -47,6 +47,43 @@ function is_directly_reachable(address::AbstractString)
     end
 end
 
+# The jump hosts needed to reach `address` from this machine. Blocks for up to
+# 1s on the reachability check.
+function default_jump_hops(address::AbstractString)
+    address = last(split(address, "@"))
+    hops = String[]
+
+    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
+        local_host = first(split(gethostname(), "."))
+        if startswith(local_host, "max-exfl-display") && local_host != first(split(DISPLAY_JUMP, "."))
+            push!(hops, DISPLAY_JUMP)
+        else
+            push!(hops, BASTION)
+            # Maxwell nodes (max-*) are reachable from bastion, the online cluster
+            # needs the gateway hop too.
+            if !startswith(address, "max-")
+                push!(hops, GATEWAY)
+            end
+        end
+    end
+
+    return hops
+end
+
+function detect_jump_hops(state::GuiState)
+    address = state.address
+    hops = default_jump_hops(address)
+
+    @lock state begin
+        state.detecting_jump_hops = false
+        # Drop the result if the address was edited in the meantime, the GUI
+        # will start a new detection.
+        if state.address == address
+            state.jump_hops = hops
+        end
+    end
+end
+
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
@@ -56,17 +93,9 @@ function ssh_initialize(state::GuiState)
         user, address = split(address, "@")
     end
 
-    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
-        local_host = first(split(gethostname(), "."))
-        if startswith(local_host, "max-exfl-display") && local_host != first(split(DISPLAY_JUMP, "."))
-            push!(client.ssh_hops, SshState(; address=DISPLAY_JUMP))
-        else
-            push!(client.ssh_hops, SshState(; address=BASTION))
-            # Maxwell nodes (max-*) are reachable from bastion, the online cluster
-            # needs the gateway hop too.
-            if !startswith(address, "max-")
-                push!(client.ssh_hops, SshState(; address=GATEWAY))
-            end
+    for hop in state.jump_hops
+        if !isempty(hop)
+            push!(client.ssh_hops, SshState(; address=hop))
         end
     end
 

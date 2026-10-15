@@ -923,6 +923,9 @@ end
 
     # Connections to remote things
     address::String = "$(Sys.username())@sa2-onc-mid.desy.de"
+    # SSH jump hosts in front of `address`, `nothing` until auto-detected
+    jump_hops::Maybe{Vector{String}} = nothing
+    detecting_jump_hops::Bool = false
     client::ClientState = ClientState()
     julia_module::String = "exfel xfa"
     engine_environment::String = ""
