@@ -256,7 +256,6 @@ end
 # The curves of one of a spec's models, resampled when its parameters update.
 @kwdef struct ViewModel
     overlay::ModelOverlay
-    xs::Vector{Float64} = Float64[]
     curves::Vector{PlotType} = PlotType[]
 end
 

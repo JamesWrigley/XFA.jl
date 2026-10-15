@@ -36,7 +36,7 @@ end
 @enum Mark Mark_Line Mark_Point Mark_Bar Mark_Rect
 @enum FieldType FieldType_Quantitative FieldType_Nominal FieldType_Ordinal
 @enum LookupKey LookupKey_TrainId LookupKey_Index
-@enum ModelFunction ModelFunction_Gaussian
+@enum ModelFunction ModelFunction_Gaussian ModelFunction_Linear
 
 # An encoding channel. `field` is a field of the layer's variable: a dim by name
 # or position (`index`, or `row`/`col`), `value`, or `trainId` for a scalar
@@ -78,21 +78,30 @@ struct RoiParam
 end
 
 # A model curve drawn over the spec's layers, its parameters read from dataset
-# `params`.
+# `params`. It's drawn across the x extent of the layers, which
+# `to_x_intercept` widens to reach where a linear model crosses y = 0.
 struct ModelOverlay
     func::ModelFunction
     params::String
     title::Union{String, Nothing}
+    to_x_intercept::Bool
+
+    function ModelOverlay(func, params, title, to_x_intercept)
+        if to_x_intercept && func != ModelFunction_Linear
+            throw(ArgumentError("to_x_intercept is only supported for linear models"))
+        end
+        new(func, params, title, to_x_intercept)
+    end
 end
 
-# Sugar: the model function by name (:gaussian).
+# Sugar: the model function by name (:gaussian or :linear).
 function ModelOverlay(func::Symbol; params::AbstractString,
-                      title::Union{AbstractString, Nothing}=nothing)
-    functions = (gaussian=ModelFunction_Gaussian,)
+                      title::Union{AbstractString, Nothing}=nothing, to_x_intercept::Bool=false)
+    functions = (gaussian=ModelFunction_Gaussian, linear=ModelFunction_Linear)
     if !haskey(functions, func)
         throw(ArgumentError("unsupported model function :$(func), expected one of: $(join(keys(functions), ", "))"))
     end
-    ModelOverlay(functions[func], String(params), isnothing(title) ? nothing : String(title))
+    ModelOverlay(functions[func], String(params), isnothing(title) ? nothing : String(title), to_x_intercept)
 end
 
 # A named plot a variable advertises on `VariableData.plot_specs`, besides its

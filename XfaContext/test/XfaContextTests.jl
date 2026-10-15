@@ -185,7 +185,8 @@ end
 
     # A model fit drawn over the spec's layers
     fit = Context.ModelOverlay(:gaussian; params="spectrum.fit")
-    @test fit == Context.ModelOverlay(Context.ModelFunction_Gaussian, "spectrum.fit", nothing)
+    @test fit == Context.ModelOverlay(Context.ModelFunction_Gaussian, "spectrum.fit", nothing, false)
+    @test_throws "only supported for linear" Context.ModelOverlay(:gaussian; params="a", to_x_intercept=true)
     @test PlotSpec("fits", ["spectrum"]; models=[fit]).models == [fit]
     @test_throws "unsupported model function" Context.ModelOverlay(:lorentzian; params="a")
 
@@ -421,10 +422,10 @@ end
     correlation = by_name["Correlation"]
     @test correlation.kind == Context.VariableKind_Group
     @test correlation.group_parameters[:x] isa Parameter{Dependency}
-    @test correlation.group_parameters[:buffer_size].value == 10_000
+    @test correlation.group_parameters[:trains].value == 10_000
     @test !haskey(correlation.group_parameters, :histogram)
     # Handlers are stripped for wire safety.
-    @test isnothing(correlation.group_parameters[:buffer_size].update_handler)
+    @test isnothing(correlation.group_parameters[:trains].update_handler)
 
     # A @Group backing an @Input is reported as an input, not a plain group.
     testsource = by_name["TestSource"]
@@ -1988,6 +1989,14 @@ end
     end
 
     @testset "Correlation" begin
+        runcorr(corr, x, y) = begin
+            subvars = Dict{String, Any}()
+            out = Base.ScopedValues.@with(Context.Meta.name => "correlate",
+                                          Context.Meta.subvariables => subvars,
+                                          Context.correlate(corr, x, y))
+            (out, subvars)
+        end
+
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 
         # compute_edges: empty samples → [-1,1]; otherwise min/max range
@@ -2000,53 +2009,73 @@ end
         @test Context.compute_edges(Context.pulse_samples([cb1, cb2], []), 4) == 1:24.75:100
 
         # Parameter update handlers should trigger rebuilding
-        for handler in (corr.buffer_size.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
+        for handler in (corr.trains.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
             corr.rebuild_histogram = false
             handler(corr, nothing)
             @test corr.rebuild_histogram
         end
 
-        # update_buffer_size resizes existing buffers and invalidates
+        # resize_buffers resizes existing buffers and invalidates
         push!(corr.x_buffers, CircularBuffer{Float64}(10))
         push!(corr.y_buffers, CircularBuffer{Float64}(10))
         corr.rebuild_histogram = false
-        Context.update_buffer_size(corr, 500)
+        Context.resize_buffers(corr, 500)
         @test capacity(corr.x_buffers[1]) == 500
         @test capacity(corr.y_buffers[1]) == 500
         @test corr.rebuild_histogram
 
-        # Scalar inputs allocate a single per-pulse buffer at buffer_size
+        # Scalar inputs allocate a single per-pulse buffer holding `trains` trains
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
         corr.nbins[] = 10
-        corr.buffer_size[] = 50
-        Context.correlate(corr, 1.0, 2.0)
+        corr.trains[] = 50
+        runcorr(corr, 1.0, 2.0)
         @test length(corr.x_buffers) == 1
         @test capacity(corr.x_buffers[1]) == 50
         @test binedges(corr.histogram)[1] == -1:0.2:1
 
         # Vector inputs create one buffer per pulse; shrinking pops the extras
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
-        Context.correlate(corr, [1.0, 2.0], [10.0, 20.0])
+        runcorr(corr, [1.0, 2.0], [10.0, 20.0])
         @test length(corr.x_buffers) == 2
-        Context.correlate(corr, [3.0], [30.0])
+        runcorr(corr, [3.0], [30.0])
         @test length(corr.x_buffers) == 1
 
         # Changing nbins rebuilds the histogram with the new bin count
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
         corr.nbins[] = 10
-        Context.correlate(corr, 1.0, 2.0)
+        runcorr(corr, 1.0, 2.0)
         @test length(binedges(corr.histogram)[1]) == 11
         corr.nbins[] = 20
         corr.rebuild_histogram = true
-        Context.correlate(corr, 2.0, 3.0)
+        runcorr(corr, 2.0, 3.0)
         @test length(binedges(corr.histogram)[1]) == 21
 
         # `pulses` restricts which pulses contribute to edges and counts
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
         corr.pulses[] = [1]
-        Context.correlate(corr, [1.0, 999.0], [2.0, 999.0])
+        runcorr(corr, [1.0, 999.0], [2.0, 999.0])
         @test last(binedges(corr.histogram)[1]) ≤ 1.0
         @test sum(bincounts(corr.histogram)) == 1
+
+        # Selecting more pulses than there are uses the ones present
+        corr.pulses[] = [1, 2]
+        corr.fit[] = true
+        corr.rebuild_histogram = true
+        _, subvars = runcorr(corr, [3.0], [4.0])
+        @test sum(bincounts(corr.histogram)) == 2
+        @test subvars["correlate.fit"] ≈ [1.0, 1.0]
+
+        # Non-finite pairs are dropped, and the fit only runs when enabled
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        out, subvars = runcorr(corr, [1.0, NaN], [3.0, 1.0])
+        @test isnothing(subvars["correlate.fit"]) && isempty(out.plot_specs)
+        @test length(corr.x_buffers[2]) == 0
+        corr.fit[] = true
+        for x in 2.0:4.0
+            out, subvars = runcorr(corr, [x, Inf], [2x + 1, 1.0])
+        end
+        @test subvars["correlate.fit"] ≈ [2.0, 1.0]
+        @test only(only(out.plot_specs).models).params == "correlate.fit"
     end
 
     @testset "Histogram1D" begin

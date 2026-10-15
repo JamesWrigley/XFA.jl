@@ -1538,10 +1538,11 @@ function field_dim(data, field)
     end
 end
 
-# The values of a field of a 1D variable: `value` is the data itself, `trainId`
+# The values of a field of a variable: `value` is the data itself, `trainId`
 # the train IDs of a scalar history, and a dim gives its coordinates.
 function field_values(name, store, field)
     data = store.data
+    dim = data isa CircularBuffer ? nothing : field_dim(data, field)
     if field == "value"
         if data isa CircularBuffer
             store.scalar_data_cache
@@ -1552,8 +1553,8 @@ function field_values(name, store, field)
         end
     elseif field == "trainId" && data isa CircularBuffer
         store.scalar_tids_cache
-    elseif !(data isa CircularBuffer) && field_dim(data, field) == 1
-        dim_values(store, 1)
+    elseif !isnothing(dim)
+        dim_values(store, dim)
     else
         throw(SpecError("$(name) has no field \"$(field)\""))
     end
@@ -1760,19 +1761,20 @@ function holds_array(variable_data, name)
         !(variable_data[name].data isa CircularBuffer)
 end
 
-# A view with several array layers only shows trains they all hold, and only
-# every `update_every`'th of those. They're drawn from copies since the stores
-# reuse their buffers. Returns `updated_variables` as the view sees it.
+# A view with several array layers, or models, only shows trains they all hold,
+# and only every `update_every`'th of those. They're drawn from copies since the
+# stores reuse their buffers. Returns `updated_variables` as the view sees it.
 function sync_arrays!(view::SpecView, variable_data, updated_variables)
     arrays = Set(layer.spec.data for layer in view.layers
                  if isempty(layer.spec.lookups) && holds_array(variable_data, layer.spec.data))
     snapshots = view.snapshots
-    if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1)
+    if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1 && isempty(view.models))
         empty!(snapshots)
         return updated_variables
     end
 
-    # Model parameters follow the shown train, and can arrive after its data
+    # Model parameters follow the shown train, and can arrive before or after its
+    # data (e.g. while a compressed array is still being decoded)
     params = Set(model.overlay.params for model in view.models
                  if holds_array(variable_data, model.overlay.params) && !(model.overlay.params in arrays))
     filter!(p -> p.first in arrays || p.first in params, snapshots)
@@ -1888,10 +1890,17 @@ end
 
 # The function of a model with the parameters `p`, which come in a fixed order.
 function model_function(func, name, p)
-    if length(p) != 4
-        throw(SpecError("$(name): a gaussian takes 4 parameters (y0, A, μ, σ), got $(length(p))"))
+    if func == ModelFunction_Linear
+        if length(p) != 2
+            throw(SpecError("$(name): a line takes 2 parameters (slope, intercept), got $(length(p))"))
+        end
+        x -> p[1] * x + p[2]
+    else
+        if length(p) != 4
+            throw(SpecError("$(name): a gaussian takes 4 parameters (y0, A, μ, σ), got $(length(p))"))
+        end
+        x -> gaussian(x, p[1], p[2], p[3], p[4])
     end
-    x -> gaussian(x, p[1], p[2], p[3], p[4])
 end
 
 # The x extent a model is sampled over: the union of the extents of the layers
@@ -1931,10 +1940,21 @@ function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
 
                 if isfinite(xmin) && isfinite(xmax) && xmin != xmax
                     for (k, p) in enumerate(eachcol(values))
+                        lo, hi = xmin, xmax
+                        if overlay.to_x_intercept && p[1] != 0
+                            x0 = -p[2] / p[1]
+                            lo = min(lo, x0)
+                            hi = max(hi, x0)
+                        end
+                        xs = Float64[]
                         ys = Float64[]
-                        sample_model!(model.xs, ys, model_function(overlay.func, overlay.params, p), xmin, xmax, 200)
+                        sample_model!(xs, ys, model_function(overlay.func, overlay.params, p), lo, hi, 200)
                         label = size(values, 2) == 1 ? title : "$(title) $(k)"
-                        push!(model.curves, Line(model.xs, ys, label, :line, nothing, 1.0))
+                        # The fitted values go in the legend, after ### so the item ID stays stable
+                        if overlay.func == ModelFunction_Linear
+                            label = @sprintf("%s: y = %.4gx + %.4g###%s", label, p[1], p[2], label)
+                        end
+                        push!(model.curves, Line(xs, ys, label, :line, nothing, 1.0))
                     end
                 end
             end

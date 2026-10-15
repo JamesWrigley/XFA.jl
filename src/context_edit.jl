@@ -376,8 +376,7 @@ format_param_value(roi::RectROI) =
 format_param_value(roi::LinearROI) = "LinearROI($(roi.start), $(roi.length); axis=:$(roi.axis))"
 format_param_value(x::Union{Integer, AbstractFloat, Bool}) = repr(x)
 format_param_value(d::KaraboDevice) = "KaraboDevice(\"$(d.topic)\", \"$(d.name)\")"
-format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) =
-    "[" * join((repr(x) for x in v), ", ") * "]"
+format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) = repr(v)
 format_param_value(_) = nothing
 
 # Replace the first positional argument of a `name = Parameter(...)` assignment.

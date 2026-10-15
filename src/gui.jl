@@ -23,7 +23,7 @@ using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
-    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian, ModelFunction_Linear
 include("states.jl")
 include("imgui_helpers.jl")
 
