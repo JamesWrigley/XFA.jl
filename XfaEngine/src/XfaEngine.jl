@@ -14,7 +14,7 @@ import Glob
 include("settings.jl")
 include("protocol.jl")
 
-using .KaraboBridge: KaraboBridgeClient, BufferPool
+using .KaraboBridge: KaraboBridgeClient, BufferPool, BridgePattern_REP, parse_bridge_pattern
 include("webproxy.jl")
 
 import TOML

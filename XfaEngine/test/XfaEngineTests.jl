@@ -83,7 +83,9 @@ function server_exists(port)
     end
 end
 
-function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
+function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing,
+                       pattern=KaraboBridge.BridgePattern_REP)
+    pattern_name = chopprefix(string(pattern), "BridgePattern_")
     server = HTTP.serve!("127.0.0.1", port) do request
         if request.target == "/devices.json"
             return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
@@ -97,7 +99,7 @@ function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
                                      "reply": {"success": {"value": true, "timestamp": 0, "tid": 0},
                                                "ttl": {"value": 0.5, "timestamp": 0, "tid": 0}}}""")
         elseif endswith(request.target, "/config.json")
-            return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)"}]}""")
+            return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)", "pattern": "$(pattern_name)"}]}""")
         else
             return HTTP.Response(404, "Path not supported")
         end
@@ -634,6 +636,29 @@ end
             @test eltype(data["src"]["mixed"]) == Int16
         end
     end
+
+    @testset "PUB pattern" begin
+        server = KaraboBridgeServer(endpoint; pattern=KaraboBridge.BridgePattern_PUB)
+        clients = [KaraboBridgeClient(endpoint, KaraboBridge.BridgePattern_PUB) for _ in 1:2]
+        try
+            KaraboBridge.startbridge(server)
+            payload = Dict("src" => Dict("x" => 42))
+
+            # Keep publishing until every client has received a train
+            results = [Threads.@spawn take!(client) for client in clients]
+            @test timedwait(5) do
+                put!(server, payload)
+                all(istaskdone, results)
+            end == :ok
+            @test all(fetch(t)[1] == payload for t in results)
+        finally
+            foreach(close, clients)
+            close(server)
+        end
+
+        @test KaraboBridge.parse_bridge_pattern("PUSH") == KaraboBridge.BridgePattern_PUSH
+        @test_throws ErrorException KaraboBridge.parse_bridge_pattern("DEALER")
+    end
 end
 
 # Test postprocessors, also in Main for load_from_string access.
@@ -663,13 +688,15 @@ end
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === XfaEngine.stream
 
-    @testset "Source leases" begin
+    @testset "Source leases ($(pattern))" for pattern in (KaraboBridge.BridgePattern_REP,
+                                                         KaraboBridge.BridgePattern_PUB)
         # In automatic configuration mode the bridge should lease its
         # dependencies' sources through the subscribeSources slot and keep
-        # renewing them while streaming.
+        # renewing them while streaming. The bridge pattern is looked up from
+        # the trainmatcher's zmqOutputs.
         webproxy_port = XfaEngine.getavailableport(8485)
         bridge_port = XfaEngine.getavailableport(42000)
-        bridge_server = KaraboBridgeServer("tcp://localhost:$(bridge_port)")
+        bridge_server = KaraboBridgeServer("tcp://localhost:$(bridge_port)"; pattern)
         KaraboBridge.startbridge(bridge_server)
 
         ctx = Context.load_from_string("""
@@ -683,11 +710,16 @@ end
         XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies)
 
         slot_calls = []
-        put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
-        mock_webproxy(webproxy_port, bridge_port; slot_calls) do
+        mock_webproxy(webproxy_port, bridge_port; slot_calls, pattern) do
             Context.run(ctx) do
-                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-                @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
+                # Keep sending since a PUB socket drops trains published
+                # before the subscription is established.
+                @test timedwait(5) do
+                    put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
+                    isready(ctx.stream_output)
+                end == :ok
+                result = take!(ctx.stream_output)
+                @test (result.name, result.data) == ("foo", 42.0)
 
                 # The initial subscription leased the karabo dependency, and
                 # the bridge picked up the mocked TTL from the reply

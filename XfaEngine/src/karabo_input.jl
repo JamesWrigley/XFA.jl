@@ -196,14 +196,18 @@ end
 end
 
 function stream_bridge(bridge::KaraboInput, output)
+    # Manually configured addresses are assumed to be REP sockets
+    pattern = BridgePattern_REP
     if !bridge.manual_configuration[]
         Context.declare_sources(Context.Meta.name[], Context.get_sources(bridge))
 
+        outputs = get_config(bridge.trainmatcher[])["zmqOutputs"]
+        if isempty(outputs)
+            error("No ZMQ outputs available from trainmatcher")
+        end
+
         # If no address is set, pick the first available one from the trainmatcher
         if isempty(bridge.address[])
-            config = get_config(bridge.trainmatcher[])
-            outputs = config["zmqOutputs"]
-            isempty(outputs) && error("No ZMQ outputs available from trainmatcher")
             bridge.address.value = outputs[1]["address"]
 
             # Notify clients of the new address
@@ -214,12 +218,19 @@ function stream_bridge(bridge::KaraboInput, output)
                 end
             end
         end
+
+        idx = findfirst(out -> out["address"] == bridge.address[], outputs)
+        if isnothing(idx)
+            @warn "Address isn't one of the trainmatcher's ZMQ outputs, assuming a REP socket" address=bridge.address[]
+        else
+            pattern = parse_bridge_pattern(outputs[idx]["pattern"])
+        end
     end
 
     if isempty(bridge.address[])
         error("No address configured for KaraboInput")
     end
-    client = KaraboBridgeClient(bridge.address[])
+    client = KaraboBridgeClient(bridge.address[], pattern)
 
     # Start a task just to read from the bridge. Note that this is separate from
     # the task to put it into the output channel to avoid a race condition where
