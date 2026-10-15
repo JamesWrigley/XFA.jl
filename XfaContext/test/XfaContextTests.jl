@@ -2063,7 +2063,7 @@ end
         corr.rebuild_histogram = true
         _, subvars = runcorr(corr, [3.0], [4.0])
         @test sum(bincounts(corr.histogram)) == 2
-        @test subvars["correlate.fit"] ≈ [1.0, 1.0]
+        @test subvars["correlate.fit"] ≈ [1.0, 1.0, 1.0]
 
         # Non-finite pairs are dropped, and the fit only runs when enabled
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
@@ -2074,7 +2074,7 @@ end
         for x in 2.0:4.0
             out, subvars = runcorr(corr, [x, Inf], [2x + 1, 1.0])
         end
-        @test subvars["correlate.fit"] ≈ [2.0, 1.0]
+        @test subvars["correlate.fit"] ≈ [2.0, 1.0, 1.0]
         @test only(only(out.plot_specs).models).params == "correlate.fit"
     end
 

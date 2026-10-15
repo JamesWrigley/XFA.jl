@@ -138,7 +138,7 @@ include("detector_assembly.jl")
 include("binning.jl")
 
 using DataStructures: CircularBuffer
-using CurveFit: CurveFitProblem, LinearCurveFitAlgorithm, solve
+using CurveFit: CurveFitProblem, LinearCurveFitAlgorithm, solve, rss
 using SciMLBase: successful_retcode
 using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges
 using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum

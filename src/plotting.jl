@@ -1891,8 +1891,8 @@ end
 # The function of a model with the parameters `p`, which come in a fixed order.
 function model_function(func, name, p)
     if func == ModelFunction_Linear
-        if length(p) != 2
-            throw(SpecError("$(name): a line takes 2 parameters (slope, intercept), got $(length(p))"))
+        if length(p) ∉ (2, 3)
+            throw(SpecError("$(name): a line takes 2 parameters (slope, intercept) and optionally R², got $(length(p))"))
         end
         x -> p[1] * x + p[2]
     else
@@ -1952,7 +1952,8 @@ function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
                         label = size(values, 2) == 1 ? title : "$(title) $(k)"
                         # The fitted values go in the legend, after ### so the item ID stays stable
                         if overlay.func == ModelFunction_Linear
-                            label = @sprintf("%s: y = %.4gx + %.4g###%s", label, p[1], p[2], label)
+                            r2 = length(p) == 3 ? @sprintf(", R² = %.4f", p[3]) : ""
+                            label = @sprintf("%s: y = %.4gx + %.4g%s###%s", label, p[1], p[2], r2, label)
                         end
                         push!(model.curves, Line(xs, ys, label, :line, nothing, 1.0))
                     end

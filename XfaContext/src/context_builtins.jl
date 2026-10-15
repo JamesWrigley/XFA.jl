@@ -130,7 +130,12 @@ function linear_fit(corr::Correlation)
         return nothing
     else
         sol = solve(CurveFitProblem(xs, ys), LinearCurveFitAlgorithm())
-        return successful_retcode(sol.retcode) ? collect(sol.u) : nothing
+        if successful_retcode(sol.retcode)
+            r2 = 1 - rss(sol) / sum(abs2, ys .- nanmean(ys))
+            return [sol.u..., r2]
+        else
+            return nothing
+        end
     end
 end
 
@@ -187,7 +192,7 @@ end
         end
     end
 
-    # [slope, intercept]
+    # [slope, intercept, R^2]
     fit = corr.fit[] ? linear_fit(corr) : nothing
     @add_subvariable("fit", fit)
     plot_specs = if isnothing(fit)
