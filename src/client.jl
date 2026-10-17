@@ -959,9 +959,9 @@ function store_variable_data!(client, variable::VariableData)
         elseif data isa AbstractArray
             client.variable_data[name] = VariableStore(; data)
         elseif data isa CompressedArray
-            # Seed with a buffer of the right eltype/shape so draw_plots can
-            # decompress into it in place rather than allocating per train.
-            client.variable_data[name] = VariableStore(; data=allocate_array(data))
+            # The buffer is uninitialised, so only decode into it
+            client.variable_data[name] = VariableStore(; data=ArrayMetadata(data.original_eltype, data.shape),
+                                                       spare_buffer=allocate_array(data))
         else
             @error "Unsupported variable type: $(typeof(data))"
             return
