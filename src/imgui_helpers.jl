@@ -728,7 +728,13 @@ function seed_karabo_editor!(dep_state::KaraboDepTextState, text, device_only)
     catch
         nothing
     end
-    dep_state.source = isnothing(dep) ? text : dep.source
+    dep_state.source = if isnothing(dep)
+        text
+    elseif isnothing(dep.topic)
+        dep.source
+    else
+        "$(dep.topic)//$(dep.source)"
+    end
     dep_state.property = isnothing(dep) ? "" : @something(dep.property, "")
     dep_state.proxy = (isnothing(dep) || isnothing(dep.proxy)) ? "" : dep.proxy
     dep_state.proxy_expanded = !isempty(dep_state.proxy)
