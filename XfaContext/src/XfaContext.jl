@@ -1011,6 +1011,8 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             close(channel)
         end
 
+        # Unblock pumps stuck in put! on a full input_data
+        close(input_data)
         wait(input_task)
     end
 end
