@@ -2187,16 +2187,14 @@ end
     stack = rand(2, 2, 3)
     @test isequal(Context.assemble(asm, [stack[:, 1, :], stack[:, 2, :]]), Context.assemble(asm, stack))
 
-    # ReTest may run this body on a migrated task, so hold the GIL around all
-    # the PythonCall work to avoid calling into CPython without it.
-    PythonCall.GIL.@lock begin
+    # XfaEngine works with dim-reversed arrays (e.g. (nfs, nss, nmod) rather
+    # than numpy's (nmod, nss, nfs)), so flip dimensions when crossing to or
+    # from extra-geom's numpy arrays.
+    revdims(a) = permutedims(a, ndims(a):-1:1)
+
+    @pyregion begin
         eg = pyimport("extra_geom")
         python = pyconvert(String, pyimport("sys").executable)
-
-        # XfaEngine works with dim-reversed arrays (e.g. (nfs, nss, nmod) rather
-        # than numpy's (nmod, nss, nfs)), so flip dimensions when crossing to or
-        # from extra-geom's numpy arrays.
-        revdims(a) = permutedims(a, ndims(a):-1:1)
 
         # For each detector, check assembly matches extra-geom's own
         # position_modules_fast pixel for pixel (gaps included). ePix100 and
@@ -2349,13 +2347,11 @@ end
         """)
 
         mktempdir() do dir
-            dc = PythonCall.GIL.@lock begin
-                pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
-                pyimport("extra_data").RunDirectory(dir)
-            end
+            pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
+            dc = pyimport("extra_data").RunDirectory(dir)
 
             # The type check rejects a Py object that isn't a DataCollection
-            @test_throws ArgumentError Context.run(ctx, PythonCall.GIL.@lock(pylist([1, 2, 3])))
+            @test_throws ArgumentError Context.run(ctx, pylist([1, 2, 3]))
 
             # Test returning scalars
             r = Context.run(ctx, dc; select=["double"])
@@ -2379,13 +2375,13 @@ end
             @test parent(r1["module0"]) == parent(r["module0"])
 
             # Unwrapping aliases the numpy memory and rejects non-contiguous arrays
-            arr = PythonCall.GIL.@lock pyconvert(DimArray, dc["SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "integrationTime.value"].xarray(); copy=false)
+            arr = pyconvert(DimArray, dc["SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "integrationTime.value"].xarray(); copy=false)
             unwrapped = Context.unwrap_python(arr)
             @test parent(unwrapped) isa Vector && pointer(parent(unwrapped)) == parent(arr).ptr
             @test parent(lookup(unwrapped, :trainId)) isa Vector && lookup(unwrapped, :trainId) == lookup(arr, :trainId)
             viewed = Context.unwrap_python(@view arr[1:3])
             @test parent(viewed) isa SubArray{<:Any, 1, <:Vector} && viewed == arr[1:3]
-            strided = PythonCall.GIL.@lock PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
+            strided = PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
             @test_throws ArgumentError Context.unwrap_python(strided)
 
             # Test that proxied dependencies are ignored
@@ -2422,8 +2418,7 @@ end
     """)
     vals = Dict("camera.data" => DimArray([1, 4, 9], (Dim{:trainId}([10, 11, 12]),)))
 
-    # The test thread holds the GIL, which the pipeline's tasks need
-    r = PythonCall.GIL.unlock(() -> Context.run(ctx, vals))
+    r = Context.run(ctx, vals)
     @test collect(r["root"]) == [1.0, 2.0, 3.0]
 
     # Python exceptions are rendered as plain errors

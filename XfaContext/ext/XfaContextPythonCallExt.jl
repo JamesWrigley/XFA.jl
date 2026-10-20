@@ -12,40 +12,16 @@ using PythonCall
 
 # Serialises Julia tasks' use of Python. Native code may drop the GIL mid-call
 # and re-take it in a GC-unsafe ccall, which deadlocks if another Julia thread
-# took the GIL meanwhile and then waits for a GC. Waiting on this lock yields,
-# so it can't block the GC.
+# took the GIL meanwhile and then waits for a GC. PythonCall's own thread-state
+# management doesn't prevent that. Waiting on this lock yields, so it can't
+# block the GC.
 const PYTHON_LOCK = ReentrantLock()
 
-# Wait for the GIL in a GC-safe region, otherwise a GC started while a
-# non-Julia thread holds the GIL deadlocks.
-gil_ensure() = @ccall gc_safe=true $(PythonCall.C.POINTERS.PyGILState_Ensure)()::PythonCall.C.PyGILState_STATE
-
-# Take the Python lock and the GIL with the task pinned to its OS thread, since
-# releasing the GIL from another thread than the one that took it crashes.
-function gil_enter()
-    lock(PYTHON_LOCK)
-    task = current_task()
-    was_sticky = task.sticky
-    task.sticky = true
-    return (gil_ensure(), was_sticky)
-end
-
-function gil_exit((state, was_sticky))
-    PythonCall.C.PyGILState_Release(state)
-    current_task().sticky = was_sticky
-    unlock(PYTHON_LOCK)
-end
-
-# Run `expr` holding the GIL. Keep Julia blocking primitives (`put!`, `wait`)
-# outside it.
+# Run `expr` in a Python region under the Python lock. Keep Julia blocking
+# primitives (`put!`, `wait`) outside it.
 macro pysafe_impl(expr)
     quote
-        state = gil_enter()
-        try
-            $(esc(expr))
-        finally
-            gil_exit(state)
-        end
+        @lock PYTHON_LOCK @pyregion $(esc(expr))
     end
 end
 
@@ -82,8 +58,9 @@ function label_sources(selection, deps)
     return sources, labels
 end
 
-# Showing a Python exception needs the GIL, which the pipeline doesn't hold when
-# it logs a failed input, so re-raise it as a plain error rendered under the GIL.
+# Showing a Python exception calls into Python, which the pipeline's logging
+# would do outside the Python lock, so re-raise it as a plain error rendered
+# under the lock.
 # `backtrace=false` would also drop the Python stacktrace, so pass an empty
 # Julia backtrace instead; the new error carries its own.
 function XfaContext.pysafe_rethrow(ex)
@@ -102,15 +79,21 @@ function pyguard(f)
     end
 end
 
-XfaContext.pysafe_enter() = gil_enter()
+function XfaContext.pysafe_enter()
+    lock(PYTHON_LOCK)
+    task = current_task()
+    state = PythonCall.C.current_task_state(task)
+    return (task, state, PythonCall.C.enter_region(task, state))
+end
 
-# Also frees Python objects finalized off the GIL since the last call, which
-# would otherwise pile up while the pipeline runs.
-function XfaContext.pysafe_exit(state)
+# Also frees Python objects finalized while detached since the last call,
+# which would otherwise pile up while the pipeline runs.
+function XfaContext.pysafe_exit((task, state, token))
     try
         PythonCall.GC.gc()
     finally
-        gil_exit(state)
+        PythonCall.C.exit_region(task, state, token)
+        unlock(PYTHON_LOCK)
     end
 end
 
@@ -403,14 +386,10 @@ function XfaContext.run(ctx::ContextState, dc::Py;
     stream = XfaContext.open_stream(dc, deps, monitored; trains_per_chunk, buffer_slots)
     plan.on_train_processed = tid -> XfaContext.release!(stream, tid)
 
-    # Release the main thread's GIL so the feeder and the post-pipeline stage
-    # can take it per train.
-    return PythonCall.GIL.unlock() do
-        try
-            run_offline_plan(plan, stream.train_ids, channel -> XfaContext.feed!(stream, channel))
-        finally
-            close(stream)
-        end
+    try
+        return run_offline_plan(plan, stream.train_ids, channel -> XfaContext.feed!(stream, channel))
+    finally
+        close(stream)
     end
 end
 

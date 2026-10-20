@@ -738,8 +738,8 @@ end
 
 @testset "Offline input" begin
     mktempdir() do dir
-        # Made in a subprocess so the test never has to hold the GIL itself;
-        # PythonCall is loaded lazily by the input under test.
+        # Made in a subprocess since PythonCall is loaded lazily by the input
+        # under test.
         path = joinpath(dir, "RAW-R0450-DA01-S00000.h5")
         run(`$(ENV["JULIA_PYTHONCALL_EXE"]) -c "from extra_data.tests.make_examples import make_fxe_da_file; make_fxe_da_file('$(path)')"`)
 

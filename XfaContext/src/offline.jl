@@ -20,8 +20,7 @@ function load_pythoncall()
 end
 
 # Run `f`, which may import PythonCall (directly or through another package),
-# on thread 1 if PythonCall isn't loaded yet. The importing thread is left
-# holding the GIL, so the task is pinned and the GIL released after an import.
+# on thread 1 if PythonCall isn't loaded yet.
 function guard_pythoncall_import(f)
     if haskey(Base.loaded_modules, PythonCall_pkgid)
         state = @invokelatest pysafe_enter()
@@ -35,21 +34,16 @@ function guard_pythoncall_import(f)
     end
 
     pinned = () -> begin
-        task = current_task()
-        was_sticky = task.sticky
-        task.sticky = true
         try
             return f()
         finally
             if haskey(Base.loaded_modules, PythonCall_pkgid)
+                # PythonCall's exit hook would otherwise finalise under a fresh
+                # thread state, so attach the main one first. Exit hooks run
+                # last-registered-first.
                 PythonCall = Base.loaded_modules[PythonCall_pkgid]
-                @invokelatest PythonCall.C.PyEval_SaveThread()
-
-                # PythonCall's exit hook finalises Python, which needs the GIL
-                # held by the exiting thread. Exit hooks run last-registered-first.
                 atexit(() -> @invokelatest PythonCall.C.PyGILState_Ensure())
             end
-            task.sticky = was_sticky
         end
     end
 
@@ -64,7 +58,7 @@ function guard_pythoncall_import(f)
     end
 end
 
-# Take the GIL and pin the task to its OS thread, undone by `pysafe_exit`, and
+# Take the Python lock and enter a Python region, undone by `pysafe_exit`, and
 # rethrow Python exceptions as plain errors. Implemented by the PythonCall
 # extension.
 function pysafe_enter end
@@ -74,7 +68,8 @@ function pysafe_rethrow end
 """
     @pysafe expr
 
-Evaluate `expr` holding the Python GIL, for calling Python from a variable.
+Evaluate `expr` in a Python region, serialised with other Julia tasks' use of
+Python, for calling Python from a variable.
 Requires PythonCall to be loaded by the context file. Keep Julia blocking
 operations (`put!`, `wait`, `sleep`) out of it. `expr` runs in the enclosing
 scope, so variables it assigns stay visible afterwards.
