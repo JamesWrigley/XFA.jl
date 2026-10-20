@@ -163,6 +163,31 @@ function XfaContext.data_collection_schema(dc::Py, device::AbstractString)
     end
 end
 
+# Build an assembler from an extra-geom geometry object, the same way as
+# generate_assembly_lut.py: each assembled pixel holds the 0-based C-flat index
+# of the input pixel that landed there (NaN in gaps).
+function XfaContext.AssemblerLUT(geom::Py)
+    data_shape, assembled = pyguard() do
+        @pysafe_impl begin
+            np = pyimport("numpy")
+            data_shape = pyconvert(Tuple{Int, Int, Int}, geom.expected_data_shape)
+            idx = np.arange(prod(data_shape); dtype=np.float64).reshape(data_shape...)
+            (data_shape, pyconvert(Array{Float64}, geom.position_modules_fast(idx)[0]))
+        end
+    end
+
+    # The transpose's column-major order is the numpy array's C-flat order
+    ny, nx = size(assembled)
+    lut = Vector{UInt64}(undef, prod(data_shape))
+    for (out_idx, in_idx) in enumerate(permutedims(assembled))
+        if !isnan(in_idx)
+            lut[Int(in_idx) + 1] = out_idx
+        end
+    end
+
+    return XfaContext.AssemblerLUT(lut, (nx, ny))
+end
+
 # Only arrays whose raw element type is `T` itself (not e.g. Python objects)
 # can be wrapped as a plain Array.
 function XfaContext.unwrap_python(array::PyArray{T}) where {T}

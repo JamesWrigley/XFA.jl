@@ -2216,6 +2216,11 @@ end
                 end
                 nmod, nss, nfs = pyconvert(Tuple{Int, Int, Int}, loaded.expected_data_shape)
 
+                # Building from the geometry object directly matches the script
+                from_geom = Context.AssemblerLUT(loaded)
+                @test from_geom.lut == asm.lut
+                @test from_geom.frame_size == asm.frame_size
+
                 # Test single frame
                 frame = rand(nfs, nss, nmod)
                 ref = loaded.position_modules_fast(Py(revdims(frame)).to_numpy())[0]
