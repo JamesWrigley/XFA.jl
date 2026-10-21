@@ -1,5 +1,5 @@
 @kwdef mutable struct KaraboBridgeGuiState
-    zmq_outputs::Union{Vector{String}, Exception, Nothing} = nothing
+    zmq_outputs::Union{Vector{String}, ExceptionMessage, Nothing} = nothing
     zmq_outputs_request::Maybe{Int} = nothing
     selected_output::Cint = 0
     auto_select_output::Bool = false
@@ -131,7 +131,7 @@ function draw_online_bridge(name, params, gui_state)
                 gui_state.zmq_outputs_request = send_with_callback(
                     client, GetDeviceProperty(tm.topic, tm.name, "zmqOutputs"),
                     msg -> begin
-                        if msg.value isa Exception
+                        if msg.value isa ExceptionMessage
                             gui_state.zmq_outputs = msg.value
                         else
                             gui_state.zmq_outputs = String[out["address"] for out in msg.value]
@@ -144,8 +144,8 @@ function draw_online_bridge(name, params, gui_state)
 
         if is_pending(client, gui_state.zmq_outputs_request)
             Spinner("Fetching outputs...")
-        elseif gui_state.zmq_outputs isa Exception
-            ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), sprint(showerror, gui_state.zmq_outputs))
+        elseif gui_state.zmq_outputs isa ExceptionMessage
+            ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), gui_state.zmq_outputs.text)
         elseif gui_state.zmq_outputs isa Vector
             if !isempty(gui_state.zmq_outputs)
                 # After a trainmatcher change, push the first output through as the new address

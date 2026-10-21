@@ -1456,7 +1456,7 @@ function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, sou
     end
 
     value = property_ref[]
-    if value isa Exception || !(value isa AbstractVector) || isempty(value)
+    if !(value isa AbstractVector) || isempty(value)
         return nothing, nothing
     end
 
