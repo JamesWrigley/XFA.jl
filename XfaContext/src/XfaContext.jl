@@ -912,6 +912,11 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             tid, matched_data = only(matched_trains)
             empty!(matched_trains)
 
+            # stop_pipeline() closes the output, don't start another train
+            if !isopen(stream_output)
+                break
+            end
+
             f = worker_state.dag_functions[name]
             subvar_values = Dict{String, Any}()
             empty_result = VariableData(tid, name, nothing)
@@ -1014,6 +1019,19 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
         # Unblock pumps stuck in put! on a full input_data
         close(input_data)
         wait(input_task)
+
+        # Drop the unprocessed backlog so its train data can be freed
+        for arg in values(upstream)
+            if arg isa AbstractChannel
+                while isready(arg)
+                    take!(arg)
+                end
+            end
+        end
+
+        while isready(input_data)
+            take!(input_data)
+        end
     end
 end
 
@@ -1307,11 +1325,11 @@ function stop_pipeline(ctx::ContextState; timeout=5)
     ctx.is_running[] = false
 
     # Close every channel up front, before waiting on any task. Each stage loops
-    # `while isopen(ch) || isready(ch)`, so leaving downstream channels open
-    # would make the stages drain (process) their whole buffered backlog before
-    # exiting. With everything closed, a stage's `putall!(downstream)` throws
-    # InvalidStateException after at most one more item, so the pipeline stops
-    # promptly and any buffered items are discarded.
+    # `while isopen(ch) || isready(ch)`, so leaving channels open would make the
+    # stages process their whole buffered backlog before exiting. Closing
+    # `stream_output` stops variables without downstream consumers too since
+    # they check it before each train and their next emit throws.
+    close(ctx.stream_output)
     for ch in values(ctx.input_channels)
         close(ch)
     end
@@ -1482,7 +1500,7 @@ function eval_context(ctx_module::Module, ctx_str::AbstractString, prelude::Vect
         using XfaContext.DimensionalData
 
         using XfaContext
-        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta, @pysafe
+        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta
     end
     @eval ctx_module $init_expr
 

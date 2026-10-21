@@ -1706,6 +1706,28 @@ end
         end
         @test take!(ctx.stream_output) == VariableData(0, "motor_pos", 42)
     end
+
+    @testset "Stopping skips the backlog" begin
+        # A slow leaf variable with a full backlog should stop after its current train
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            for tid in 1:50
+                put!(output, (tid, Dict("det" => Dict("value" => tid))))
+            end
+        end
+        x = Context.MockInput()
+
+        @Variable function slow(value -> karabo"det.value")
+            sleep(0.2)
+            return value
+        end
+        """)
+
+        Context.start_pipeline(ctx)
+        @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+        @test @elapsed(Context.stop_pipeline(ctx)) < 1
+        @test count(v -> v.name == "slow", ctx.stream_output) < 5
+    end
 end
 
 @testset "Pipeline drops" begin
