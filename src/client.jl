@@ -535,8 +535,10 @@ function add_subvariable!(node, ctx_info, node_name, var_name, subvar, pp_names)
         pp_prefix = "$(subvar)."
         pp_params = Dict{String, Any}()
         for (param_name, param) in ctx_info["parameters"]
-            if startswith(param_name, pp_prefix)
-                pp_params[chopprefix(param_name, pp_prefix)] = param
+            field = chopprefix(param_name, pp_prefix)
+            # A dotted remainder belongs to a postprocessor chained onto this one
+            if startswith(param_name, pp_prefix) && !occursin('.', field)
+                pp_params[field] = param
             end
         end
         push!(node["postprocessors"], (

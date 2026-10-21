@@ -448,14 +448,18 @@ end
 
     @Variable function foo(data -> karabo"foo.bar")
         @postprocess(TestWindow(; size=2))
-        @postprocess("avg", TestMean())
+        @postprocess(TestMean(); name="avg")
+        @postprocess "double" TestMean()
+        @postprocess "window" TestMean() name="wmean"
+        @add_subvariable("double", data .* 2)
         return data
     end
     """)
-    @test Set(ctx.subvariables["foo"]) == Set(["foo.avg", "foo.window"])
+    pp_names = ["foo.window", "foo.avg", "foo.double.mean", "foo.window.wmean"]
+    @test issetequal(ctx.subvariables["foo"], ["foo.double"; pp_names])
     @test ctx.parameters["foo.window.size"][] == 2
-    @test issetequal(["foo.avg", "foo.window"], keys(ctx.postprocessors))
-    @test ctx.variable_postprocessors["foo"] == ["foo.window", "foo.avg"]
+    @test issetequal(pp_names, keys(ctx.postprocessors))
+    @test ctx.variable_postprocessors["foo"] == pp_names
 
     Context.run(ctx) do
         @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
@@ -463,6 +467,23 @@ end
     result = take!(ctx.stream_output)
     @test result.subvariables["foo.window"] == VariableData(0, "foo.window", [1, 2])
     @test result.subvariables["foo.avg"] == VariableData(0, "foo.avg", 2.0)
+    @test result.subvariables["foo.double.mean"] == VariableData(0, "foo.double.mean", 4.0)
+    @test result.subvariables["foo.window.wmean"] == VariableData(0, "foo.window.wmean", 1.5)
+
+    # Sources must be known subvariables, and only a `name` keyword is supported
+    @test_throws "unknown source subvariable" Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestMean
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess "missing" TestMean()
+        return data
+    end
+    """)
+    @test_throws "`name` keyword" Context._variable(@__MODULE__, quote
+        function foo(data -> karabo"foo.bar")
+            @postprocess TestMean() size=2
+            return data
+        end
+    end, false)
 
     # Changing a postprocessor parameter should update its value, invoke the
     # update handler with the postprocessor object, and affect subsequent runs.

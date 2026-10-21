@@ -1082,7 +1082,7 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-        using Main.PostprocessorLibrary: TestWindow
+        using Main.PostprocessorLibrary: TestMean, TestWindow
 
         bridge = KaraboInput(; trainmatcher=KaraboDevice(""))
         bridge._mock_sources = SourceInfo[]
@@ -1102,6 +1102,7 @@ end
         @Variable function bar(data -> xgm)
             @add_subvariable("max_data", max(data))
             @postprocess(TestWindow(; size=5))
+            @postprocess "max_data" TestMean() name="avg"
             @display roi
             mean(data)
         end
@@ -1115,9 +1116,10 @@ end
                                                               "bar" => OD("data" => Dependency("xgm"))),
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
-                                                              "bar" => ["bar.max_data", "bar.window"]),
-                                       "postprocessors" => Dict("bar" => ["bar.window"]),
-                                       "postprocessor_origins" => Dict("bar.window" => "Main.PostprocessorLibrary.TestWindow"),
+                                                              "bar" => ["bar.max_data", "bar.max_data.avg", "bar.window"]),
+                                       "postprocessors" => Dict("bar" => ["bar.window", "bar.max_data.avg"]),
+                                       "postprocessor_origins" => Dict("bar.window" => "Main.PostprocessorLibrary.TestWindow",
+                                                                       "bar.max_data.avg" => "Main.PostprocessorLibrary.TestMean"),
                                        "displays" => Dict("bar" => ["roi"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",

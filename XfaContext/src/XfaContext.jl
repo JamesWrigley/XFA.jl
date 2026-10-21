@@ -967,15 +967,25 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 # pause_pipeline() (e.g. from change_parameter) can't mutate
                 # postprocessor state between or during the two.
                 if !isempty(postprocessors)
-                    raw_out = out isa VariableData ? out.data : out
                     for (pp_name, pp) in postprocessors
+                        # The source is the output name's parent: the variable or one of its subvariables
+                        source = pp_name[1:findlast('.', pp_name) - 1]
+                        if source == name
+                            pp_input = out
+                        elseif haskey(subvar_values, source)
+                            pp_input = subvar_values[source]
+                        else
+                            continue
+                        end
+                        raw_input = pp_input isa VariableData ? pp_input.data : pp_input
+
                         try
                             subvar_values[pp_name] = @with(Meta.tid => tid,
                                                            Meta.name => pp_name,
                                                            Meta.group_name => group_name,
                                                            Meta.scratch => scratch,
                                                            Meta.subvariables => subvar_values,
-                                                           pp(raw_out))
+                                                           pp(raw_input))
                         catch ex
                             @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
                         end
@@ -1298,7 +1308,8 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
             continue
         end
 
-        var_pps = Dict{String, AbstractPostprocessor}(
+        # Kept in declaration order so a postprocessor can consume an earlier one's output
+        var_pps = OrderedDict{String, AbstractPostprocessor}(
             pp_name => ctx.postprocessors[pp_name]
             for pp_name in get(ctx.variable_postprocessors, name, String[])
         )
@@ -1762,11 +1773,15 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; @nospecialize
 
             for (pp_name, processor) in pps
                 pp_name = replace(pp_name::String, func_base => name; count=1)
+                source = pp_name[1:findlast('.', pp_name) - 1]
+                if source != name && source ∉ ctx_subvariables[name]
+                    throw(XfaContextException("Postprocessor '$(pp_name)' has unknown source subvariable '$(source)'"))
+                end
                 ctx_postprocessors[pp_name] = processor
                 push!(ctx_variable_postprocessors[name], pp_name)
 
                 # Add subvariable names that weren't known at macro time
-                # (one-arg @add_postprocessor form using default_name)
+                # (postprocessors named by default_name)
                 if pp_name ∉ ctx_subvariables[name]
                     push!(ctx_subvariables[name], pp_name)
                 end
