@@ -2349,6 +2349,8 @@ end
         end
 
         @Variable itime_proxied -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime@proxy:output"
+
+        @Variable absent -> karabo"NOT/A/DEVICE.foo"
         """)
 
         mktempdir() do dir
@@ -2393,6 +2395,11 @@ end
             r = Context.run(ctx, dc; select=["itime_proxied"])
             @test keyset(r) == Set(["itime_proxied"])
             @test all(==(15), r["itime_proxied"])
+
+            # Dependencies missing from the run are skipped
+            r = @test_logs (:warn, r"aren't in the run") match_mode=:any Context.run(ctx, dc; select=["itime", "absent"])
+            @test keyset(r) == Set(["itime"])
+            @test length(r["itime"]) == 100
 
             devices = Context.data_collection_devices(dc)
             @test ("SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "") in devices

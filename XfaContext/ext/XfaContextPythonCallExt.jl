@@ -19,6 +19,15 @@ function dep_key_data(selection, dep)
     return selection[pytuple((dep.source, key))]
 end
 
+function has_key_data(dc, dep)
+    if dep.source in dc.all_sources
+        keys = pyconvert(Vector{String}, dc.keys_for_source(dep.source))
+        return dep.property in keys || dep.property * ".value" in keys
+    else
+        return false
+    end
+end
+
 # Label each distinct (source, property) for the streamer, which hands a train's
 # data back as fields of a dataclass, so the labels have to be identifiers
 # rather than dependency names. Returns the sources to stream and the label each
@@ -180,10 +189,18 @@ struct TrainStream
     last_update_tids::Dict{String, Int}
 end
 
-# Only trains where every (source, property) is present are streamed. The
+# Only trains where every (source, property) is present are streamed. Deps
+# missing from the run entirely are dropped, so their variables never run. The
 # streamer reads up to `buffer_slots` chunks of `trains_per_chunk` trains ahead.
 function XfaContext.open_stream(dc::Py, deps::Vector{Dependency}, monitored::Vector{Dependency}=Dependency[];
                                 trains_per_chunk=2, buffer_slots=8)
+    absent = filter(dep -> !has_key_data(dc, dep), deps)
+    if !isempty(absent)
+        @warn "Some dependencies aren't in the run, skipping them" deps=[dep.name for dep in absent]
+        deps = setdiff(deps, absent)
+        monitored = setdiff(monitored, absent)
+    end
+
     if isempty(deps)
         train_ids = pyconvert(Vector{Int}, dc.train_ids)
         return TrainStream(nothing, nothing, deps, monitored, Dict{String, Symbol}(), train_ids,
