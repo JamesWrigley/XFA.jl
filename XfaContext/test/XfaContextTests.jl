@@ -2407,27 +2407,22 @@ end
     end
 end
 
-@testset "@pysafe" begin
+@testset "Python in variables" begin
+    # Variables run on pipeline tasks and call Python with no wrapper; a Python
+    # error fails the variable like any other exception.
     ctx = Context.load_from_string(raw"""
     using PythonCall
 
     @Variable foo -> karabo"camera.data"
     @Variable function root(x -> foo)
-        @pysafe begin
-            math = pyimport("math")
-            y = pyconvert(Float64, math.sqrt(x))
-        end
-        # Assignments stay in the enclosing scope
-        y + (@pysafe pyconvert(Float64, math.floor(0.5)))
+        pyconvert(Float64, pyimport("math").sqrt(x))
     end
     """)
     vals = Dict("camera.data" => DimArray([1, 4, 9], (Dim{:trainId}([10, 11, 12]),)))
+    @test collect(Context.run(ctx, vals)["root"]) == [1.0, 2.0, 3.0]
 
-    r = Context.run(ctx, vals)
-    @test collect(r["root"]) == [1.0, 2.0, 3.0]
-
-    # Python exceptions are rendered as plain errors
-    @test_throws "math domain error" Context.@pysafe pyimport("math").sqrt(-1)
+    vals = Dict("camera.data" => DimArray([-1], (Dim{:trainId}([10]),)))
+    @test_logs (:error, r"Execution of variable 'root' failed") match_mode=:any Context.run(ctx, vals)
 end
 
 end

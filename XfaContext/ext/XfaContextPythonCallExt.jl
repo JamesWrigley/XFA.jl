@@ -10,21 +10,6 @@ import DimensionalData as DD
 using FileWatching: FDWatcher
 using PythonCall
 
-# Serialises Julia tasks' use of Python. Native code may drop the GIL mid-call
-# and re-take it in a GC-unsafe ccall, which deadlocks if another Julia thread
-# took the GIL meanwhile and then waits for a GC. PythonCall's own thread-state
-# management doesn't prevent that. Waiting on this lock yields, so it can't
-# block the GC.
-const PYTHON_LOCK = ReentrantLock()
-
-# Run `expr` in a Python region under the Python lock. Keep Julia blocking
-# primitives (`put!`, `wait`) outside it.
-macro pysafe_impl(expr)
-    quote
-        @lock PYTHON_LOCK @pyregion $(esc(expr))
-    end
-end
-
 # Build the KeyData for a dependency. Control (slow) data is keyed with a
 # `.value` suffix, so fall back to that when the bare property isn't a key of
 # the source.
@@ -58,74 +43,27 @@ function label_sources(selection, deps)
     return sources, labels
 end
 
-# Showing a Python exception calls into Python, which the pipeline's logging
-# would do outside the Python lock, so re-raise it as a plain error rendered
-# under the lock.
-# `backtrace=false` would also drop the Python stacktrace, so pass an empty
-# Julia backtrace instead; the new error carries its own.
-function XfaContext.pysafe_rethrow(ex)
-    if ex isa PyException
-        msg = @pysafe_impl sprint((io, ex) -> showerror(io, ex, []; backtrace=true), ex)
-        throw(ErrorException(msg))
-    end
-    rethrow()
-end
-
-function pyguard(f)
-    try
-        f()
-    catch ex
-        XfaContext.pysafe_rethrow(ex)
-    end
-end
-
-function XfaContext.pysafe_enter()
-    lock(PYTHON_LOCK)
-    task = current_task()
-    state = PythonCall.C.current_task_state(task)
-    return (task, state, PythonCall.C.enter_region(task, state))
-end
-
-# Also frees Python objects finalized while detached since the last call,
-# which would otherwise pile up while the pipeline runs.
-function XfaContext.pysafe_exit((task, state, token))
-    try
-        PythonCall.GC.gc()
-    finally
-        PythonCall.C.exit_region(task, state, token)
-        unlock(PYTHON_LOCK)
-    end
-end
-
 function XfaContext.open_data_collection(proposal::Integer, run::Integer, directory::AbstractString)
-    pyguard() do
-        @pysafe_impl begin
-            extra_data = pyimport("extra_data")
-            if isempty(directory)
-                extra_data.open_run(proposal, run)
-            else
-                extra_data.RunDirectory(directory)
-            end
-        end
+    extra_data = pyimport("extra_data")
+    if isempty(directory)
+        return extra_data.open_run(proposal, run)
+    else
+        return extra_data.RunDirectory(directory)
     end
 end
 
 # `(device, class_id)` pairs like a webproxy lists devices: instrument sources
 # `DEV:pipe` collapse to their device.
 function XfaContext.data_collection_devices(dc::Py)
-    pyguard() do
-        @pysafe_impl begin
-            devices = Dict{String, String}()
-            for src in dc.control_sources
-                class_id = dc[src].device_class
-                devices[pyconvert(String, src)] = pyis(class_id, pybuiltins.None) ? "" : pyconvert(String, class_id)
-            end
-            for src in dc.instrument_sources
-                get!(devices, first(split(pyconvert(String, src), ':')), "")
-            end
-            return sort!([(name, class_id) for (name, class_id) in devices])
-        end
+    devices = Dict{String, String}()
+    for src in dc.control_sources
+        class_id = dc[src].device_class
+        devices[pyconvert(String, src)] = pyis(class_id, pybuiltins.None) ? "" : pyconvert(String, class_id)
     end
+    for src in dc.instrument_sources
+        get!(devices, first(split(pyconvert(String, src), ':')), "")
+    end
+    return sort!([(name, class_id) for (name, class_id) in devices])
 end
 
 function insert_leaf!(node, key)
@@ -139,42 +77,34 @@ end
 # A Karabo-style schema for a device in the run, in the shape the client's
 # `schema_property_names` parses.
 function XfaContext.data_collection_schema(dc::Py, device::AbstractString)
-    pyguard() do
-        @pysafe_impl begin
-            schema = Dict{String, Any}()
-            if pyconvert(Bool, device in dc.control_sources)
-                for key in dc[device].keys(; inc_timestamps=false)
-                    insert_leaf!(schema, pyconvert(String, key))
-                end
-            end
-
-            for src in dc.instrument_sources
-                dev, pipe = split(pyconvert(String, src), ':'; limit=2)
-                if dev == device
-                    pipe_schema = Dict{String, Any}()
-                    for key in dc[src].keys()
-                        insert_leaf!(pipe_schema, pyconvert(String, key))
-                    end
-                    schema[String(pipe)] = Dict{String, Any}("noInputShared" => true, "schema" => pipe_schema)
-                end
-            end
-            return schema
+    schema = Dict{String, Any}()
+    if pyconvert(Bool, device in dc.control_sources)
+        for key in dc[device].keys(; inc_timestamps=false)
+            insert_leaf!(schema, pyconvert(String, key))
         end
     end
+
+    for src in dc.instrument_sources
+        dev, pipe = split(pyconvert(String, src), ':'; limit=2)
+        if dev == device
+            pipe_schema = Dict{String, Any}()
+            for key in dc[src].keys()
+                insert_leaf!(pipe_schema, pyconvert(String, key))
+            end
+            schema[String(pipe)] = Dict{String, Any}("noInputShared" => true, "schema" => pipe_schema)
+        end
+    end
+    return schema
 end
 
 # Build an assembler from an extra-geom geometry object, the same way as
 # generate_assembly_lut.py: each assembled pixel holds the 0-based C-flat index
 # of the input pixel that landed there (NaN in gaps).
 function XfaContext.AssemblerLUT(geom::Py)
-    data_shape, assembled = pyguard() do
-        @pysafe_impl begin
-            np = pyimport("numpy")
-            data_shape = pyconvert(Tuple{Int, Int, Int}, geom.expected_data_shape)
-            idx = np.arange(prod(data_shape); dtype=np.float64).reshape(data_shape...)
-            (data_shape, pyconvert(Array{Float64}, geom.position_modules_fast(idx)[0]))
-        end
-    end
+    np = pyimport("numpy")
+    data_shape = pyconvert(Tuple{Int, Int, Int}, geom.expected_data_shape)
+    idx = np.arange(prod(data_shape); dtype=np.float64).reshape(data_shape...)
+    assembled = pyconvert(Array{Float64}, geom.position_modules_fast(idx)[0])
 
     # The transpose's column-major order is the numpy array's C-flat order
     ny, nx = size(assembled)
@@ -254,25 +184,21 @@ end
 # streamer reads up to `buffer_slots` chunks of `trains_per_chunk` trains ahead.
 function XfaContext.open_stream(dc::Py, deps::Vector{Dependency}, monitored::Vector{Dependency}=Dependency[];
                                 trains_per_chunk=2, buffer_slots=8)
-    pyguard() do
-        @pysafe_impl begin
-            if isempty(deps)
-                train_ids = pyconvert(Vector{Int}, dc.train_ids)
-                return TrainStream(nothing, nothing, deps, monitored, Dict{String, Symbol}(), train_ids,
-                                   Base.Lockable(Dict{Int, Py}()), Dict{String, Any}(), Dict{String, Int}())
-            end
-
-            selection = dc.select(unique([(dep.source, dep.property) for dep in deps]); require_all=true)
-            train_ids = pyconvert(Vector{Int}, selection.train_ids)
-            sources, labels = label_sources(selection, deps)
-            streamer = pyimport("extra_data.export").MemoryStreamer()
-            iterator = streamer.event_iterator(sources; trains_per_part=1,
-                                               reader_trains_per_chunk=trains_per_chunk,
-                                               n_buffer_slots=buffer_slots)
-            return TrainStream(streamer, iterator, deps, monitored, labels, train_ids,
-                               Base.Lockable(Dict{Int, Py}()), Dict{String, Any}(), Dict{String, Int}())
-        end
+    if isempty(deps)
+        train_ids = pyconvert(Vector{Int}, dc.train_ids)
+        return TrainStream(nothing, nothing, deps, monitored, Dict{String, Symbol}(), train_ids,
+                           Base.Lockable(Dict{Int, Py}()), Dict{String, Any}(), Dict{String, Int}())
     end
+
+    selection = dc.select(unique([(dep.source, dep.property) for dep in deps]); require_all=true)
+    train_ids = pyconvert(Vector{Int}, selection.train_ids)
+    sources, labels = label_sources(selection, deps)
+    streamer = pyimport("extra_data.export").MemoryStreamer()
+    iterator = streamer.event_iterator(sources; trains_per_part=1,
+                                       reader_trains_per_chunk=trains_per_chunk,
+                                       n_buffer_slots=buffer_slots)
+    return TrainStream(streamer, iterator, deps, monitored, labels, train_ids,
+                       Base.Lockable(Dict{Int, Py}()), Dict{String, Any}(), Dict{String, Int}())
 end
 
 # Convert a train object to the `(tid, data)` the input emits. Files have no
@@ -317,68 +243,55 @@ function XfaContext.feed!(stream::TrainStream, channel, rate=Ref(Inf))
         return
     end
 
-    pyguard() do
-        iterator = stream.iterator
-        fd = @pysafe_impl pyconvert(Int, iterator.fd)
-        watcher = FDWatcher(RawFD(fd), true, false)
+    iterator = stream.iterator
+    watcher = FDWatcher(RawFD(pyconvert(Int, iterator.fd)), true, false)
 
-        try
+    try
+        while true
+            wait(watcher)
+
             while true
-                wait(watcher)
-
-                while true
-                    train = @pysafe_impl begin
-                        td = iterator.get()
-                        pyis(td, pybuiltins.None) ? nothing : (train_data(stream, td)..., td)
-                    end
-
-                    if isnothing(train)
-                        break
-                    end
-
-                    tid, data, td = train
-                    @lock stream.pending stream.pending[][tid] = td
-                    wait_time = next - time()
-                    if wait_time > 0
-                        sleep(wait_time)
-                    end
-                    next = time() + 1 / rate[]
-                    put!(channel, (tid, data))
-                end
-
-                if @pysafe_impl pyconvert(Bool, iterator.ended)
+                td = iterator.get()
+                if pyis(td, pybuiltins.None)
                     break
                 end
+
+                tid, data = train_data(stream, td)
+                @lock stream.pending stream.pending[][tid] = td
+                wait_time = next - time()
+                if wait_time > 0
+                    sleep(wait_time)
+                end
+                next = time() + 1 / rate[]
+                put!(channel, (tid, data))
             end
-        catch ex
-            if !(ex isa InvalidStateException)
-                rethrow()
+
+            if pyconvert(Bool, iterator.ended)
+                break
             end
-        finally
-            close(watcher)
         end
+    catch ex
+        if !(ex isa InvalidStateException)
+            rethrow()
+        end
+    finally
+        close(watcher)
     end
 end
 
 function XfaContext.release!(stream::TrainStream, tid::Integer)
     if !isnothing(stream.iterator)
         td = @lock stream.pending pop!(stream.pending[], tid)
-        pyguard() do
-            @pysafe_impl stream.iterator.done(td)
-        end
+        stream.iterator.done(td)
     end
 end
 
 function Base.close(stream::TrainStream)
     if !isnothing(stream.iterator)
-        pyguard() do
-            @pysafe_impl begin
-                try
-                    stream.iterator.close()
-                finally
-                    stream.streamer.close()
-                end
-            end
+        try
+            stream.iterator.close()
+        finally
+            stream.streamer.close()
         end
     end
 end
@@ -397,10 +310,8 @@ end
 function XfaContext.run(ctx::ContextState, dc::Py;
                         select=String[], override=Dict{String, Any}(),
                         trains_per_chunk=2, buffer_slots=8)
-    @pysafe_impl begin
-        if !is_data_collection(dc)
-            throw(ArgumentError("Expected an extra_data DataCollection, got a $(pytype(dc))"))
-        end
+    if !is_data_collection(dc)
+        throw(ArgumentError("Expected an extra_data DataCollection, got a $(pytype(dc))"))
     end
 
     plan = copy(ctx)
