@@ -154,10 +154,10 @@ function node_tooltip(text)
     # The foreground list is unscaled screen space, but when zoomed in the frame
     # density is cranked up for the canvas-magnified node text; that bakes this
     # tooltip oversized and minifies it (aliasing). Bake at the displayed size.
-    frame_density = ig.GetFontRasterizerDensity()
-    ig.SetFontRasterizerDensity(1f0)
+    frame_density = ne.get_pixel_density()
+    ne.set_pixel_density(1f0)
     ig.AddText(draw_list, font, font_size, pos, IM_COL32(230, 230, 230, 255), text)
-    ig.SetFontRasterizerDensity(frame_density)
+    ne.set_pixel_density(frame_density)
     ig.PopClipRect(draw_list)
 end
 
@@ -844,7 +844,7 @@ function draw_variable(name, var_data)
     draw_list = ig.GetWindowDrawList()
     start_pos = ig.GetCursorScreenPos()
     gray = ig.IM_COL32(100, 100, 100, 255)
-    ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
+    ig.AddLineH(draw_list, start_pos.x, start_pos.x + min_node_width / 2f0, start_pos.y, gray, 2)
     ig.Dummy(min_node_width, 2)
 
     # Draw outputs
@@ -922,7 +922,7 @@ function draw_variable(name, var_data)
         ig.Dummy(min_node_width, 8)
         ig.TextDisabled("Postprocessors")
         pp_sep_pos = ig.GetCursorScreenPos()
-        ig.AddLine(draw_list, pp_sep_pos, (pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y), gray, 2)
+        ig.AddLineH(draw_list, pp_sep_pos.x, pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y, gray, 2)
         ig.Dummy(min_node_width, 2)
 
         for pp in postprocessors
@@ -1016,7 +1016,7 @@ function draw_variable(name, var_data)
     ig.AddRectFilled(ne.GetNodeBackgroundDrawList(handle),
                      (node_pos.x + border, node_pos.y + border),
                      (node_pos.x + node_size.x - border, title_bottom),
-                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundCornersTop)
+                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundTop)
 
     if !isnothing(pending)
         ne.PopStyleColor()
@@ -1383,7 +1383,7 @@ function draw_dag()
         # base size. Match the font rasterizer density to the magnification (snapped
         # up to a power of two so the bake cache stays warm) to keep text crisp.
         magnification = ne.current_scale()
-        ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
+        ne.set_pixel_density(exp2(ceil(log2(max(magnification, 1f0)))))
 
         # Keep the front node from before a click or edit started, so the node
         # being interacted with isn't disabled partway through.
@@ -1900,70 +1900,6 @@ end
 
 default(value, default="") = something(value, default)
 
-# ImGui's GLFW backend (1.92.6+) remembers the last cursor it applied in a
-# single field shared by all viewports, so after the main window is updated
-# every secondary viewport window is skipped and never changes cursor. Apply
-# the frame's cursor to those windows ourselves. GLFW.jl's wrappers assert the
-# main thread, which the render loop isn't on, hence calling libglfw directly.
-const glfw_cursors = Dict{ig.ImGuiMouseCursor_, Ptr{Cvoid}}()
-const viewport_cursors = Dict{Ptr{Cvoid}, ig.ImGuiMouseCursor_}()
-
-function update_viewport_cursors()
-    cursor = ig.ImGuiMouseCursor_(ig.GetMouseCursor())
-    if cursor == ig.ImGuiMouseCursor_None || unsafe_load(ig.GetIO().MouseDrawCursor)
-        return
-    end
-    if !haskey(glfw_cursors, cursor)
-        shape = if cursor == ig.ImGuiMouseCursor_TextInput
-            GLFW.IBEAM_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeAll
-            GLFW.RESIZE_ALL_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNS
-            GLFW.RESIZE_NS_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeEW
-            GLFW.RESIZE_EW_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNESW
-            GLFW.RESIZE_NESW_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNWSE
-            GLFW.RESIZE_NWSE_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_Hand
-            GLFW.POINTING_HAND_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_NotAllowed
-            GLFW.NOT_ALLOWED_CURSOR
-        else
-            GLFW.ARROW_CURSOR
-        end
-        # Not every X11 cursor theme has the GLFW 3.4 shapes; like ImGui's
-        # backend, fall back to the arrow for those.
-        glfw_cursors[cursor] = try
-            @ccall GLFW.libglfw.glfwCreateStandardCursor(shape::Cint)::Ptr{Cvoid}
-        catch err
-            if !(err isa GLFW.GLFWError)
-                rethrow()
-            end
-            @ccall GLFW.libglfw.glfwCreateStandardCursor(GLFW.ARROW_CURSOR::Cint)::Ptr{Cvoid}
-        end
-    end
-
-    main_window = unsafe_load(ig.GetMainViewport().PlatformHandle)
-    viewports = unsafe_load(ig.GetPlatformIO().Viewports)
-    windows = Set{Ptr{Cvoid}}()
-    for i in 1:viewports.Size
-        window = unsafe_load(unsafe_load(viewports.Data, i).PlatformHandle)
-        if window == C_NULL || window == main_window
-            continue
-        end
-        push!(windows, window)
-        if !haskey(viewport_cursors, window) || viewport_cursors[window] != cursor
-            viewport_cursors[window] = cursor
-            @ccall GLFW.libglfw.glfwSetCursor(window::Ptr{Cvoid}, glfw_cursors[cursor]::Ptr{Cvoid})::Cvoid
-        end
-    end
-    # A closed window's address may be reused by a new one that starts out with
-    # the default cursor, so forget windows that are gone.
-    filter!(kv -> kv.first in windows, viewport_cursors)
-end
-
 # Consumes a pending state[].select_tab request for `tab`
 function tab_flags(tab::MainTab)
     if state[].select_tab == tab
@@ -2243,8 +2179,6 @@ function draw_gui()
         save_settings(client)
         io.WantSaveIniSettings = false
     end
-
-    update_viewport_cursors()
 end
 
 function timestamped_metafmt(level, _module, group, id, file, line)

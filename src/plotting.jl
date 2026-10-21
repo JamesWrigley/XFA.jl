@@ -1087,8 +1087,8 @@ function interactive_colorbar(img::ImageState, id, size::ImVec2)
     thickness = 5.0f0
     min_color = near_handle === :min ? hover_color : base_color
     max_color = near_handle === :max ? hover_color : base_color
-    ig.AddLine(draw, ImVec2(rect_min.x, y_min_px), ImVec2(rect_max.x, y_min_px), min_color, thickness)
-    ig.AddLine(draw, ImVec2(rect_min.x, y_max_px), ImVec2(rect_max.x, y_max_px), max_color, thickness)
+    ig.AddLineH(draw, rect_min.x, rect_max.x, y_min_px, min_color, thickness, ig.ImDrawFlags_StrokeCenter)
+    ig.AddLineH(draw, rect_min.x, rect_max.x, y_max_px, max_color, thickness, ig.ImDrawFlags_StrokeCenter)
 
     changed = false
 

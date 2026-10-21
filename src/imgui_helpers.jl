@@ -193,7 +193,7 @@ macro NodeEditor(editor, name, expr)
             $(esc(expr))
         finally
             ne.End()
-            ig.SetFontRasterizerDensity(1f0)
+            ne.set_pixel_density(1f0)
             ne.SetCurrentEditor(C_NULL)
         end
     end
