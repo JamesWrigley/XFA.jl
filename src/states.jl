@@ -662,13 +662,12 @@ struct PendingRequest
     sent_at::Float64
 end
 
-struct EngineLog
-    timestamp::Float64
-    message::String
-    extra_details::Maybe{String}
+@kwdef mutable struct VariableLogs
+    records::CircularBuffer{Protocol.LogRecord} = CircularBuffer{Protocol.LogRecord}(100)
+    # Errors received while the log window was closed
+    unseen_errors::Int = 0
+    window_open::Bool = false
 end
-
-EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
 
 # Per-variable subscription state. `count` tracks open plots referencing the
 # variable; when it drops to zero we flip `active` off (so the engine stops
@@ -814,9 +813,9 @@ end
     # the decompression scratch buffers don't get resized on every payload.
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
-    # Engine log messages
-    engine_logs::Vector{EngineLog} = EngineLog[]
-    log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"
+    # Engine log messages, with consecutive repeats merged
+    engine_logs::CircularBuffer{Protocol.LogRecord} = CircularBuffer{Protocol.LogRecord}(500)
+    variable_logs::Dict{String, VariableLogs} = Dict{String, VariableLogs}()
 
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()

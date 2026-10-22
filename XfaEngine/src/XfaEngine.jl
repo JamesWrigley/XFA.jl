@@ -31,11 +31,17 @@ using DimensionalData: DimArray
 
 using .Protocol
 using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
-using Accessors: @set
+using Accessors: @set, setproperties
 
 # The KaraboInput @Group/@Input lives here (not in Context) because it depends
 # on the engine's webproxy/device discovery and the ZMQ KaraboBridge transport.
 include("karabo_input.jl")
+
+using Base.CoreLogging: AbstractLogger, LogLevel, Info, global_logger
+using Base.ScopedValues: ScopedValue, @with
+using DataStructures: CircularBuffer
+using LoggingExtras: TeeLogger
+include("gui_logger.jl")
 
 
 """Find the closest available port to `port_hint`."""
@@ -73,6 +79,9 @@ end
     # forwarded, mapped to the noise multiplier k (0 lossless, -1 for default).
     # Updated via `SetVariableSubscriptions`.
     subscriptions::Dict{String, Float64} = Dict{String, Float64}()
+
+    # Set once broadcast_logs() has sent the log history
+    logs_seeded::Bool = false
 end
 
 @kwdef mutable struct EngineState
@@ -99,6 +108,10 @@ end
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
     channel_stats_task::Union{Task, Nothing} = nothing
+
+    gui_logger::GuiLogger = GuiLogger()
+    previous_logger::Union{AbstractLogger, Nothing} = nothing
+    log_broadcast_task::Union{Task, Nothing} = nothing
 
     stop_event::Base.Event = Base.Event()
     stop_task::Union{Task, Nothing} = nothing
@@ -366,6 +379,38 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
     end
 end
 
+# Periodically send the logs collected by the GuiLogger to all clients
+function broadcast_logs(state::EngineState; period=0.3)
+    @with in_log_broadcast => true while !state.stop_event.set
+        sleep(period)
+        records = take_pending!(state.gui_logger)
+        clients = collect(values(state.clients))
+
+        # New clients get the whole history instead, which already includes the
+        # pending records, so nothing is sent twice or out of order.
+        history = if any(client -> !client.logs_seeded, clients)
+            log_history(state.gui_logger)
+        else
+            Protocol.LogRecord[]
+        end
+
+        for client in clients
+            replay = !client.logs_seeded
+            to_send = replay ? history : records
+            client.logs_seeded = true
+            if isempty(to_send)
+                continue
+            end
+
+            try
+                Protocol.server_send(client.websocket, Protocol.LogMessages(to_send, replay))
+            catch ex
+                @debug "Failed to send LogMessages to client" exception=(ex, catch_backtrace())
+            end
+        end
+    end
+end
+
 """Close connections to all clients and optionally the websocket listener."""
 function shutdown(state::EngineState, ws_server=nothing)
     if ws_server != nothing
@@ -376,6 +421,10 @@ function shutdown(state::EngineState, ws_server=nothing)
 
     for client in values(state.clients)
         close(client.websocket)
+    end
+
+    if !isnothing(state.previous_logger)
+        global_logger(state.previous_logger)
     end
 end
 
@@ -497,6 +546,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
             ctx
         catch ex
+            @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
             Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
@@ -521,7 +571,6 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
                 Protocol.server_send(ws, Ack(start_error))
             end
         else
-            @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
             Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[], ""); reply_to)
         end
     elseif msg isa ReviseCode
@@ -642,6 +691,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     websocket_port = getavailableport(1331)
     state = EngineState(; websocket_port, stop_event)
     global current_engine_state = state
+    state.previous_logger = global_logger(TeeLogger(global_logger(), state.gui_logger))
 
     if haskey(ENV, "SASE")
         merge!(state.webproxies, Dict(instrument => WebProxy(address)
@@ -721,6 +771,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     state.channel_stats_task = Threads.@spawn :interactive broadcast_channel_stats(state)
     errormonitor(state.channel_stats_task)
 
+    state.log_broadcast_task = Threads.@spawn :interactive broadcast_logs(state)
+    errormonitor(state.log_broadcast_task)
+
     state.stop_task = Threads.@spawn :interactive try
         Base.wait(state.stop_event)
     catch ex
@@ -736,6 +789,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     if wait
         Base.wait(state.stop_task)
         Base.wait(state.channel_stats_task)
+        Base.wait(state.log_broadcast_task)
     end
 
     return state
@@ -774,6 +828,7 @@ precompile(Context.get_sources, (KaraboInput,))
                 notify(state.stop_event)
                 wait(state.stop_task)
                 wait(state.channel_stats_task)
+                wait(state.log_broadcast_task)
             end
         end
     end

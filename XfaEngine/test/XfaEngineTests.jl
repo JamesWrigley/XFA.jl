@@ -21,6 +21,7 @@ ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
 using Logging: Logging
 using Sockets: Sockets, @ip_str, send, recv
 using Statistics: mean
+using Base.ScopedValues: @with
 using Test: with_logger, TestLogger
 using ReTest: @testset, @test, @test_throws, @test_logs
 
@@ -1290,6 +1291,72 @@ end
         plain = compress_array(ws, randn(600))
         @test restore_dims(allocate_array(plain), plain) isa Vector{Float64}
     end
+end
+
+@testset "GuiLogger" begin
+    # Only info and above are kept, and only consecutive repeats with the
+    # same variable, message, values and exception are merged.
+    logger = engine.GuiLogger()
+    thrower1() = error("same")
+    thrower2() = error("same")
+    log_failed(value) = @error "Failed" value
+    with_logger(logger) do
+        @debug "Ignored"
+        for (name, tid, msg) in [("x", 1, "a"), ("x", 2, "a"), ("y", 3, "a"), ("x", 4, "a"), ("x", 5, "b")]
+            @with Context.Meta.name => name Context.Meta.tid => tid @warn "Warning" exception=ErrorException(msg)
+        end
+        # The same exception thrown from a different place isn't merged
+        for f in (thrower1, thrower1, thrower2)
+            try
+                f()
+            catch ex
+                @error "Failed" exception=(ex, catch_backtrace())
+            end
+        end
+        log_failed(2)
+        log_failed(1)
+        @with engine.in_log_broadcast => true @error "Suppressed"
+    end
+
+    records = engine.take_pending!(logger)
+    @test [(r.variable, r.tid, r.count) for r in records] ==
+        [("x", 2, 2), ("y", 3, 1), ("x", 4, 1), ("x", 5, 1), ("", -1, 2), ("", -1, 1), ("", -1, 1), ("", -1, 1)]
+    @test records[4].details == "b"
+    @test contains(records[6].details, "thrower2")
+    @test [r.details for r in records[7:8]] == ["value = 2", "value = 1"]
+    @test isempty(engine.take_pending!(logger))
+    @test engine.log_history(logger) == records
+
+    # Repeats spanning two takes are merged in the history
+    with_logger(() -> log_failed(1), logger)
+    @test only(engine.take_pending!(logger)).count == 1
+    history = engine.log_history(logger)
+    @test length(history) == length(records)
+    @test history[end].count == 2
+
+    # Errors from a variable's task are attributed to the variable
+    ctx = Context.load_from_string("""
+    @Input function input(::Context.MockInput, output)
+        for tid in 1:3
+            put!(output, (tid, Dict("foo" => Dict("bar" => tid))))
+        end
+    end
+    i = Context.MockInput()
+
+    @Variable function failing(data -> karabo"foo.bar")
+        error("boom")
+    end
+    """)
+    logger = engine.GuiLogger()
+    with_logger(logger) do
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+    end
+
+    failures = filter(r -> r.variable == "failing", engine.take_pending!(logger))
+    @test sum(r.count for r in failures) == 3
+    @test all(r -> contains(r.details, "boom"), failures)
 end
 
 end

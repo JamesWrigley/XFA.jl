@@ -12,11 +12,12 @@ using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
-using Dates: Dates, unix2datetime, @dateformat_str
+using Dates: Dates
 using DataStructures: CircularBuffer, OrderedDict
 using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
+using XfaEngine: XfaEngine, Protocol
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
     ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
@@ -38,11 +39,11 @@ using CRC32c: crc32c
 using LibGit2: LibGit2
 using Sentry: Sentry
 using LoggingExtras: TeeLogger
+using Base.CoreLogging: CoreLogging
 using Base.Filesystem: Filesystem, JL_O_WRONLY, JL_O_CREAT, JL_O_APPEND
 using XfaContext: XfaContext
 using Serialization
 using XfaEngine.Protocol
-using XfaEngine: XfaEngine, Protocol
 using XfaContext: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
     subvariable_dependency,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
@@ -700,20 +701,48 @@ function draw_variable(name, var_data)
         # Bottom of the title, used to size the header background drawn after
         # EndNode. The Dummy adds breathing room between the header and content.
         title_bottom = ig.GetItemRectMax().y
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
-        # Right-aligned delete button in the header. It does nothing for real
-        # nodes yet; for pending nodes it discards them. Placed on the title row
-        # via content_width (last frame's width), then the cursor is restored to
-        # below the title so the rest of the node stacks normally.
-        after_title = ig.GetCursorPos()
+        # Logs and delete buttons, right-aligned on the title row. The measured
+        # width includes them so they don't overlap the title.
         del_w = ig.GetTextLineHeight()
+        spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+
+        # The logs button shows the number of unseen errors, and widens for it
+        logs = get(client.variable_logs, name, nothing)
+        has_logs = !isnothing(logs) && !isempty(logs.records)
+        unseen_errors = has_logs ? logs.unseen_errors : 0
+        logs_text = unseen_errors > 0 ? "\uf03a $(unseen_errors)" : "\uf03a"
+        logs_w = unseen_errors > 0 ? ig.CalcTextSize(logs_text).x + del_w / 2 : del_w
+
+        content_measured = max(content_measured, ig.GetItemRectSize().x + 2 * spacing + logs_w + del_w)
+        after_title = ig.GetCursorPos()
+        # The icons only fit in the buttons without the horizontal frame padding,
+        # and 3/4 of the vertical padding centers them vertically
+        ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(0, 0.75 * unsafe_load(ig.GetStyle().FramePadding.y)))
+
+        ig.SetCursorPos((title_pos.x + content_width - del_w - spacing - logs_w, title_pos.y))
+        if unseen_errors > 0
+            ig.PushStyleColor(ig.ImGuiCol_Button, ImVec4(0.8, 0.2, 0.2, 1))
+            ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ImVec4(0.9, 0.3, 0.3, 1))
+        end
+        @Disabled !has_logs begin
+            if ig.Button("$(logs_text)###logs-$(var_data["id"])", (logs_w, del_w))
+                logs.window_open = true
+                logs.unseen_errors = 0
+                ig.SetWindowFocus("###logs-$(name)")
+            end
+        end
+        if unseen_errors > 0
+            ig.PopStyleColor(2)
+        end
+
         ig.SetCursorPos((title_pos.x + content_width - del_w, title_pos.y))
         if ig.Button("##delete-$(var_data["id"])", (del_w, del_w))
             if !isnothing(pending)
                 filter!(p -> p !== pending, client.pending_nodes)
             end
         end
+        ig.PopStyleVar()
         ig.SetCursorPos(after_title)
 
         if !isnothing(pending)
@@ -1821,38 +1850,74 @@ function draw_plots()
     end
 end
 
-function draw_engine_logs()
-    client = state[].client
-
+function draw_logs(records::CircularBuffer{Protocol.LogRecord}; expanded::Bool=false)
     ig.Dummy(0, 5)
     if ig.Button("Clear all logs")
-        empty!(client.engine_logs)
+        empty!(records)
     end
 
     ig.Dummy(0, 5)
     ig.Separator()
 
-    for (i, log) in enumerate(client.engine_logs)
+    ig.BeginChild("##logs")
+    for (i, log) in enumerate(records)
         ig.PushID(i)
 
-        timestamp = Dates.format(unix2datetime(log.timestamp), client.log_dateformat)
+        timestamp = Libc.strftime("%Y-%m-%d %H:%M:%S", log.timestamp)
         ig.Text(timestamp)
         ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  ").x)
 
-        if !isnothing(log.extra_details)
-            CopyButton("log", log.message * "\n" * log.extra_details)
+        if log.level >= CoreLogging.Error
+            ig.TextColored(ImVec4(0.9, 0.3, 0.3, 1), string(log.level))
+        elseif log.level >= CoreLogging.Warn
+            ig.TextColored(ImVec4(0.9, 0.7, 0.2, 1), string(log.level))
+        else
+            ig.TextDisabled(string(log.level))
+        end
+        ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  Error  ").x)
+
+        message = log.message
+        if log.count > 1
+            message *= " (x$(log.count))"
+        end
+
+        if !isempty(log.details)
+            CopyButton("log", message * "\n" * log.details)
             ig.SameLine()
-            if ig.TreeNode(log.message)
-                ig.TextUnformatted(log.extra_details)
+            if expanded
+                ig.SetNextItemOpen(true, ig.ImGuiCond_Once)
+            end
+            if ig.TreeNode("$(message)###log")
+                ig.TextUnformatted(log.details)
                 ig.TreePop()
             end
         else
-            CopyButton("log", log.message)
+            CopyButton("log", message)
             ig.SameLine()
-            ig.BulletText(log.message)
+            # Not BulletText(), which would treat the message as a format string
+            ig.Bullet()
+            ig.TextUnformatted(message)
         end
 
         ig.PopID()
+    end
+
+    # Follow new logs while scrolled to the bottom
+    if ig.GetScrollY() >= ig.GetScrollMaxY()
+        ig.SetScrollHereY(1.0)
+    end
+    ig.EndChild()
+end
+
+function draw_variable_logs(client::ClientState)
+    for (name, logs) in client.variable_logs
+        if logs.window_open
+            ig.SetNextWindowSize((800, 400), ig.ImGuiCond_FirstUseEver)
+            if @c ig.Begin("Logs: $(name)###logs-$(name)", &logs.window_open)
+                draw_logs(logs.records; expanded=true)
+            end
+            ig.End()
+        end
     end
 end
 
@@ -2104,7 +2169,7 @@ function draw_gui()
 
         if state[].show_engine_logs
             if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, tab_flags(MainTab_EngineLogs))
-                draw_engine_logs()
+                draw_logs(client.engine_logs)
                 ig.EndTabItem()
             end
         end
@@ -2119,6 +2184,8 @@ function draw_gui()
     # The Karabo source editor, opened by any inline KaraboDepText widget. Drawn
     # here at the top level so it escapes the node canvas and works from any tab.
     draw_karabo_editor(client)
+
+    draw_variable_logs(client)
 
     # Display tooling windows
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),

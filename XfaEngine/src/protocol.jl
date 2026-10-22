@@ -192,6 +192,28 @@ struct Ack <: AbstractMessage
 end
 Ack() = Ack(nothing)
 
+# A log record from the engine, pre-formatted to strings. `variable` is the
+# `Meta.name` it was logged under ("" if none). Consecutive records with the
+# same `key` are repeats, merged by adding up their `count`.
+@kwdef struct LogRecord
+    timestamp::Float64 = time()
+    level::Base.CoreLogging.LogLevel
+    message::String
+    details::String = ""
+    variable::String = ""
+    tid::Int = -1
+    key::UInt64 = 0
+    file::String = ""
+    line::Int = -1
+    count::Int = 1
+end
+
+struct LogMessages <: AbstractMessage
+    records::Vector{LogRecord}
+    # Set for the history sent to a newly connected client
+    replay::Bool
+end
+
 const MessageId = Int
 
 struct Envelope

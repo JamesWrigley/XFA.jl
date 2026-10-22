@@ -1214,7 +1214,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
 
         ctx.input_channels[name] = Channel(1)
-        ctx.input_tasks[name] = Threads.@spawn input_wrapper(name, group, ctx.input_channels[name])
+        ctx.input_tasks[name] = Threads.@spawn @with Meta.name => name input_wrapper(name, group, ctx.input_channels[name])
         errormonitor(ctx.input_tasks[name])
     end
 
@@ -1247,7 +1247,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(ctx, name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates, get(monitors, name, []))
+        ctx.input_variables_tasks[name] = Threads.@spawn :samepool @with Meta.name => name stream_input(ctx, name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates, get(monitors, name, []))
         errormonitor(ctx.input_variables_tasks[name])
     end
 
@@ -1265,7 +1265,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
-        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
+        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool @with Meta.name => dep_name stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
 
@@ -1325,7 +1325,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
             pp_name => ctx.postprocessors[pp_name]
             for pp_name in get(ctx.variable_postprocessors, name, String[])
         )
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
+        ctx.variable_tasks[name] = Threads.@spawn @with Meta.name => name stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
         errormonitor(ctx.variable_tasks[name])
     end
 

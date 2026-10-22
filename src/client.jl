@@ -2,10 +2,13 @@ const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
 const DISPLAY_JUMP = "max-exfl-display003.desy.de"
 
-function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
-    push!(state.client.engine_logs, EngineLog(message, extra_details))
-    state.show_engine_logs = true
-    state.select_tab = MainTab_EngineLogs
+# Append a log record, merging it into the last one if it's a repeat
+function push_log!(logs::CircularBuffer{Protocol.LogRecord}, record::Protocol.LogRecord)
+    if !isempty(logs) && logs[end].key == record.key
+        logs[end] = @set record.count = record.count + logs[end].count
+    else
+        push!(logs, record)
+    end
 end
 
 function send(client::ClientState, msg::AbstractMessage)
@@ -1117,10 +1120,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = PipelineStatus_Stopped
 
     elseif msg isa InputSources
-        if msg.input_sources isa ExceptionMessage
-            @error "Error from server with INPUTSOURCES" exception=msg.input_sources.text
-            log_engine_error(state, "Failed to get the input sources", msg.input_sources.text)
-        else
+        if !(msg.input_sources isa ExceptionMessage)
             client.sources_by_input = msg.input_sources
             client.source_list = build_source_list(Iterators.flatten(values(msg.input_sources)))
 
@@ -1139,10 +1139,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remote_context_dir = msg.context
 
     elseif msg isa AvailableVariables
-        if msg.variables isa ExceptionMessage
-            @error "Error from server with AvailableVariables" exception=msg.variables.text
-            log_engine_error(state, "Failed to get the available variables", msg.variables.text)
-        else
+        if !(msg.variables isa ExceptionMessage)
             client.available_variables = msg.variables
         end
 
@@ -1168,10 +1165,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remap_rules = msg.rules
 
     elseif msg isa DeviceSchema
-        if msg.schema isa ExceptionMessage
-            @error "Error from server with DEVICESCHEMA" exception=msg.schema.text
-            log_engine_error(state, "Failed to get the schema of $(msg.topic)//$(msg.name)", msg.schema.text)
-        else
+        if !(msg.schema isa ExceptionMessage)
             client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         end
         delete!(client.device_schema_requests, (msg.topic, msg.name))
@@ -1186,18 +1180,38 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.input_topics = msg.info["input_topics"]
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
+            filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_logs)
             # The new context has its own inputs, so the sources we complete
             # against have changed.
             get_input_sources(client)
             # A newly loaded context may pull in packages that register more
             # variables, so refresh the add-variable palette.
             get_available_variables(client)
-        else
-            @error "Context failed to load"
-            log_engine_error(state, "Context failed to load", msg.info.text)
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
+    elseif msg isa Protocol.LogMessages
+        for record in msg.records
+            is_new_error = record.level >= CoreLogging.Error && !msg.replay
+            if isempty(record.variable)
+                push_log!(client.engine_logs, record)
+
+                # Errors from before we connected aren't new, so we don't switch tabs for them
+                if is_new_error
+                    state.show_engine_logs = true
+                    state.select_tab = MainTab_EngineLogs
+                end
+            else
+                if !haskey(client.variable_logs, record.variable)
+                    client.variable_logs[record.variable] = VariableLogs()
+                end
+                logs = client.variable_logs[record.variable]
+                push_log!(logs.records, record)
+                if is_new_error && !logs.window_open
+                    logs.unseen_errors += record.count
+                end
+            end
+        end
     elseif msg isa TrainData
         for variable in msg.variables
             store_variable_data!(client, variable)
@@ -1270,13 +1284,6 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remoterepl_mode[] = msg.enabled
         client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
-        # Callback errors are logged with the callback's name by invoke_callback
-        is_callback = !isnothing(replied_to) && replied_to.msg_type == InvokeCallback
-        if !isnothing(msg.error) && !is_callback
-            @error "Server reported an error" exception=msg.error.text
-            log_engine_error(state, "Server reported an error", msg.error.text)
-        end
-
         if !isnothing(replied_to) && replied_to.msg_type == Start
             if isnothing(msg.error)
                 client.context.pipeline_status = PipelineStatus_Started
@@ -1616,14 +1623,8 @@ function change_parameter(param::Parameter)
 end
 
 function invoke_callback(name::String)
-    gui_state = state[]
-    on_reply = msg -> begin
-        if !isnothing(msg.error)
-            @error "Callback '$(name)' failed" exception=msg.error.text
-            log_engine_error(gui_state, "Callback '$(name)' failed", msg.error.text)
-        end
-    end
-    gui_state.client.callback_requests[name] = send_with_callback(gui_state.client, InvokeCallback(name), on_reply)
+    client = state[].client
+    client.callback_requests[name] = send(client, InvokeCallback(name))
 end
 
 function start(state)
