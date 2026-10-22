@@ -188,7 +188,6 @@ end
     const clip_max::Ref{Cdouble} = Ref(1.0)
     const display_min::Ref{Cdouble} = Ref(0.0)
     const display_max::Ref{Cdouble} = Ref(1.0)
-    drag::Symbol = :none
     display_zoomed::Bool = false
 end
 

@@ -1015,115 +1015,77 @@ function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     end
 end
 
-# Interactive colorbar. Draws ImPlot.ColormapScale spanning the display range
-# and overlays two horizontal handles at clip_min/clip_max. Returns true when
-# the clip range changed and the colormap output needs re-rendering.
+# Interactive colorbar, drawn as a narrow plot whose Y axis is the display
+# range. The bar shows the colormap as the shader applies it: stretched between
+# the clip_min/clip_max handles and clamped outside them. Returns true when the
+# clip range changed and the colormap output needs re-rendering.
 #
-# Hovering: drag a handle to set clip_min/clip_max (disables colorbar
-# autoscale); mouse wheel zooms the display range around the cursor.
+# Dragging a handle sets the clip range (disabling colorbar autoscale);
+# zooming or panning the plot changes the display range.
 function interactive_colorbar(img::ImageState, id, size::ImVec2)
     cb = img.colorbar
     display_min = cb.display_min[]
     display_max = cb.display_max[]
-    clip_min = cb.clip_min[]
-    clip_max = cb.clip_max[]
-    # In log mode all four refs hold log10(value); the colorbar renders that
-    # space directly and tick labels read as exponents.
-    tick_format = img.log_scale[] ? "1e%g" : "%g"
-
-    # ColormapScale itself does not consume mouse input — without an overlay
-    # button, clicks fall through to the parent window and start a window
-    # move. Mark it as overlap-allowed and stack an InvisibleButton on top to
-    # capture clicks/drags for the handles.
-    ig.SetNextItemAllowOverlap()
-    start_pos = ig.GetCursorScreenPos()
-    ImPlot.ColormapScale("##colorbar_$(id)",
-                         display_min, display_max,
-                         size, tick_format,
-                         ImPlot.ImPlotColormapScaleFlags_None,
-                         img.colormap)
-    rect_min = ig.GetItemRectMin()
-    rect_max = ig.GetItemRectMax()
-
-    ig.SetCursorScreenPos(start_pos)
-    ig.InvisibleButton("##colorbar_input_$(id)",
-                       ImVec2(rect_max.x - rect_min.x, rect_max.y - rect_min.y))
-    hovered = ig.IsItemHovered()
-    active = ig.IsItemActive()
-
-    # ColormapScale insets the gradient bar by PlotPadding inside its frame
-    pad_y = unsafe_load(ImPlot.GetStyle().PlotPadding).y
-    bar_top = rect_min.y + pad_y
-    bar_bot = rect_max.y - pad_y
-    bar_h = max(bar_bot - bar_top, 1.0f0)
-    span = display_max - display_min
-    safe_span = span == 0 ? 1.0 : span
-
-    value_to_y(v) = bar_bot - Float32(clamp((v - display_min) / safe_span, 0.0, 1.0)) * bar_h
-    y_to_value(y) = display_min + clamp((bar_bot - y) / bar_h, 0.0f0, 1.0f0) * safe_span
-
-    y_min_px = value_to_y(clip_min)
-    y_max_px = value_to_y(clip_max)
-
-    # Highlight the handle nearest the cursor while hovered/active
-    threshold = 8.0f0
-    near_handle = :none
-    if hovered || active
-        mouse_y = ig.GetMousePos().y
-        d_min = abs(mouse_y - y_min_px)
-        d_max = abs(mouse_y - y_max_px)
-        if active && cb.drag !== :none
-            near_handle = cb.drag
-        elseif d_min <= d_max && d_min < threshold
-            near_handle = :min
-        elseif d_max < threshold
-            near_handle = :max
-        end
-    end
-
-    draw = ig.GetWindowDrawList()
-    base_color = ig.GetColorU32(ig.ImGuiCol_Text, 0.5f0)
-    hover_color = ig.GetColorU32(ImVec4(1.0f0, 0.2f0, 0.2f0, 0.5f0))
-    thickness = 5.0f0
-    min_color = near_handle === :min ? hover_color : base_color
-    max_color = near_handle === :max ? hover_color : base_color
-    ig.AddLineH(draw, rect_min.x, rect_max.x, y_min_px, min_color, thickness, ig.ImDrawFlags_StrokeCenter)
-    ig.AddLineH(draw, rect_min.x, rect_max.x, y_max_px, max_color, thickness, ig.ImDrawFlags_StrokeCenter)
-
     changed = false
 
-    if ig.IsItemActivated()
-        mouse_y = ig.GetMousePos().y
-        d_min = abs(mouse_y - y_min_px)
-        d_max = abs(mouse_y - y_max_px)
-        cb.drag = d_min <= d_max ? :min : :max
+    plot_flags = ImPlot.ImPlotFlags_NoTitle | ImPlot.ImPlotFlags_NoLegend | ImPlot.ImPlotFlags_NoMenus |
+                 ImPlot.ImPlotFlags_NoBoxSelect | ImPlot.ImPlotFlags_NoMouseText
+    if ImPlot.BeginPlot("##colorbar_$(id)", size, plot_flags)
+        try
+            ImPlot.SetupAxes("", "", ImPlot.ImPlotAxisFlags_NoDecorations | ImPlot.ImPlotAxisFlags_Lock,
+                             ImPlot.ImPlotAxisFlags_Opposite | ImPlot.ImPlotAxisFlags_NoGridLines |
+                             ImPlot.ImPlotAxisFlags_NoMenus)
+            ImPlot.SetupAxisLimits(ImPlot.ImAxis_X1, 0, 1, ImPlot.ImPlotCond_Always)
+            # Read at setup, written back with any zoom/pan by EndPlot
+            ImPlot.SetupAxisLinks(ImPlot.ImAxis_Y1, cb.display_min, cb.display_max)
+            # In log mode all four refs hold log10(value), so tick labels read as exponents
+            ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, img.log_scale[] ? "1e%g" : "%g")
+
+            clip_min = cb.clip_min[]
+            clip_max = cb.clip_max[]
+            span = clip_max == clip_min ? 1.0 : clip_max - clip_min
+            color(v) = ig.ColorConvertFloat4ToU32(ImPlot.SampleColormap(clamp((v - clip_min) / span, 0.0, 1.0),
+                                                                        img.colormap))
+            draw = ImPlot.GetPlotDrawList()
+            fill_band(lo, hi) = ig.AddRectFilledMultiColor(draw, ImPlot.PlotToPixels(0, hi), ImPlot.PlotToPixels(1, lo),
+                                                      color(hi), color(hi), color(lo), color(lo))
+            # Solid ends outside the handles, gradient strips between them
+            limits = ImPlot.GetPlotLimits()
+            nstrips = 64
+            ImPlot.PushPlotClipRect()
+            fill_band(limits.Y.Min, clip_min)
+            for k in 1:nstrips
+                fill_band(clip_min + (k - 1) / nstrips * span, clip_min + k / nstrips * span)
+            end
+            fill_band(clip_max, limits.Y.Max)
+            ImPlot.PopPlotClipRect()
+
+            text = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Text))
+            handle_color = ImVec4(text.x, text.y, text.z, 0.5f0)
+            # NoFit leaves double-click with nothing to fit, so it doesn't move the display range
+            min_moved = ImPlot.DragLineY(0, cb.clip_min, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
+            max_moved = ImPlot.DragLineY(1, cb.clip_max, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
+            if min_moved || max_moved
+                eps = 1e-9 * max(abs(span), 1.0)
+                if min_moved
+                    cb.clip_min[] = min(cb.clip_min[], cb.clip_max[] - eps)
+                else
+                    cb.clip_max[] = max(cb.clip_max[], cb.clip_min[] + eps)
+                end
+                cb.autoscale[] = false
+                changed = true
+            end
+            if ImPlot.IsPlotHovered() && ig.IsMouseDoubleClicked(ig.ImGuiMouseButton_Left)
+                cb.autoscale[] = true
+                cb.display_zoomed = false
+            end
+        finally
+            ImPlot.EndPlot()
+        end
     end
 
-    if active && cb.drag !== :none
-        mouse_y = ig.GetMousePos().y
-        new_v = y_to_value(mouse_y)
-        eps = 1e-9 * max(abs(safe_span), 1.0)
-        if cb.drag === :min
-            cb.clip_min[] = min(new_v, cb.clip_max[] - eps)
-        else
-            cb.clip_max[] = max(new_v, cb.clip_min[] + eps)
-        end
-        cb.autoscale[] = false
-        changed = true
-    elseif !active
-        cb.drag = :none
-    end
-
-    if hovered && !active
-        wheel = unsafe_load(ig.GetIO().MouseWheel)
-        if wheel != 0
-            mouse_y = ig.GetMousePos().y
-            anchor = y_to_value(mouse_y)
-            factor = wheel > 0 ? 0.85 : 1 / 0.85
-            cb.display_min[] = anchor + (display_min - anchor) * factor
-            cb.display_max[] = anchor + (display_max - anchor) * factor
-            cb.display_zoomed = true
-        end
+    if cb.display_min[] != display_min || cb.display_max[] != display_max
+        cb.display_zoomed = true
     end
 
     return changed
@@ -2207,7 +2169,7 @@ function fit_colorbar!(cb::ColorbarState, hist_buf, data, log, reset)
     cb.clip_min[] = dmin
     cb.clip_max[] = dmax
     if reset || !cb.display_zoomed
-        margin = 0.1 * (dmax - dmin)
+        margin = dmax > dmin ? 0.1 * (dmax - dmin) : max(0.1 * abs(dmin), 0.5)
         cb.display_min[] = dmin - margin
         cb.display_max[] = dmax + margin
     end
