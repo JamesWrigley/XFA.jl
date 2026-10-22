@@ -13,8 +13,15 @@ end
 function write_settings(settings)
     path = settings_path()
     mkpath(dirname(path))
-    @lock SETTINGS_LOCK open(path, "w") do io
-        TOML.print(io, settings; sorted=true)
+    @lock SETTINGS_LOCK begin
+        # Write to a temp file and rename it over the original so other GUI
+        # processes never see a partially-written file. It's a bit of a hack, we
+        # should figure out how to do this properly.
+        tmp_path = tempname(dirname(path); cleanup=false)
+        open(tmp_path, "w") do io
+            TOML.print(io, settings; sorted=true)
+        end
+        mv(tmp_path, path; force=true)
     end
 end
 
