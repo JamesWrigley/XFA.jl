@@ -167,6 +167,27 @@ function XfaContext.unwrap_python(value::DimArray)
     end
 end
 
+class_fqn(cls::Py) = join(string.([cls.__module__, cls.__qualname__]), ".")
+python_fqn(obj::Py) = class_fqn(obj.__class__)
+
+# numpy arrays are wrapped with their dimensions reversed so the fast axis stays
+# the same, xarray DataArrays become DimArrays, and scalars are converted.
+# Anything else is an error rather than a Python object sent to the GUI.
+function XfaContext.convert_python(x::Py)
+    fqn = python_fqn(x)
+    if fqn == "numpy.ndarray"
+        return PyArray(x.T)
+    elseif fqn == "xarray.core.dataarray.DataArray"
+        return pyconvert(DimArray, x; copy=false)
+    else
+        value = pyconvert(Union{Nothing, Number, String}, x, x)
+        if value isa Py
+            throw(ArgumentError("Cannot convert a Python $(fqn) to Julia, return a numpy array, xarray DataArray or scalar instead"))
+        end
+        return value
+    end
+end
+
 # A view into the streamer's buffers, valid until the train is returned. A
 # scalar (slow) property arrives as a 0-dimensional array, unwrapped here.
 function train_value(array)

@@ -2473,6 +2473,28 @@ end
 
     vals = Dict("camera.data" => DimArray([-1], (Dim{:trainId}([10]),)))
     @test_logs (:error, r"Execution of variable 'root' failed") match_mode=:any Context.run(ctx, vals)
+
+    ctx = Context.load_from_string(raw"""
+    using PythonCall
+
+    @Variable foo -> karabo"camera.data"
+    @Variable function arrays(x -> foo)
+        np = pyimport("numpy")
+        @add_subvariable("xr", pyimport("xarray").DataArray(np.zeros((2, 3)); dims=("a", "b")))
+        @add_subvariable("scalar", np.float64(x))
+        np.arange(6).reshape(2, 3)
+    end
+    @Variable function bad(x -> foo)
+        pylist([x])
+    end
+    """)
+    vals = Dict("camera.data" => DimArray([1], (Dim{:trainId}([10]),)))
+    r = @test_logs (:error, r"Execution of variable 'bad' failed") match_mode=:any Context.run(ctx, vals)
+    @test r["arrays"][:, :, 1] == [0 3; 1 4; 2 5]
+    @test size(r["arrays.xr"]) == (3, 2, 1)
+    @test hasdim(r["arrays.xr"], :b)
+    @test r["arrays.scalar"] == [1.0]
+    @test !haskey(r, "bad")
 end
 
 end

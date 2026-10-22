@@ -713,6 +713,11 @@ function input_wrapper(name, group, channel)
     end
 end
 
+# Convert Python values returned by a variable into Julia ones, implemented by
+# the PythonCall extension.
+convert_python(x) = x
+convert_python(v::VariableData) = @set v.data = convert_python(v.data)
+
 function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update_rate=0.0)
     if result isa VariableData
         v = @set result.tid = tid
@@ -954,6 +959,13 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                                 Meta.scratch => scratch,
                                 Meta.subvariables => subvar_values,
                                 @invokelatest f(args...))
+
+                    # Python objects are never sent on, so postprocessors and
+                    # downstream variables only see Julia values.
+                    out = @invokelatest convert_python(out)
+                    for (subvar_name, subvar_value) in subvar_values
+                        subvar_values[subvar_name] = @invokelatest convert_python(subvar_value)
+                    end
                 catch ex
                     @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                     emit(empty_result)
