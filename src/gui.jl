@@ -474,10 +474,10 @@ end
 
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
-function draw_parameter(name, param, widget_args...; min_node_width=150, pending=false)
+function draw_parameter(name, param, widget_args...; pending=false)
     ig.Text(name * ":")
     ig.SameLine()
-    ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
+    ig.SetNextItemWidth(max(50f0, state[].client.ne_node_right - ig.GetCursorScreenPos().x))
     modified, new_value = draw_parameter_widget(name, param, widget_args...)
     if modified
         if pending
@@ -521,9 +521,9 @@ draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
 # Specialize on Val{Symbol("ModulePath.PostprocessorType")} to draw a custom
 # parameter UI for a postprocessor. Default: list every parameter.
-function draw_postprocessor_params(::Val, pp, min_node_width)
+function draw_postprocessor_params(::Val, pp)
     for (param_name, param) in pp.params
-        draw_parameter(param_name, param; min_node_width)
+        draw_parameter(param_name, param)
     end
 end
 
@@ -665,7 +665,6 @@ end
 function draw_variable(name, var_data)
     client = state[].client
     pending = pending_node_for(client, var_data["id"])
-    min_node_width = 150
     variable_store = get(client.variable_data, name, nothing)
 
     ig.PushID(name)
@@ -676,13 +675,11 @@ function draw_variable(name, var_data)
     handle = ne.NodeId(var_data["id"])
     ne.BeginNode(handle)
 
-    # Right-align the output/postprocessor pins to the widest left-anchored row.
-    # `content_measured` accumulates each row's width (via origin-independent
-    # GetItemRectSize) this frame; `content_width` reuses last frame's value to
-    # place the pins. The pins are never measured, so they can't ratchet the node
-    # ever-wider.
-    content_measured = Float32(min_node_width)
-    content_width = get(client.ne_node_content_widths, var_data["id"], Float32(min_node_width))
+    # Nodes have a fixed width that the user can drag with the resize grip at the
+    # bottom. Content that doesn't fit still widens the node so it stays visible.
+    node_width = get(client.ne_node_widths, name, 250f0)
+    node_left = ig.GetCursorScreenPos().x
+    client.ne_node_right = node_left + node_width
 
     @Disabled !graph_editable(client) begin
         # Draw the titlebar at a fixed 1.5x canvas size (1.5*current_scale() keeps
@@ -702,8 +699,7 @@ function draw_variable(name, var_data)
         # EndNode. The Dummy adds breathing room between the header and content.
         title_bottom = ig.GetItemRectMax().y
 
-        # Logs and delete buttons, right-aligned on the title row. The measured
-        # width includes them so they don't overlap the title.
+        # Logs and delete buttons, right-aligned on the title row
         del_w = ig.GetTextLineHeight()
         spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
 
@@ -714,13 +710,12 @@ function draw_variable(name, var_data)
         logs_text = unseen_errors > 0 ? "\uf03a $(unseen_errors)" : "\uf03a"
         logs_w = unseen_errors > 0 ? ig.CalcTextSize(logs_text).x + del_w / 2 : del_w
 
-        content_measured = max(content_measured, ig.GetItemRectSize().x + 2 * spacing + logs_w + del_w)
         after_title = ig.GetCursorPos()
         # The icons only fit in the buttons without the horizontal frame padding,
         # and 3/4 of the vertical padding centers them vertically
         ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(0, 0.75 * unsafe_load(ig.GetStyle().FramePadding.y)))
 
-        ig.SetCursorPos((title_pos.x + content_width - del_w - spacing - logs_w, title_pos.y))
+        ig.SetCursorPos((title_pos.x + node_width - del_w - spacing - logs_w, title_pos.y))
         if unseen_errors > 0
             ig.PushStyleColor(ig.ImGuiCol_Button, ImVec4(0.8, 0.2, 0.2, 1))
             ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ImVec4(0.9, 0.3, 0.3, 1))
@@ -736,7 +731,7 @@ function draw_variable(name, var_data)
             ig.PopStyleColor(2)
         end
 
-        ig.SetCursorPos((title_pos.x + content_width - del_w, title_pos.y))
+        ig.SetCursorPos((title_pos.x + node_width - del_w, title_pos.y))
         if ig.Button("##delete-$(var_data["id"])", (del_w, del_w))
             if !isnothing(pending)
                 filter!(p -> p !== pending, client.pending_nodes)
@@ -747,13 +742,9 @@ function draw_variable(name, var_data)
 
         if !isnothing(pending)
             ig.TextDisabled("(pending)")
-            content_measured = max(content_measured, ig.GetItemRectSize().x)
         end
 
         ig.Dummy(0, 6)
-        # Group the custom content so we can measure its full width; the helpers
-        # draw several rows and GetItemRectMax alone would only see the last one.
-        ig.BeginGroup()
         origin = var_data["origin"]
         # Skip custom content for pending nodes: it targets live engine state
         # (fires parameter changes, reads runtime data) that a not-yet-added node
@@ -782,10 +773,8 @@ function draw_variable(name, var_data)
         if haskey(var_data, "callbacks")
             draw_callbacks(var_data)
         end
-        ig.EndGroup()
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
-        ig.Dummy(min_node_width, 20)
+        ig.Dummy(0, 20)
 
         # Draw dependencies
         for pin in var_data["dependencies"]
@@ -803,8 +792,6 @@ function draw_variable(name, var_data)
             # row; the label/editor are drawn after EndPin on the same line.
             draw_pin(client, dep_id, ne.PinKind_Input)
             ig.SameLine()
-            # Group the post-pin content so we can size the row from it. The pin
-            # icon to its left is a fixed advance (icon + SameLine spacing).
             ig.BeginGroup()
             if var_data["type"] == :group
                 label = something(pin.field, arg_name)
@@ -830,8 +817,6 @@ function draw_variable(name, var_data)
                 node_tooltip(isempty(dep.name) ? "Set by the engine, not known yet" :
                              "Set by the engine to $(dep.name)")
             end
-            pin_advance = ig.GetTextLineHeight() + unsafe_load(ig.GetStyle().ItemSpacing.x)
-            content_measured = max(content_measured, pin_advance + ig.GetItemRectSize().x)
             if edited
                 if !isnothing(pending)
                     pending.dep_values[arg_name] = new_dep
@@ -844,14 +829,14 @@ function draw_variable(name, var_data)
         end
     end # @Disabled
 
-    ig.Dummy(min_node_width, 10)
+    ig.Dummy(0, 10)
 
     ig.TextDisabled("Outputs")
     draw_list = ig.GetWindowDrawList()
     start_pos = ig.GetCursorScreenPos()
     gray = ig.IM_COL32(100, 100, 100, 255)
-    ig.AddLineH(draw_list, start_pos.x, start_pos.x + min_node_width / 2f0, start_pos.y, gray, 2)
-    ig.Dummy(min_node_width, 2)
+    ig.AddLineH(draw_list, start_pos.x, start_pos.x + node_width / 2f0, start_pos.y, gray, 2)
+    ig.Dummy(0, 2)
 
     # Draw outputs
     for output in var_data["outputs"]
@@ -859,10 +844,6 @@ function draw_variable(name, var_data)
         output_name = isempty(label) ? name : "$(name).$(label)"
         pin_start = ig.GetCursorPos()
 
-        # Measure the label group before placing the pin. BeginPin leaves the
-        # cursor's max-x at the far-right pin position, so measuring after it would
-        # make content_width self-sustaining (the node would never shrink). The pin
-        # is drawn afterwards via SetCursorPos.
         ig.BeginGroup()
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
@@ -907,13 +888,12 @@ function draw_variable(name, var_data)
             end
         end
         ig.EndGroup()
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
         after_label = ig.GetCursorPos()
 
         # Right-aligned output pin on the label's row. Drawing it (icon Dummy) after
         # the rightward SetCursorPos validates the extent (no boundary assert).
         icon_w = ig.GetTextLineHeight()
-        ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+        ig.SetCursorPos((pin_start.x + node_width - icon_w, pin_start.y))
         draw_pin(client, output.id, ne.PinKind_Output)
         # Continue below both the label and the pin icon so rows don't overlap.
         # The trailing Dummy validates the SetCursorPos extent so ImGui's boundary
@@ -925,11 +905,11 @@ function draw_variable(name, var_data)
     # Draw postprocessors
     postprocessors = get(var_data, "postprocessors", [])
     if !isempty(postprocessors)
-        ig.Dummy(min_node_width, 8)
+        ig.Dummy(0, 8)
         ig.TextDisabled("Postprocessors")
         pp_sep_pos = ig.GetCursorScreenPos()
-        ig.AddLineH(draw_list, pp_sep_pos.x, pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y, gray, 2)
-        ig.Dummy(min_node_width, 2)
+        ig.AddLineH(draw_list, pp_sep_pos.x, pp_sep_pos.x + node_width / 2f0, pp_sep_pos.y, gray, 2)
+        ig.Dummy(0, 2)
 
         for pp in postprocessors
             label = pp.display_name * pp.tree_id_suffix
@@ -939,7 +919,7 @@ function draw_variable(name, var_data)
             # The pin wraps only the icon (right-aligned to the node edge) so its
             # hover rect doesn't span the whole row; the tree is drawn after EndPin
             # from the left.
-            ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+            ig.SetCursorPos((pin_start.x + node_width - icon_w, pin_start.y))
             draw_pin(client, pp.id, ne.PinKind_Output)
             ig.SetCursorPos(pin_start)
 
@@ -949,7 +929,7 @@ function draw_variable(name, var_data)
             ig.BeginColumns("##pp-$(pp.id)", 2,
                             ig.ImGuiOldColumnFlags_NoBorder | ig.ImGuiOldColumnFlags_NoResize |
                             ig.ImGuiOldColumnFlags_NoPreserveWidths | ig.ImGuiOldColumnFlags_NoForceWithinWindow)
-            ig.SetColumnWidth(0, content_width - icon_w)
+            ig.SetColumnWidth(0, node_width - icon_w)
 
             expanded = ig.TreeNode(label)
             if haskey(client.variable_data, pp.name)
@@ -967,7 +947,7 @@ function draw_variable(name, var_data)
                 if isempty(pp.params)
                     ig.TextDisabled("(no parameters)")
                 else
-                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
+                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp)
                 end
                 ig.TreePop()
             end
@@ -979,7 +959,7 @@ function draw_variable(name, var_data)
     # Commit button for a pending node. Enabled once the name is valid and every
     # dependency has been wired to something.
     if !isnothing(pending)
-        ig.Dummy(min_node_width, 8)
+        ig.Dummy(0, 8)
         valid = isnothing(variable_name_validator(name, name)) &&
                 all(!isempty(dep.name) for (arg, dep) in pending.dep_values
                     if !optional_dep(pending, arg))
@@ -988,15 +968,46 @@ function draw_variable(name, var_data)
                 @guiasync commit_pending_node(state[], pending)
             end
         end
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
     end
 
-    # Stash the widest content row for next frame's pin alignment. Postprocessors
-    # are excluded: their tree column is sized to content_width, so measuring it
-    # would feed the imposed width back and re-introduce the ratchet.
-    client.ne_node_content_widths[var_data["id"]] = content_measured
+    # Resize grip in the bottom-right corner, drawn like ImGui's window grip
+    grip_w = round(0.75f0 * ig.GetTextLineHeight())
+    ig.SetCursorPosX(ig.GetCursorPos().x + node_width - grip_w)
+    ig.InvisibleButton("##resize-$(var_data["id"])", (grip_w, grip_w))
+    grip_active = ig.IsItemActive()
+    grip_hovered = item_has_hover()
+    if ig.IsItemActivated()
+        client.ne_resize_min = 0f0
+    end
+    if grip_active
+        client.ne_node_widths[name] = max(100f0, ig.GetMousePos().x - node_left + grip_w / 2)
+    end
+    if grip_active || grip_hovered
+        ig.SetMouseCursor(ig.ImGuiMouseCursor_ResizeEW)
+    end
+    grip_color = if grip_active
+        ig.GetColorU32(ig.ImGuiCol_ResizeGripActive)
+    elseif grip_hovered
+        ig.GetColorU32(ig.ImGuiCol_ResizeGripHovered)
+    else
+        ig.GetColorU32(ig.ImGuiCol_ResizeGrip)
+    end
+    grip_max = ig.GetItemRectMax()
+    ig.AddTriangleFilled(draw_list, grip_max, (grip_max.x, grip_max.y - grip_w),
+                         (grip_max.x - grip_w, grip_max.y), grip_color)
 
     ne.EndNode()
+
+    # Content that can't shrink overflows once the node is dragged narrow enough,
+    # and that width becomes the minimum for the rest of the drag.
+    if grip_active
+        padding = unsafe_load(ne.GetStyle().NodePadding)
+        content_w = ne.GetNodeSize(handle).x - padding.x - padding.z
+        if content_w > node_width + 1
+            client.ne_resize_min = max(client.ne_resize_min, content_w)
+        end
+        client.ne_node_widths[name] = max(client.ne_node_widths[name], client.ne_resize_min)
+    end
 
     # Dark blue header background behind the title (following builders.cpp
     # BlueprintNodeBuilder::End): drawn after EndNode on the node's background draw
@@ -1365,10 +1376,10 @@ function draw_dag()
     # that context's saved layout. Persist the outgoing context's layout first.
     if client.ne_editor_path != client.context_path
         if client.ne_editor != C_NULL
-            save_node_editor_state(client.ne_editor_path, client.ne_settings)
+            save_node_editor_state(client.ne_editor_path, client.ne_settings, client.ne_node_widths)
             ne.DestroyEditor(client.ne_editor)
         end
-        client.ne_settings = load_node_editor_state(client.context_path)
+        client.ne_settings, client.ne_node_widths = load_node_editor_state(client.context_path)
         create_node_editor!(client)
     end
 

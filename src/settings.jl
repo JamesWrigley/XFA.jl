@@ -97,6 +97,7 @@ function save_settings(client::ClientState, updated_field=nothing)
             "plot_counter" => client.plot_counter,
             "saved_layout" => ini_data,
             "node_editor_state" => client.ne_settings,
+            "node_widths" => client.ne_node_widths,
         )
 
         write_settings(settings)
@@ -108,12 +109,13 @@ function load_node_editor_state(context_path)
     settings = load_settings()
     contexts = get(get(settings, "ClientState", Dict()), "contexts", Dict())
     ctx = get(contexts, context_path, Dict())
-    return get(ctx, "node_editor_state", "")
+    widths = Dict{String, Float32}(name => Float32(w) for (name, w) in get(ctx, "node_widths", Dict()))
+    return get(ctx, "node_editor_state", ""), widths
 end
 
 # Persist just the editor state for a context without touching its other
 # entries; used when switching away from a context before recreating the editor.
-function save_node_editor_state(context_path, blob)
+function save_node_editor_state(context_path, blob, widths)
     if isempty(context_path)
         return
     end
@@ -124,6 +126,7 @@ function save_node_editor_state(context_path, blob)
         contexts = get!(client_settings, "contexts", Dict{String, Any}())
         ctx = get!(contexts, context_path, Dict{String, Any}())
         ctx["node_editor_state"] = blob
+        ctx["node_widths"] = widths
 
         write_settings(settings)
     end

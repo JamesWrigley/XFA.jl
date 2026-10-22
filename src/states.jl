@@ -738,7 +738,11 @@ end
 
     ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     ne_editor_path::String = ""
-    ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
+    # User-set node widths keyed by variable name, and the right edge of the node
+    # being drawn so parameter widgets can fill up to it.
+    ne_node_widths::Dict{String, Float32} = Dict{String, Float32}()
+    ne_node_right::Float32 = 0f0
+    ne_resize_min::Float32 = 0f0
     ne_settings::String = ""
 
     # Pin registries for link dragging, keyed by pin id. Pins that can't take part

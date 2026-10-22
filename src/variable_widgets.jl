@@ -169,7 +169,11 @@ function draw_online_bridge(name, params, gui_state)
                     end
                 end
 
-                ig.SetNextItemWidth(350)
+                # Fill up to the node edge, leaving room for the Refresh button
+                style = ig.GetStyle()
+                refresh_w = ig.CalcTextSize("Refresh").x + 2 * unsafe_load(style.FramePadding.x) +
+                            unsafe_load(style.ItemSpacing.x)
+                ig.SetNextItemWidth(client.ne_node_right - ig.GetCursorScreenPos().x - refresh_w)
                 idx = Ref(gui_state.selected_output)
                 if CopyableCombo("Output", gui_state.zmq_outputs, idx)
                     gui_state.selected_output = idx[]
@@ -240,14 +244,14 @@ function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, g
     return nothing
 end
 
-function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp, min_node_width)
+function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp)
     param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
     for param_name in param_order
         if param_name == "buffer_size" && !pp.params["windowed"].value
             continue
         end
         if haskey(pp.params, param_name)
-            draw_parameter(param_name, pp.params[param_name]; min_node_width)
+            draw_parameter(param_name, pp.params[param_name])
         end
     end
 end

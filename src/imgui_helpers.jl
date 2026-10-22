@@ -843,18 +843,24 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
 end
 
 # A framed, clickable read-only field that looks like a text input and shows the
-# current (elided) source with a trailing edit icon. Returns true when clicked.
+# current source with a trailing edit icon, elided to the item width. Returns true
+# when clicked.
 function KaraboDepDisplay(label, text)
-    max_chars = 30
     empty = isempty(text)
-    display = empty ? "set source\u2026" : (length(text) > max_chars ? text[1:max_chars] * "\u2026" : text)
-
     icon = "\uf044"  # pencil
     icon_w = ig.CalcTextSize(icon).x
     padding = ImVec2(4, 2)
-    min_width = ig.CalcTextSize("m").x * 13
-    text_w = ig.CalcTextSize(display).x
-    width = max(text_w + icon_w + 8, min_width) + 2 * padding.x
+    width = max(ig.CalcTextSize("m").x * 13, ig.CalcItemWidth())
+
+    avail = width - icon_w - 8 - 2 * padding.x
+    display = empty ? "set source\u2026" : text
+    if ig.CalcTextSize(display).x > avail
+        while !isempty(display) && ig.CalcTextSize(display * "\u2026").x > avail
+            display = display[1:prevind(display, lastindex(display))]
+        end
+        display *= "\u2026"
+    end
+    elided = !empty && display != text
 
     ig.InvisibleButton("##karabo-display-$(label)", ImVec2(width, ig.GetFontSize() + 2 * padding.y))
     hovered = item_has_hover()
@@ -873,7 +879,7 @@ function KaraboDepDisplay(label, text)
     ig.AddText(draw_list, ImVec2(p_max.x - icon_w - padding.x, p_min.y + padding.y),
                ig.GetColorU32(ig.ImGuiCol_TextDisabled), icon)
 
-    if hovered && length(text) > max_chars
+    if hovered && elided
         node_tooltip(text)
     end
 
@@ -1445,6 +1451,7 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
     if dep_state.is_karabo
         text = dep.kind == DepKind_Karabo ? string(dep) : ""
         focus &= isempty(text)
+        ig.SetNextItemWidth(client.ne_node_right - ig.GetCursorScreenPos().x)
         # With several inputs the topic decides which one serves the dependency
         edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
                                          source_list, client;
