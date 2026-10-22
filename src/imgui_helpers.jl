@@ -370,6 +370,10 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
     return result, popup_hovered
 end
 
+# IsItemHovered() doesn't check whether another item holds the hover, which is
+# how the node editor keeps the widgets of covered nodes from being hovered
+item_has_hover() = ig.IsItemHovered() && ig.GetHoveredID() == ig.GetItemID()
+
 function ElidedText(label::AbstractString, text::AbstractString;
                     max_chars::Int=30, editable::Bool=false,
                     focus::Bool=false,
@@ -461,8 +465,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
             cursor = ig.GetCursorPos()
             ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
             ig.InvisibleButton("##elided-btn-$(label)", ImVec2(max(text_size.x, min_width) + 2 * padding.x, text_size.y + 2 * padding.y))
-            hovered = ig.IsItemHovered()
-            clicked = ig.IsItemClicked()
+            hovered = item_has_hover()
+            clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
 
             draw_list = ig.GetWindowDrawList()
             p_min = ig.GetItemRectMin()
@@ -853,8 +857,8 @@ function KaraboDepDisplay(label, text)
     width = max(text_w + icon_w + 8, min_width) + 2 * padding.x
 
     ig.InvisibleButton("##karabo-display-$(label)", ImVec2(width, ig.GetFontSize() + 2 * padding.y))
-    hovered = ig.IsItemHovered()
-    clicked = ig.IsItemClicked()
+    hovered = item_has_hover()
+    clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
 
     draw_list = ig.GetWindowDrawList()
     p_min = ig.GetItemRectMin()

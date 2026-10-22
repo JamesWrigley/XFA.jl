@@ -740,8 +740,6 @@ end
     ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     ne_editor_path::String = ""
     ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
-    ne_node_order::Vector{ne.NodeId} = ne.NodeId[]
-    ne_front_node::ne.NodeId = ne.NodeId(0)
     ne_settings::String = ""
 
     # Pin registries for link dragging, keyed by pin id. Pins that can't take part
