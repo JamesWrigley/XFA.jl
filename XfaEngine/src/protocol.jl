@@ -27,7 +27,7 @@ using ..XfaEngine: RoutingRule, RemapRule
 
 # Max websocket frame size for client-engine traffic. The HTTP.jl default of
 # 16 MiB is too small so we effectively disable the limit.
-const MAX_FRAME_SIZE = typemax(Int)
+const MAX_FRAME_SIZE = 1 << 40
 
 abstract type AbstractMessage end
 
