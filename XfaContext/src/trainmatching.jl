@@ -150,13 +150,15 @@ function PlotSpec(name::AbstractString, layers::AbstractVector{LayerSpec}=[Layer
              collect(layers), rois, models, fixed_aspect)
 end
 
-# `spec` with the layers that don't name a variable ("") pointed at `variable`,
-# the one advertising it.
+# `spec` with the layers relative to `variable`, the one advertising it, pointed
+# at it: "" is the variable itself and ".<name>" one of its subvariables.
 function bind_variable(spec::PlotSpec, variable)
-    if all(layer -> !isempty(layer.data), spec.layers)
-        spec
-    else
-        @set spec.layers = [isempty(layer.data) ? (@set layer.data = variable) : layer for layer in spec.layers]
+    @set spec.layers = map(spec.layers) do layer
+        if isempty(layer.data) || startswith(layer.data, ".")
+            @set layer.data = variable * layer.data
+        else
+            layer
+        end
     end
 end
 
@@ -209,6 +211,47 @@ function LayerSpec(; data::AbstractString="", mark::Symbol=:line,
         LayerSpec(String(data), marks[mark], 1.0, axis(something(x, "index")), axis("value"),
                   color_channel, lookups)
     end
+end
+
+"""
+    ImageAsLines(name; x, gradient=true, variable="", subvariable=nothing, kwargs...)
+
+A [`PlotSpec`](@ref) drawing an image as lines: one line along `x` for each
+coordinate of the other dim.
+
+`x` is the dim the lines run along, either by name (e.g. `x=:energy` for a
+`DimArray`) or by position (`x=1` or `x=2`). The lines are shaded along a
+continuous colour scheme, or given distinct colours if `gradient` is false.
+
+The image is that of the variable advertising the spec, or of the variable
+named by `variable`. `subvariable` picks one of that variable's subvariables
+instead. Any other keyword arguments are passed to `PlotSpec`.
+
+# Examples
+```julia
+@Variable function spectra(...)
+    @add_subvariable "background" background
+    VariableData(; data, plot_specs=[ImageAsLines("Spectra"; x=:energy),
+                                     ImageAsLines("Background"; x=:energy, subvariable="background"),
+                                     ImageAsLines("Reference"; x=:energy, variable="reference")])
+end
+```
+"""
+function ImageAsLines(name::AbstractString; x::Union{Symbol, Integer}, gradient::Bool=true,
+                      variable::AbstractString="", subvariable::Union{AbstractString, Nothing}=nothing, kwargs...)
+    # A named x leaves the color empty, for the client to set to the image's other dim
+    x, color = if x isa Integer
+        if !(x in (1, 2))
+            throw(ArgumentError("x must be dim 1 or 2 of the image, got $(x)"))
+        end
+        positions = (:row, :col)
+        positions[x], positions[3 - x]
+    else
+        x, Symbol("")
+    end
+    # A leading "." marks a subvariable of the advertising variable, see bind_variable
+    data = isnothing(subvariable) ? variable : "$(variable).$(subvariable)"
+    PlotSpec(name, [LayerSpec(; data, x, color, gradient)]; kwargs...)
 end
 
 @kwdef struct VariableData{T}

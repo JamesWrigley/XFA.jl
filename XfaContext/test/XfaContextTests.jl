@@ -194,7 +194,17 @@ end
     own = PlotSpec("own", [LayerSpec(; color=:pulseId), LayerSpec(; data="baseline")]; models=[fit])
     bound = only(Context.wrap_result(VariableData(; data=1, plot_specs=own), 1, "spectra").plot_specs)
     @test [layer.data for layer in bound.layers] == ["spectra", "baseline"]
-    @test Context.bind_variable(bound, "other") === bound
+    @test Context.bind_variable(bound, "other") == bound
+
+    # ImageAsLines draws the advertising variable, one of its subvariables, or another variable
+    lines_data(; kwargs...) = only(Context.bind_variable(ImageAsLines("lines"; x=:X, kwargs...), "spectra").layers).data
+    @test lines_data() == "spectra"
+    @test lines_data(; subvariable="bg") == "spectra.bg"
+    @test lines_data(; variable="other") == "other"
+    @test lines_data(; variable="other", subvariable="bg") == "other.bg"
+    # A named x leaves the color to the client, a positional one names the other dim
+    @test only(ImageAsLines("lines"; x=:X).layers).color.field == ""
+    @test only(ImageAsLines("lines"; x=2).layers).color.field == "row"
     @test PlotSpec("own"; ylabel="counts") == PlotSpec("own", [LayerSpec()]; ylabel="counts")
     @test VariableData(1; plot_specs=own) == VariableData(; data=1, plot_specs=[own])
 

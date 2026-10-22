@@ -1598,10 +1598,14 @@ end
 # matrix by one dim. An x on `index` runs along each series, i.e. the other dim.
 function series_dims(name, data, spec::LayerSpec)
     color_dim = field_dim(data, spec.color.field)
-    x_dim = if spec.x.field == "index" && data isa AbstractMatrix && !isnothing(color_dim)
-        3 - color_dim
-    else
-        field_dim(data, spec.x.field)
+    x_dim = field_dim(data, spec.x.field)
+    if data isa AbstractMatrix
+        if spec.x.field == "index" && !isnothing(color_dim)
+            x_dim = 3 - color_dim
+        elseif isempty(spec.color.field) && !isnothing(x_dim)
+            # An empty color (see ImageAsLines) groups by the dim x isn't on
+            color_dim = 3 - x_dim
+        end
     end
     if !(data isa AbstractMatrix) || isnothing(x_dim) || isnothing(color_dim) || x_dim == color_dim ||
        spec.y.field != "value"
@@ -1621,9 +1625,14 @@ function group_series!(series, name, store, spec::LayerSpec)
     coords = dim_values(store, color_dim)
     values = data isa DimArray ? parent(data) : data
 
+    title = if isempty(spec.color.field)
+        data isa DimArray ? string(DD.name(DD.dims(data, color_dim))) : ("row", "col")[color_dim]
+    else
+        something(spec.color.title, "")
+    end
+
     empty!(series)
     for (i, ys) in enumerate(eachslice(values; dims = color_dim))
-        title = something(spec.color.title, "")
         label = isempty(title) ? string(coords[i]) : "$(title) - $(coords[i])"
         if spec.mark == Mark_Bar
             bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0

@@ -3,7 +3,7 @@ module XfaContext
 export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, Callback, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    RectROI, LinearROI, Context
+    RectROI, LinearROI, ImageAsLines, Context
 
 # Macro-generated code and context files refer to this module as `Context`. It's
 # exported so `using XfaContext` binds it the way `using XfaEngine.Context` used
@@ -724,7 +724,7 @@ function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update
         v = @set v.name = name
         v = @set v.subvariables = subvariables
         if !isempty(v.plot_specs)
-            v = @set v.plot_specs = [bind_variable(spec, name) for spec in v.plot_specs]
+            v = @set v.plot_specs = [bind_variable(spec, name, v.data) for spec in v.plot_specs]
         end
         @set v.update_rate = update_rate
     elseif result isa Histogram1D

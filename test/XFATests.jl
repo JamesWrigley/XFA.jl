@@ -1165,6 +1165,11 @@ end
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:col, color=:row)) == (2, 1)
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:pulseId)) == (1, 2)
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:X)) == (2, 1)
+        # ImageAsLines leaves the color to the dim x isn't on
+        for (x, dims) in ((:X, (1, 2)), (:pulseId, (2, 1)))
+            layer = only(XFA.XfaContext.ImageAsLines("lines"; x).layers)
+            @test XFA.series_dims("spectra", spectra.data, layer) == dims
+        end
         @test (XFA.dim_values(spectra, 1), XFA.dim_values(spectra, 2)) == ([1.0, 2.0, 3.0], [10, 20])
         # An explicit x_axis runs along the columns
         spectra.x_axis = [0.1, 0.2]
