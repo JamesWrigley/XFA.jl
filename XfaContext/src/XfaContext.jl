@@ -3,7 +3,7 @@ module XfaContext
 export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, Callback, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    RectROI, LinearROI, ImageAsLines, Context
+    RectROI, LinearROI, IndexSelection, ImageAsLines, Context
 
 # Macro-generated code and context files refer to this module as `Context`. It's
 # exported so `using XfaContext` binds it the way `using XfaEngine.Context` used
@@ -2006,6 +2006,11 @@ module _InternalPrecompileModule end
     @compile_workload begin
         exprs = eval_context(_InternalPrecompileModule, ctx_str, Expr[])
         @invokelatest load_from_module(_InternalPrecompileModule, exprs; dep_router=(topic, source) -> nothing)
+
+        # For Correlation.fit
+        sol = solve(CurveFitProblem([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]), LinearCurveFitAlgorithm())
+        successful_retcode(sol.retcode)
+        rss(sol)
     end
 
     global current_ctx = nothing

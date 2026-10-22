@@ -19,7 +19,7 @@ using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
 using XfaEngine: XfaEngine, Protocol
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable, VariableKind_Input,
+    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, IndexSelection, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
@@ -273,6 +273,29 @@ end
 
 function draw_parameter_widget(name, param::Parameter{Vector{Float64}})
     return draw_numeric_vector_widget(name, param)
+end
+
+function index_selection_validator(text)
+    try
+        IndexSelection(text)
+        return nothing
+    catch ex
+        return ex.msg
+    end
+end
+
+function draw_parameter_widget(name, param::Parameter{IndexSelection})
+    current = string(param.value)
+    # Leave room for the marker within the width draw_parameter set
+    marker_w = ig.CalcTextSize("[?]").x + unsafe_load(ig.GetStyle().ItemSpacing.x)
+    ig.SetNextItemWidth(max(50f0, ig.CalcItemWidth() - marker_w))
+    edited, new_text = SafeInputText("##$(name)"; current_text=current, validator=index_selection_validator)
+    ig.SameLine()
+    InfoMarker("Indices and ranges, e.g.:\n  1-10\n  1, 5, 8\n  1-10, 50, 51")
+    if edited
+        return true, IndexSelection(new_text)
+    end
+    return false, nothing
 end
 
 # (lo, hi) range editor. We only commit a new value once lo < hi so the engine

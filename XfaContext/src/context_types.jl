@@ -205,6 +205,56 @@ end
 
 (r::LinearROI)(v::AbstractVector) = @view v[roi_range(r.start, r.length, axes(v, 1))]
 
+# A set of indices, constructible from strings like "1-10, 50, 51".
+struct IndexSelection
+    indices::Vector{Int}
+end
+
+IndexSelection() = IndexSelection(Int[])
+
+function IndexSelection(str::AbstractString)
+    indices = Int[]
+    for part in split(str, ',')
+        part = strip(part)
+        if isempty(part)
+            continue
+        end
+
+        m = match(r"^(\d+)(?:\s*-\s*(\d+))?$", part)
+        if isnothing(m)
+            throw(ArgumentError("Invalid index or range: '$(part)'"))
+        end
+        lo = parse(Int, m[1])
+        hi = isnothing(m[2]) ? lo : parse(Int, m[2])
+        if hi < lo
+            throw(ArgumentError("Range ends before it starts: '$(part)'"))
+        end
+        append!(indices, lo:hi)
+    end
+
+    IndexSelection(sort!(unique!(indices)))
+end
+
+# Show in the string constructor's format, collapsing runs of 3+ indices into ranges.
+function Base.show(io::IO, sel::IndexSelection)
+    idxs = sel.indices
+    parts = String[]
+    start = 1
+    while start <= length(idxs)
+        stop = start
+        while stop < length(idxs) && idxs[stop + 1] == idxs[stop] + 1
+            stop += 1
+        end
+        if stop - start >= 2
+            push!(parts, "$(idxs[start])-$(idxs[stop])")
+        else
+            append!(parts, string.(idxs[start:stop]))
+        end
+        start = stop + 1
+    end
+    join(io, parts, ", ")
+end
+
 struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
 end

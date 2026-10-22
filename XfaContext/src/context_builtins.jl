@@ -34,7 +34,7 @@ end
 @Group mutable struct Correlation
     trains::Parameter{Int} = Parameter(resize_buffers, 10_000)
     nbins::Parameter{Int} = Parameter(invalidate_histogram, 100)
-    pulses::Parameter{Vector{Int}} = Parameter(invalidate_histogram, Int[])
+    pulses::Parameter{IndexSelection} = Parameter(invalidate_histogram, IndexSelection())
     fit::Parameter{Bool} = Parameter(false)
     clear::Callback = Callback("Clear", clear_buffers)
     x::Parameter{Dependency}
@@ -107,11 +107,11 @@ function pulse_samples(buffers::Vector{CircularBuffer{Float64}}, pulses)
 end
 
 function build_histogram(corr::Correlation)
-    binedges = (compute_edges(pulse_samples(corr.x_buffers, corr.pulses[]), corr.nbins[]),
-                compute_edges(pulse_samples(corr.y_buffers, corr.pulses[]), corr.nbins[]))
+    binedges = (compute_edges(pulse_samples(corr.x_buffers, corr.pulses[].indices), corr.nbins[]),
+                compute_edges(pulse_samples(corr.y_buffers, corr.pulses[].indices), corr.nbins[]))
     corr.histogram = Hist2D(; binedges, overflow=true)
 
-    for i in active_pulses(corr.x_buffers, corr.pulses[])
+    for i in active_pulses(corr.x_buffers, corr.pulses[].indices)
         for (x, y) in zip(corr.x_buffers[i], corr.y_buffers[i])
             push!(corr.histogram, x, y)
         end
@@ -122,7 +122,7 @@ function build_histogram(corr::Correlation)
 end
 
 function linear_fit(corr::Correlation)
-    pulses = active_pulses(corr.x_buffers, corr.pulses[])
+    pulses = active_pulses(corr.x_buffers, corr.pulses[].indices)
     xs = reduce(vcat, (corr.x_buffers[i] for i in pulses); init=Float64[])
     ys = reduce(vcat, (corr.y_buffers[i] for i in pulses); init=Float64[])
 
@@ -187,7 +187,7 @@ end
         push!(corr.x_buffers[i], x[i])
         push!(corr.y_buffers[i], y[i])
 
-        if isempty(corr.pulses[]) || i ∈ corr.pulses[]
+        if isempty(corr.pulses[].indices) || i ∈ corr.pulses[].indices
             push!(corr.histogram, x[i], y[i])
         end
     end

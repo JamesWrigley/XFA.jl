@@ -2041,6 +2041,16 @@ end
         @test length(scn.binner.history) == 1
     end
 
+    @testset "IndexSelection" begin
+        @test IndexSelection("1-3").indices == [1, 2, 3]
+        @test IndexSelection("8, 1 , 5,").indices == [1, 5, 8]
+        @test IndexSelection("50, 1 - 3, 2, 51").indices == [1, 2, 3, 50, 51]
+        @test isempty(IndexSelection("").indices)
+        @test string(IndexSelection("50, 1-10, 51, 60")) == "1-10, 50, 51, 60"
+        @test_throws ArgumentError IndexSelection("1-x")
+        @test_throws ArgumentError IndexSelection("5-1")
+    end
+
     @testset "Correlation" begin
         runcorr(corr, x, y) = begin
             subvars = Dict{String, Any}()
@@ -2105,13 +2115,13 @@ end
 
         # `pulses` restricts which pulses contribute to edges and counts
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
-        corr.pulses[] = [1]
+        corr.pulses[] = IndexSelection([1])
         runcorr(corr, [1.0, 999.0], [2.0, 999.0])
         @test last(binedges(corr.histogram)[1]) ≤ 1.0
         @test sum(bincounts(corr.histogram)) == 1
 
         # Selecting more pulses than there are uses the ones present
-        corr.pulses[] = [1, 2]
+        corr.pulses[] = IndexSelection([1, 2])
         corr.fit[] = true
         corr.rebuild_histogram = true
         _, subvars = runcorr(corr, [3.0], [4.0])
