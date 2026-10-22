@@ -542,6 +542,7 @@ end
 @kwdef mutable struct SshState
     address::String
     port::Int = 22
+    user::Maybe{String} = nothing
 
     auth_state::Any = nothing
     auth_method::Maybe{ssh.AuthMethod} = nothing

@@ -84,25 +84,32 @@ function detect_jump_hops(state::GuiState)
     end
 end
 
+# Split an optional `user@` prefix off an address
+function split_user(address)
+    if occursin("@", address)
+        user, host = split(address, "@")
+        return String(user), String(host)
+    else
+        return nothing, address
+    end
+end
+
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
-    address = state.address
-    user = nothing
-    if occursin("@", address)
-        user, address = split(address, "@")
-    end
+    user, address = split_user(state.address)
 
     for hop in state.jump_hops
         if !isempty(hop)
-            push!(client.ssh_hops, SshState(; address=hop))
+            hop_user, hop_address = split_user(hop)
+            push!(client.ssh_hops, SshState(; address=hop_address, user=hop_user))
         end
     end
 
     # This is the blocking SSH session used for SFTP
-    push!(client.ssh_hops, SshState(; address))
+    push!(client.ssh_hops, SshState(; address, user))
     # And this is the regular, non-blocking SSH session
-    push!(client.ssh_hops, SshState(; address))
+    push!(client.ssh_hops, SshState(; address, user))
 
     # Start by initializing the first hop
     ssh_initialize_hop(state, 1, user)
@@ -136,6 +143,10 @@ end
 
 function ssh_initialize_hop(state, hop_idx, user)
     client = state.client
+    # Hops without an explicit user inherit the previous hop's
+    if !isnothing(client.ssh_hops[hop_idx].user)
+        user = client.ssh_hops[hop_idx].user
+    end
     client.ssh_hops[hop_idx].session = ssh_open_session(client, hop_idx, user)
 
     ssh_authenticate_hop(state, hop_idx)
