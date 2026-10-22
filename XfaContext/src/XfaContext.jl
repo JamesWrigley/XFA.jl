@@ -724,7 +724,7 @@ function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update
         v = @set v.name = name
         v = @set v.subvariables = subvariables
         if !isempty(v.plot_specs)
-            v = @set v.plot_specs = [bind_variable(spec, name, v.data) for spec in v.plot_specs]
+            v = @set v.plot_specs = [bind_variable(spec, name) for spec in v.plot_specs]
         end
         @set v.update_rate = update_rate
     elseif result isa Histogram1D
