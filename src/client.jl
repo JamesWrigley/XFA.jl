@@ -1280,9 +1280,6 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa PipelineStats
         client.context.channel_stats = msg.channel_stats
         client.context.input_rates = msg.input_rates
-    elseif msg isa RemoteReplState
-        client.remoterepl_mode[] = msg.enabled
-        client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
         if !isnothing(replied_to) && replied_to.msg_type == Start
             if isnothing(msg.error)
@@ -1648,12 +1645,6 @@ end
 function set_debug_mode(state)
     client = state.client
     client.debug_mode_request = send(client, SetDebugMode(client.debug_mode[]))
-end
-
-function set_remoterepl(state)
-    client = state.client
-    client.remoterepl_status = RemoteReplStatus_Changing
-    send(client, SetRemoteRepl(client.remoterepl_mode[]))
 end
 
 function send_subscriptions(client)

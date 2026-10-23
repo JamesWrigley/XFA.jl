@@ -2151,16 +2151,6 @@ function draw_gui()
                     end
                 end
 
-                @Disabled client.remoterepl_status == RemoteReplStatus_Changing begin
-                    ig.Text("Remote REPL")
-                    ig.SameLine()
-                    if client.remoterepl_status == RemoteReplStatus_Changing
-                        Spinner()
-                    elseif ig.Checkbox("##remoterepl-mode", client.remoterepl_mode)
-                        set_remoterepl(state[])
-                    end
-                end
-
                 ig.Text("Use context file:")
                 ig.SameLine()
                 edited, new_context_path = SafeInputText("##context-file";

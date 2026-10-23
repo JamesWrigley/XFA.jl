@@ -367,12 +367,6 @@ struct DeviceProperties
 end
 DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}())
 
-@enum RemoteReplStatus begin
-    RemoteReplStatus_Running
-    RemoteReplStatus_Changing
-    RemoteReplStatus_Stopped
-end
-
 @kwdef mutable struct KaraboDepTextState
     # Working copies of the source/property/proxy fields while the editor window
     # is open. Seeded from the current value when the window opens and composed
@@ -720,9 +714,6 @@ end
 
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
-
-    remoterepl_mode::Ref{Bool} = Ref(false)
-    remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
 
     # Context file and pipeline
     context_path::String = ""

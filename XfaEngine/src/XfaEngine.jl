@@ -19,14 +19,13 @@ include("webproxy.jl")
 
 import TOML
 import Sockets
-import Sockets: listen, close, @ip_str, TCPServer
+import Sockets: listen, close, @ip_str
 import DistributedNext: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
 import Revise
-import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
@@ -93,9 +92,6 @@ end
     webproxies::Dict{String, WebProxy} = Dict()
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     remap_rules::Vector{RemapRule} = copy(BUILTIN_REMAP_RULES)
-
-    remoterepl_server::TCPServer = TCPServer()
-    remoterepl_task::Union{Task, Nothing} = nothing
 
     ctx::ContextState = ContextState()
     # Keeps the pipeline running across rewires, see start_pipeline(::EngineState).
@@ -634,18 +630,6 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
         Protocol.server_send(ws, Ack(); reply_to)
-    elseif msg isa SetRemoteRepl
-        if msg.enable
-            @info "Starting RemoteREPL"
-            port, state.remoterepl_server = Sockets.listenany(27754)
-            state.remoterepl_task = Threads.@spawn :samepool RemoteREPL.serve_repl(state.remoterepl_server)
-            Protocol.server_send(ws, RemoteReplState(true, Int(port)); reply_to)
-        else
-            @info "Stopping RemoteREPL"
-            close(state.remoterepl_server)
-            wait(state.remoterepl_task)
-            Protocol.server_send(ws, RemoteReplState(false, -1); reply_to)
-        end
     else
         @error "Received unsupported message: $(typeof(msg))"
     end

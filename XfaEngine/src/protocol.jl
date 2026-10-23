@@ -10,10 +10,10 @@ export AbstractMessage, Ping, Shutdown,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
     ChangeParameter, InvokeCallback, Start, Stop,
-    SetDebugMode, SetRemoteRepl,
+    SetDebugMode,
     Pong, AvailableDevices,
     Started, Stopped, InputSources,
-    ContextInfo, ParameterChanged, DisplayableChanged, TrainData, RemoteReplState,
+    ContextInfo, ParameterChanged, DisplayableChanged, TrainData,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
@@ -94,10 +94,6 @@ struct SetDebugMode <: AbstractMessage
     enable::Bool
 end
 
-struct SetRemoteRepl <: AbstractMessage
-    enable::Bool
-end
-
 struct GetDevices <: AbstractMessage end
 
 struct GetInputSources <: AbstractMessage end
@@ -170,11 +166,6 @@ end
 
 struct TrainData <: AbstractMessage
     variables::Vector{VariableData}
-end
-
-struct RemoteReplState <: AbstractMessage
-    enabled::Bool
-    port::Int
 end
 
 # Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
