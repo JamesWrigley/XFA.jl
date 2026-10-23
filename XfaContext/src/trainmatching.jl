@@ -310,11 +310,19 @@ function Base.hash(x::VariableData, h::UInt)
     return h
 end
 
+# A partially received train, with the value of `Trainmatcher.n_new_trains`
+# when its first source arrived.
+struct PendingTrain
+    opened::Int
+    data::Dict{String, Any}
+end
+
 mutable struct Trainmatcher
     max_train_latency::Int
     sources::Set{String}
-    train_data::Dict{Int}
+    train_data::Dict{Int, PendingTrain}
     latest_trainid::Int
+    n_new_trains::Int
 
     """
         Trainmatcher(sources, max_train_latency::Int)
@@ -322,12 +330,14 @@ mutable struct Trainmatcher
     Create a Trainmatcher object, which tries to match `sources` coming from a
     Karabo bridge. `sources` is some iterable of `String`'s. The matching is
     'greedy', which means that if not all sources have been received for a certain
-    train after `max_train_latency` trains, then the incomplete train data will be
-    dropped. A negative `max_train_latency` disables this: incomplete trains are
-    kept indefinitely (used for lossless offline replay).
+    train after `max_train_latency` newer trains have arrived, then the
+    incomplete train data will be dropped. Only trains with a new highest train
+    ID count, so neither regressing train IDs nor late data for old trains
+    shorten the window. A negative `max_train_latency` disables this: incomplete
+    trains are kept indefinitely (used for lossless offline replay).
     """
-    function Trainmatcher(sources, max_train_latency::Integer=20)
-        new(max_train_latency, Set(sources), Dict{Int, Any}(), -1)
+    function Trainmatcher(sources, max_train_latency::Integer=30)
+        new(max_train_latency, Set(sources), Dict{Int, PendingTrain}(), -1, 0)
     end
 end
 
@@ -347,17 +357,20 @@ function match_train!(matched_trains::Dict{Int, Any}, dropped_trains::Vector{Int
     end
 
     # Update cached data
-    tm.latest_trainid = max(tm.latest_trainid, variable.tid)
-    if !haskey(tm.train_data, variable.tid)
-        tm.train_data[variable.tid] = Dict{String, Any}()
+    if variable.tid > tm.latest_trainid
+        tm.latest_trainid = variable.tid
+        tm.n_new_trains += 1
     end
-    tm.train_data[variable.tid][variable.name] = variable
+    if !haskey(tm.train_data, variable.tid)
+        tm.train_data[variable.tid] = PendingTrain(tm.n_new_trains, Dict{String, Any}())
+    end
+    tm.train_data[variable.tid].data[variable.name] = variable
 
     # Pop trains that are too old, or fully matched
-    for tid in collect(keys(tm.train_data))
-        if issetequal(tm.sources, keys(tm.train_data[tid]))
-            matched_trains[tid] = pop!(tm.train_data, tid)
-        elseif tm.max_train_latency >= 0 && tm.latest_trainid - tid > tm.max_train_latency
+    for (tid, pending) in collect(tm.train_data)
+        if issetequal(tm.sources, keys(pending.data))
+            matched_trains[tid] = pop!(tm.train_data, tid).data
+        elseif tm.max_train_latency >= 0 && tm.n_new_trains - pending.opened > tm.max_train_latency
             pop!(tm.train_data, tid)
             push!(dropped_trains, tid)
         end

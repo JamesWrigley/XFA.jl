@@ -151,17 +151,39 @@ end
     @test length(matched_trains) == 1
     @test Set(keys(matched_trains[1])) == Set(["foo.bar", "foo.baz"])
 
-    # Test the max train latency. A stale train is dropped and reported, and
-    # late data for it is matched afresh rather than ignored.
+    # Test the max train latency. A train is dropped and reported once more
+    # than `max_train_latency` newer trains have started, and late data for it
+    # is matched afresh rather than ignored.
     tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 1)
     matched = Dict{Int, Any}()
     dropped = Int[]
     @test isempty(Context.match_train!(matched, dropped, tm, VariableData(1, "foo.bar", 1)))
     @test isempty(Context.match_train!(matched, dropped, tm, VariableData(3, "foo.bar", 1)))
+    @test isempty(dropped)
+    @test isempty(Context.match_train!(matched, dropped, tm, VariableData(4, "foo.bar", 1)))
     @test dropped == [1]
     @test isempty(Context.match_train!(matched, dropped, tm, VariableData(1, "foo.baz", 1)))
-    @test dropped == [1, 1]
-    @test length(Context.match_train!(matched, dropped, tm, VariableData(3, "foo.baz", 1))) == 1
+    @test length(Context.match_train!(matched, dropped, tm, VariableData(4, "foo.baz", 1))) == 1
+    @test dropped == [1]
+
+    # A lagging source's late data doesn't shorten the window for other trains
+    tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 2)
+    empty!(matched)
+    for tid in 1:4
+        Context.match_train!(matched, dropped, tm, VariableData(tid, "foo.bar", 1))
+    end
+    for tid in 1:4
+        Context.match_train!(matched, dropped, tm, VariableData(tid, "foo.baz", 1))
+    end
+    @test keys(matched) == Set([2, 3, 4])
+
+    # Regressing train IDs (e.g. from a slow source) still match
+    tm = Context.Trainmatcher(["foo.bar", "foo.baz"], 1)
+    for tid in (100, 50, 50)
+        empty!(matched)
+        Context.match_train!(matched, dropped, tm, VariableData(tid, "foo.bar", 1))
+        @test length(Context.match_train!(matched, dropped, tm, VariableData(tid, "foo.baz", 1))) == 1
+    end
 end
 
 @testset "Plot specs" begin

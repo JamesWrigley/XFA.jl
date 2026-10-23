@@ -861,7 +861,7 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
 end
 
 function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors;
-                         max_train_latency::Integer=20)
+                         max_train_latency::Integer=30)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
     group_name = group_prefix(name)
@@ -1270,7 +1270,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
     end
 
     # Offline drops nothing: keep partial trains indefinitely (see Trainmatcher).
-    max_train_latency = offline ? -1 : 20
+    max_train_latency = offline ? -1 : 30
 
     # Start the variables themselves
     execution_order = topological_sort(ctx)
