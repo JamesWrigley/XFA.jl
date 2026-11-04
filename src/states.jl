@@ -662,6 +662,27 @@ end
     window_open::Bool = false
 end
 
+mutable struct ContextEditor
+    editor::TextEditor
+    window_open::Bool
+    # Text read by a background task, picked up by the render thread on the next
+    # frame since the editor isn't thread-safe.
+    pending_text::Maybe{String}
+    busy::Bool
+end
+
+function ContextEditor()
+    editor = TextEditor()
+    cte.SetLanguage(editor, cte.Language_Julia())
+    cte.SetPalette(editor, cte.GetDarkPalette())
+    cte.SetShowWhitespacesEnabled(editor, false)
+    cte.SetInsertSpacesOnTabs(editor, true)
+    cte.SetTabSize(editor, 4)
+    cte.SetAutoCompleteConfig(editor, cte.Completions(REPLCompleter(; symbols_only=true), cte.DocumentCompleter()))
+
+    ContextEditor(editor, false, nothing, false)
+end
+
 # Per-variable subscription state. `count` tracks open plots referencing the
 # variable; when it drops to zero we flip `active` off (so the engine stops
 # streaming) but keep the entry around to remember the user's chosen zfp
@@ -719,6 +740,7 @@ end
     context_path::String = ""
     context_path_valid::Bool = true
     context::ContextState = ContextState()
+    context_editor::ContextEditor = ContextEditor()
 
     available_variables::Vector{VariableSpec} = VariableSpec[]
     # Nodes being assembled in the add-variable flow, not yet written to source.
@@ -901,6 +923,8 @@ end
 
     # Baked drop-shadow for the Karabo source editor, built on first use.
     window_shadow::Maybe{WindowShadow} = nothing
+    mono_font::Ptr{ig.lib.ImFont} = C_NULL
+    font_percent::Cint = Cint(100)
 
     # Showing external tool windows
     show_imgui_demo::Bool = false
@@ -939,6 +963,7 @@ function GuiState(settings::Dict; kwargs...)
     engine_environment = get(gui, "engine_environment", "")
     engine_working_dir = get(gui, "engine_working_dir", "~/xfa")
     client_type_current_item = Cint(get(gui, "client_type", 0))
+    font_percent = Cint(get(gui, "font_percent", 100))
     saved_contexts = Dict{String, Dict{String, Any}}(
         k => Dict{String, Any}(v) for (k, v)
             in get(client_settings, "contexts", Dict()))
@@ -946,7 +971,7 @@ function GuiState(settings::Dict; kwargs...)
     client = ClientState(settings; embedded_engine = client_type_current_item == 1)
 
     GuiState(; address, julia_module, engine_environment, engine_working_dir,
-             client_type_current_item, saved_contexts, client, kwargs...)
+             client_type_current_item, font_percent, saved_contexts, client, kwargs...)
 end
 
 function Base.setproperty!(state::GuiState, sym::Symbol, x)

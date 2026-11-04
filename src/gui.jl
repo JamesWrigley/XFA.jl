@@ -7,6 +7,7 @@ using ImPlot: ImPlot
 using GLFW: GLFW
 using ModernGL
 import ImGuiNodeEditor as ne
+using ImGuiColorTextEdit: ImGuiColorTextEdit as cte, TextEditor, REPLCompleter
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
@@ -1372,6 +1373,13 @@ function draw_dag()
     end
 
     ig.SameLine()
+    @Disabled !client.context_path_valid begin
+        if ig.Button("Edit context")
+            open_context_editor(client)
+        end
+    end
+
+    ig.SameLine()
     changing_states = (PipelineStatus_Starting, PipelineStatus_Stopping, PipelineStatus_LoadingContext)
     @Disabled context.pipeline_status in changing_states begin
         if ig.Button("Load context")
@@ -1394,9 +1402,11 @@ function draw_dag()
     end
 
     ig.SameLine()
-    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - 100)
+    label = "Add variable"
+    button_width = ig.CalcTextSize(label).x + 2 * unsafe_load(ig.GetStyle()).FramePadding.x
+    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - button_width)
     @Disabled isempty(ctx_state) begin
-        if ig.Button("Add variable")
+        if ig.Button(label)
             ig.OpenPopup("add_variable_popup")
         end
     end
@@ -1976,6 +1986,56 @@ function draw_variable_logs(client::ClientState)
     end
 end
 
+function draw_context_editor(client::ClientState)
+    context_editor = client.context_editor
+    if context_editor.window_open
+        text = context_editor.pending_text
+        if !isnothing(text)
+            set_editor_text(context_editor.editor, text)
+            context_editor.pending_text = nothing
+        end
+
+        ig.SetNextWindowSize((800, 600), ig.ImGuiCond_FirstUseEver)
+        if @c ig.Begin("Context: $(client.context_path)###context-editor", &context_editor.window_open)
+            busy = context_editor.busy
+            @Disabled busy begin
+                if ig.Button("Save")
+                    save_context_editor(client)
+                end
+
+                ig.SameLine()
+                if ig.Button("Reload from disk")
+                    reload_context_editor(client)
+                end
+
+                # TODO: GetText() copies the whole document every frame (~0.2ms for
+                # 120KB), only compare when the text or loaded source changes.
+                source = client.context.source
+                ig.SameLine()
+                @Disabled isempty(source) || cte.GetText(context_editor.editor) == source begin
+                    if ig.Button("Reset to loaded context")
+                        set_editor_text(context_editor.editor, client.context.source)
+                    end
+                end
+            end
+
+            if busy
+                ig.SameLine()
+                Spinner()
+            end
+
+            # The editor ignores the disabled state, so it needs to be read-only too
+            cte.SetReadOnlyEnabled(context_editor.editor, busy)
+            @Disabled busy begin
+                ig.PushFont(state[].mono_font, 18f0)
+                cte.Render(context_editor.editor, "##context-editor")
+                ig.PopFont()
+            end
+        end
+        ig.End()
+    end
+end
+
 ## Main GUI function
 
 default(value, default="") = something(value, default)
@@ -2231,6 +2291,7 @@ function draw_gui()
     draw_karabo_editor(client)
 
     draw_variable_logs(client)
+    draw_context_editor(client)
 
     # Display tooling windows
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
@@ -2346,7 +2407,8 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
         (joinpath(font_dir, "JuliaMono-Regular.ttf"), 16),
     ]
     for (font, font_size) in fonts
-        ig.AddFontFromFileTTF(font_atlas, font, font_size)
+        # This ends up as the last font, which must be monospaced for the context editor
+        gui_state.mono_font = ig.AddFontFromFileTTF(font_atlas, font, font_size)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, font_config)
     end

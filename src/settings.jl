@@ -35,7 +35,8 @@ function save_section(section::String, data::Dict)
 end
 
 function save_settings(state::GuiState, updated_field=nothing)
-    fields_to_save = (:address, :julia_module, :engine_environment, :engine_working_dir, :client_type_current_item)
+    fields_to_save = (:address, :julia_module, :engine_environment, :engine_working_dir, :client_type_current_item,
+                      :font_percent)
     if !isnothing(updated_field) && updated_field ∉ fields_to_save
         return
     end
@@ -46,6 +47,7 @@ function save_settings(state::GuiState, updated_field=nothing)
         "engine_environment" => state.engine_environment,
         "engine_working_dir" => state.engine_working_dir,
         "client_type" => state.client_type_current_item,
+        "font_percent" => state.font_percent,
     ))
 end
 
