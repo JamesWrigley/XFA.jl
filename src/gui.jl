@@ -211,6 +211,27 @@ function draw_main_menubar()
             ig.EndMenu()
         end
 
+        # This scales all fonts, including the size pushed by the context editor
+        style = ig.GetStyle()
+        font_percent = Ref(round(Cint, unsafe_load(style).FontScaleMain * 100))
+
+        # Pin it to the right edge, otherwise it moves under the mouse as the
+        # items before it resize, which changes the value again.
+        slider_x = ig.GetWindowWidth() - 130 - unsafe_load(style).WindowPadding.x
+        label = "Font size: "
+        ig.SetCursorPosX(slider_x - ig.CalcTextSize(label).x - unsafe_load(style).ItemInnerSpacing.x)
+        ig.Text(label)
+        ig.SetCursorPosX(slider_x)
+        ig.SetNextItemWidth(130)
+        if ig.SliderInt("##font-size", font_percent, 50, 200, "%d%%", ig.ImGuiSliderFlags_AlwaysClamp)
+            style.FontScaleMain = font_percent[] / 100
+        end
+
+        # Don't write the settings file on every step of a drag
+        if ig.IsItemDeactivatedAfterEdit()
+            state[].font_percent = font_percent[]
+        end
+
         ig.EndMenuBar()
     end
 end
@@ -2311,6 +2332,7 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     ig.StyleColorsDark()
     style = ig.GetStyle()
     style.FrameBorderSize = 1
+    style.FontScaleMain = gui_state.font_percent / 100
 
     # Load fonts
     font_config = ig.ImFontConfig()
