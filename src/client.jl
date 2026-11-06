@@ -555,9 +555,11 @@ function add_subvariable!(node, ctx_info, node_name, var_name, subvar, pp_names)
                 pp_params[field] = param
             end
         end
-        push!(node["postprocessors"], (
+        push!(node["postprocessors"], PostprocessorInfo(;
             id = subvar_id,
             name = subvar,
+            var_name,
+            var_postprocessors = pp_names,
             display_name = chopprefix(subvar, "$(node_name)."),
             tree_id_suffix = "###pp_$(subvar)",
             plot_id = "Plot##pp_plot_$(subvar)",
@@ -616,7 +618,7 @@ function build_context_state(state, ctx_info)
         push!(ctx_state[name]["outputs"], OutputPin(output_id, ""))
         state.client.ne_output_pins[output_id] = OutputPinInfo(name, name)
 
-        pp_names = Set(get(postprocessors_info, name, String[]))
+        pp_names = get(postprocessors_info, name, String[])
         for subvar in ctx_info["subvariables"][name]
             subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, name, subvar, pp_names)
             state.client.ne_output_pins[subvar_id] = OutputPinInfo(name, subvar)
@@ -698,7 +700,7 @@ function build_context_state(state, ctx_info)
             state.client.ne_output_pins[attr_id] = OutputPinInfo(var_name, var_name)
 
             # Its subvariables
-            pp_names = Set(get(postprocessors_info, var_name, String[]))
+            pp_names = get(postprocessors_info, var_name, String[])
             for subvar in ctx_info["subvariables"][var_name]
                 subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, var_name, subvar, pp_names)
                 state.client.ne_output_pins[subvar_id] = OutputPinInfo(var_name, subvar)
@@ -1061,7 +1063,7 @@ end
 struct ParameterOwner
     kind::ParameterOwnerKind
     var_name::String
-    pp_name::Maybe{String}
+    pp::Maybe{PostprocessorInfo}
     field_name::String
 end
 
@@ -1082,7 +1084,7 @@ function find_parameter_owner(client, param_name::String)
         for pp in get(var_data, "postprocessors", ())
             for (field_name, stored) in pp.params
                 if stored.name == param_name
-                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp.name, field_name)
+                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp, field_name)
                 end
             end
         end
@@ -1273,6 +1275,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                     set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)
                 elseif owner.kind == ParameterOwner_Global
                     set_parameter_value(state, owner.var_name, new_value; reload=false)
+                elseif owner.kind == ParameterOwner_Postprocessor
+                    set_postprocessor_param(state, owner.pp, owner.field_name, new_value; reload=false)
                 end
             end
             client.pending_source_edit = nothing

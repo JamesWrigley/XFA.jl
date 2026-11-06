@@ -579,6 +579,18 @@ struct OutputPin
 end
 OutputPin(id, label) = OutputPin(id, label, false)
 
+@kwdef struct PostprocessorInfo
+    id::UInt
+    name::String
+    var_name::String
+    var_postprocessors::Vector{String}
+    display_name::String
+    tree_id_suffix::String
+    plot_id::String
+    params::Dict{String, Any}
+    origin::String
+end
+
 # An input pin of a node: a variable argument or, for groups, a
 # Parameter{Dependency} field (`field` is then the constructor kwarg rewritten
 # in source). Readonly pins are engine-managed and drawn disabled.

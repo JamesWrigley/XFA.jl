@@ -487,6 +487,29 @@ end
         """
     end
 
+    @testset "Edit postprocessor parameter" begin
+        source = """
+        @Variable function foo(x -> karabo"A/B.c")
+            @postprocess Histogram1D(nbins=5)
+            @postprocess "fit" Mean() name="m"
+            x
+        end
+        """
+        pp_info(name, pp_names) = XFA.PostprocessorInfo(; id=0, name, var_name="foo", var_postprocessors=pp_names,
+                                                        display_name="", tree_id_suffix="", plot_id="",
+                                                        params=Dict{String, Any}(), origin="")
+        pp_names = ["foo.histogram", "foo.fit.m"]
+        edit(pp_name, kwarg, value) = XFA.replace_postprocess_kwarg(source, pp_info(pp_name, pp_names), kwarg, value)
+
+        @test occursin("Histogram1D(nbins=10)", edit("foo.histogram", "nbins", "10"))
+        @test occursin("Mean(; dims=[2]) name=\"m\"", edit("foo.fit.m", "dims", XFA.format_param_value(Context.OptionalDims([2]))))
+
+        # A postprocessor list that doesn't match the source is left alone
+        @test_logs (:warn, r"Could not find the @postprocess") begin
+            @test XFA.replace_postprocess_kwarg(source, pp_info("foo.mean", ["foo.mean"]), "dims", "[2]") == source
+        end
+    end
+
     @testset "Add variable" begin
         variable_spec(origin) = Context.VariableSpec("scan", Context.VariableKind_Variable, origin,
                                                      Context.OrderedDict{String, Dependency}(),

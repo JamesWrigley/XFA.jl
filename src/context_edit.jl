@@ -378,45 +378,83 @@ function replace_constructor_kwarg(source::String, var_name::AbstractString,
         return source
     end
 
-    call_node = children(assign_node)[2]
+    return replace_call_kwarg(source, children(assign_node)[2], kwarg_name, new_value)
+end
 
-    # Find the parameters node (kwargs after ;)
-    params_node = nothing
-    for c in children(call_node)
-        if kind(c) == K"parameters"
-            params_node = c
-            break
-        end
+# Replace a keyword argument value in a call node, accepting kwargs both after
+# a `;` and without one. A missing kwarg is appended after the existing ones.
+function replace_call_kwarg(source::String, call_node::SyntaxNode,
+                            kwarg_name::AbstractString, new_value::AbstractString)
+    cs = children(call_node)
+    params_idx = findfirst(c -> kind(c) == K"parameters", cs)
+    params_node = isnothing(params_idx) ? nothing : cs[params_idx]
+    kwarg_nodes = filter(c -> kind(c) == K"=", cs)
+    if !isnothing(params_node)
+        append!(kwarg_nodes, filter(c -> kind(c) == K"=", children(params_node)))
     end
-
+    kwarg_node = findfirst(kwarg_nodes) do c
+        is_leaf(children(c)[1]) && children(c)[1].val == Symbol(kwarg_name)
+    end
     new_kwarg = "$(kwarg_name)=$(new_value)"
 
-    if isnothing(params_node)
-        # No kwargs at all — insert before the closing paren
+    if !isnothing(kwarg_node)
+        # Replace the entire RHS of the kwarg with the new value
+        br = byte_range(children(kwarg_nodes[kwarg_node])[2])
+        return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+    elseif !isempty(kwarg_nodes)
+        last_end = last(byte_range(kwarg_nodes[end]))
+        return source[1:last_end] * ", $(new_kwarg)" * source[last_end+1:end]
+    else
+        # No kwargs at all, insert before the closing paren
         call_end = last(byte_range(call_node))
         return source[1:call_end-1] * "; $(new_kwarg)" * source[call_end:end]
     end
+end
 
-    # Find the kwarg matching kwarg_name
-    kwarg_node = nothing
-    for c in children(params_node)
-        if kind(c) == K"=" && !isempty(children(c)) &&
-           is_leaf(children(c)[1]) && children(c)[1].val == Symbol(kwarg_name)
-            kwarg_node = c
-            break
+# Replace a keyword argument of the postprocessor constructor in the
+# `@postprocess` call defining `pp`. The variable's postprocessors are in
+# declaration order, which is also the order of its `@postprocess` calls. Only
+# variables defined in the context source itself can be edited, so library
+# references and group members are left alone.
+function replace_postprocess_kwarg(source::String, pp::PostprocessorInfo,
+                                   kwarg_name::AbstractString, new_value::AbstractString)
+    var_name = pp.var_name
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    var_node = find_variable_node(tree, var_name)
+    pp_nodes = if isnothing(var_node)
+        SyntaxNode[]
+    else
+        find_nodes(var_node) do node
+            kind(node) == K"macrocall" && macro_name_symbol(children(node)[1]) == Symbol("@postprocess")
         end
     end
 
-    if isnothing(kwarg_node)
-        # Kwarg not present — append it after the existing kwargs
-        br = byte_range(params_node)
-        return source[1:last(br)] * ", $(new_kwarg)" * source[last(br)+1:end]
+    if length(pp_nodes) != length(pp.var_postprocessors)
+        @warn "Could not find the @postprocess calls of '$(var_name)' in the context file"
+        return source
     end
 
-    # Replace the entire RHS of the kwarg with the new value
-    rhs = children(kwarg_node)[2]
-    br = byte_range(rhs)
-    return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+    # Check that the call's source subvariable and name agree with pp.name
+    pp_args = children(pp_nodes[findfirst(==(pp.name), pp.var_postprocessors)])[2:end]
+    positional = filter(c -> kind(c) ∉ (K"=", K"parameters"), pp_args)
+    name_kwargs = filter(pp_args) do c
+        kind(c) == K"=" && children(c)[1].val == :name
+    end
+    subvar = length(positional) == 2 ? children(positional[1])[1].val : nothing
+    name = isempty(name_kwargs) ? nothing : children(children(only(name_kwargs))[2])[1].val
+    prefix = isnothing(subvar) ? "$(var_name)." : "$(var_name).$(subvar)."
+    rest = chopprefix(pp.name, prefix)
+    matches = startswith(pp.name, prefix) && !occursin('.', rest) && (isnothing(name) || rest == name)
+
+    if !matches
+        @warn "The @postprocess calls of '$(var_name)' don't match the loaded context"
+        return source
+    elseif kind(positional[end]) != K"call"
+        @warn "Postprocessor '$(pp.name)' isn't defined by a constructor call"
+        return source
+    else
+        return replace_call_kwarg(source, positional[end], kwarg_name, new_value)
+    end
 end
 
 # Format a parameter value as its Julia source representation for embedding as
@@ -429,6 +467,8 @@ format_param_value(roi::LinearROI) = "LinearROI($(roi.start), $(roi.length); axi
 format_param_value(x::Union{Integer, AbstractFloat, Bool}) = repr(x)
 format_param_value(d::KaraboDevice) = "KaraboDevice(\"$(d.topic)\", \"$(d.name)\")"
 format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) = repr(v)
+format_param_value(t::Tuple{Vararg{Union{Integer, AbstractFloat}}}) = repr(t)
+format_param_value(d::OptionalDims) = format_param_value(d.dims)
 format_param_value(sel::IndexSelection) = "IndexSelection(\"$(sel)\")"
 format_param_value(_) = nothing
 
@@ -653,6 +693,10 @@ set_group_param(state, var_name::AbstractString, kwarg_name::AbstractString, new
 
 set_parameter_value(state, var_name::String, new_value::String; reload::Bool=true) =
     apply_source_edit(s -> replace_parameter_value(s, var_name, new_value), state; reload)
+
+set_postprocessor_param(state, pp::PostprocessorInfo, kwarg_name::AbstractString, new_value::AbstractString;
+                        reload::Bool=true) =
+    apply_source_edit(s -> replace_postprocess_kwarg(s, pp, kwarg_name, new_value), state; reload)
 
 # Replace a dependency (Karabo or variable) in the source code and reload.
 rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency) =
