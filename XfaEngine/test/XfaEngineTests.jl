@@ -223,6 +223,14 @@ end
                 @test msg isa Protocol.ContextInfo
                 @test msg.info isa Dict
                 @test haskey(msg.info["dag"], "x")
+
+                # Changes to the loaded file are broadcast. The watcher only picks up
+                # a newly loaded path when its 1s watch_file() timeout expires.
+                sleep(1.5)
+                write(path, "p = Parameter(1)\n")
+                msg = Protocol.receive(ws).msg
+                @test msg isa Protocol.ContextSource
+                @test msg.source == "p = Parameter(1)\n"
             end
 
             # Test ChangeParameter — engine should ack and then broadcast the

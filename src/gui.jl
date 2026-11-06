@@ -1988,6 +1988,17 @@ end
 
 function draw_context_editor(client::ClientState)
     context_editor = client.context_editor
+
+    # Follow changes to the context source unless there are local changes
+    source = client.context.source
+    if source != context_editor.synced_source
+        context_editor.disk_changed = cte.GetText(context_editor.editor) != context_editor.synced_source
+        if !context_editor.disk_changed
+            set_editor_text(context_editor.editor, source)
+        end
+        context_editor.synced_source = source
+    end
+
     if context_editor.window_open
         text = context_editor.pending_text
         if !isnothing(text)
@@ -1999,9 +2010,11 @@ function draw_context_editor(client::ClientState)
         if @c ig.Begin("Context: $(client.context_path)###context-editor", &context_editor.window_open)
             busy = context_editor.busy
             @Disabled busy begin
-                if ig.Button("Save")
+                # Shortcut() ignores the disabled state, so check busy explicitly
+                if ig.Button("Save") || (!busy && ig.Shortcut(ig.ImGuiMod_Ctrl | ig.ImGuiKey_S))
                     save_context_editor(client)
                 end
+                ig.SetItemTooltip("Ctrl+S")
 
                 ig.SameLine()
                 if ig.Button("Reload from disk")
@@ -2011,8 +2024,9 @@ function draw_context_editor(client::ClientState)
                 # TODO: GetText() copies the whole document every frame (~0.2ms for
                 # 120KB), only compare when the text or loaded source changes.
                 source = client.context.source
+                in_sync = cte.GetText(context_editor.editor) == source
                 ig.SameLine()
-                @Disabled isempty(source) || cte.GetText(context_editor.editor) == source begin
+                @Disabled isempty(source) || in_sync begin
                     if ig.Button("Reset to loaded context")
                         set_editor_text(context_editor.editor, client.context.source)
                     end
@@ -2022,6 +2036,11 @@ function draw_context_editor(client::ClientState)
             if busy
                 ig.SameLine()
                 Spinner()
+            end
+
+            if context_editor.disk_changed && !in_sync
+                ig.TextColored(ImVec4(0.9, 0.7, 0.2, 1),
+                               "The context file has changed on disk, click 'Reload from disk' to load the changes (this will discard local changes).")
             end
 
             # The editor ignores the disabled state, so it needs to be read-only too

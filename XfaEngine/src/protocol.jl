@@ -156,6 +156,11 @@ end
 
 ContextInfo(ctx::ContextState, source::String) = ContextInfo(XfaContext.to_dict(ctx), ctx.is_running[], source)
 
+# The new contents of the loaded context file, broadcast whenever it changes
+struct ContextSource <: AbstractMessage
+    source::String
+end
+
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter
 end

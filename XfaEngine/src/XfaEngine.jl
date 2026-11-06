@@ -39,6 +39,7 @@ include("karabo_input.jl")
 using Base.CoreLogging: AbstractLogger, LogLevel, Info, global_logger
 using Base.ScopedValues: ScopedValue, @with
 using DataStructures: CircularBuffer
+using FileWatching: watch_file
 using LoggingExtras: TeeLogger
 include("gui_logger.jl")
 
@@ -104,6 +105,7 @@ end
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
     channel_stats_task::Union{Task, Nothing} = nothing
+    context_watch_task::Union{Task, Nothing} = nothing
 
     gui_logger::GuiLogger = GuiLogger()
     previous_logger::Union{AbstractLogger, Nothing} = nothing
@@ -255,6 +257,38 @@ function broadcast_context_info(state::EngineState)
             Protocol.server_send(client.websocket, msg)
         catch ex
             @warn "Failed to broadcast ContextInfo to client '$(id)'" exception=ex
+        end
+    end
+end
+
+# Broadcast the loaded context file whenever it changes, e.g. when a client
+# writes a parameter change to it. The timeout lets us notice a newly loaded
+# context or a shutdown.
+function watch_context_file(state::EngineState)
+    last_source = ""
+    while !state.stop_event.set
+        path = state.ctx.path
+        try
+            if isempty(path) || !isfile(path)
+                sleep(1)
+            elseif !watch_file(path, 1).timedout && isfile(path)
+                source = read(path, String)
+                # A single write can fire several events
+                if source != last_source
+                    last_source = source
+                    msg = Protocol.ContextSource(source)
+                    for (id, client) in state.clients
+                        try
+                            Protocol.server_send(client.websocket, msg)
+                        catch ex
+                            @warn "Failed to broadcast ContextSource to client '$(id)'" exception=ex
+                        end
+                    end
+                end
+            end
+        catch ex
+            @error "Failed to watch context file $(path)" exception=(ex, catch_backtrace())
+            sleep(1)
         end
     end
 end
@@ -758,6 +792,9 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     state.log_broadcast_task = Threads.@spawn :interactive broadcast_logs(state)
     errormonitor(state.log_broadcast_task)
 
+    state.context_watch_task = Threads.@spawn :interactive watch_context_file(state)
+    errormonitor(state.context_watch_task)
+
     state.stop_task = Threads.@spawn :interactive try
         Base.wait(state.stop_event)
     catch ex
@@ -774,6 +811,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         Base.wait(state.stop_task)
         Base.wait(state.channel_stats_task)
         Base.wait(state.log_broadcast_task)
+        Base.wait(state.context_watch_task)
     end
 
     return state
@@ -813,6 +851,7 @@ precompile(Context.get_sources, (KaraboInput,))
                 wait(state.stop_task)
                 wait(state.channel_stats_task)
                 wait(state.log_broadcast_task)
+                wait(state.context_watch_task)
             end
         end
     end

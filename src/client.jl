@@ -1192,6 +1192,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
+    elseif msg isa Protocol.ContextSource
+        # Keep the source in sync with the file since edits are applied to it
+        client.context.source = msg.source
     elseif msg isa Protocol.LogMessages
         for record in msg.records
             is_new_error = record.level >= CoreLogging.Error && !msg.replay

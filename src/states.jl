@@ -680,6 +680,9 @@ mutable struct ContextEditor
     # Text read by a background task, picked up by the render thread on the next
     # frame since the editor isn't thread-safe.
     pending_text::Maybe{String}
+    # The context source the editor last followed, for detecting local changes
+    synced_source::String
+    disk_changed::Bool
     busy::Bool
 end
 
@@ -692,7 +695,7 @@ function ContextEditor()
     cte.SetTabSize(editor, 4)
     cte.SetAutoCompleteConfig(editor, cte.Completions(REPLCompleter(; symbols_only=true), cte.DocumentCompleter()))
 
-    ContextEditor(editor, false, nothing, false)
+    ContextEditor(editor, false, nothing, "", false, false)
 end
 
 # Per-variable subscription state. `count` tracks open plots referencing the
