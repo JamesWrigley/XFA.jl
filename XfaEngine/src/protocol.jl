@@ -1,7 +1,7 @@
 module Protocol
 
 export AbstractMessage, Ping, Shutdown,
-    GetTrainmatchers, GetInputSources, LoadContext, ReviseCode,
+    GetDevices, GetInputSources, LoadContext, ReviseCode,
     GetDeviceSchema, DeviceSchema,
     GetDeviceProperty, DeviceProperty,
     GetPackageDirs, PackageDirs,
@@ -10,10 +10,10 @@ export AbstractMessage, Ping, Shutdown,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
     ChangeParameter, InvokeCallback, Start, Stop,
-    SetDebugMode, SetRemoteRepl,
-    Pong, AvailableTrainmatchers,
+    SetDebugMode,
+    Pong, AvailableDevices,
     Started, Stopped, InputSources,
-    ContextInfo, ParameterChanged, DisplayableChanged, TrainData, RemoteReplState,
+    ContextInfo, ParameterChanged, DisplayableChanged, TrainData,
     PipelineStats, Ack, Envelope, MessageId, ExceptionMessage, client_send, server_send
 
 import Serialization: serialize, deserialize
@@ -21,13 +21,13 @@ import Serialization: serialize, deserialize
 import HTTP: WebSockets
 
 import XfaContext
-using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec
+using XfaContext: ContextState, VariableData, Parameter, Displayable, SourceInfo, VariableSpec, KaraboDevice
 using ..XfaEngine: RoutingRule, RemapRule
 
 
 # Max websocket frame size for client-engine traffic. The HTTP.jl default of
 # 16 MiB is too small so we effectively disable the limit.
-const MAX_FRAME_SIZE = typemax(Int)
+const MAX_FRAME_SIZE = 1 << 40
 
 abstract type AbstractMessage end
 
@@ -94,11 +94,7 @@ struct SetDebugMode <: AbstractMessage
     enable::Bool
 end
 
-struct SetRemoteRepl <: AbstractMessage
-    enable::Bool
-end
-
-struct GetTrainmatchers <: AbstractMessage end
+struct GetDevices <: AbstractMessage end
 
 struct GetInputSources <: AbstractMessage end
 
@@ -109,8 +105,9 @@ struct GetVariables <: AbstractMessage end
 # Messages that the server can send
 struct Pong <: AbstractMessage end
 
-struct AvailableTrainmatchers <: AbstractMessage
-    topic_trainmatchers::Dict{String, Vector{Tuple{String, Bool}}}
+struct AvailableDevices <: AbstractMessage
+    devices::Vector{SourceInfo}
+    whitelisted::Set{KaraboDevice}
 end
 
 struct RoutingRules <: AbstractMessage
@@ -159,6 +156,11 @@ end
 
 ContextInfo(ctx::ContextState, source::String) = ContextInfo(XfaContext.to_dict(ctx), ctx.is_running[], source)
 
+# The new contents of the loaded context file, broadcast whenever it changes
+struct ContextSource <: AbstractMessage
+    source::String
+end
+
 struct ParameterChanged <: AbstractMessage
     parameter::Parameter
 end
@@ -169,11 +171,6 @@ end
 
 struct TrainData <: AbstractMessage
     variables::Vector{VariableData}
-end
-
-struct RemoteReplState <: AbstractMessage
-    enabled::Bool
-    port::Int
 end
 
 # Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
@@ -190,6 +187,28 @@ struct Ack <: AbstractMessage
     error::Union{ExceptionMessage, Nothing}
 end
 Ack() = Ack(nothing)
+
+# A log record from the engine, pre-formatted to strings. `variable` is the
+# `Meta.name` it was logged under ("" if none). Consecutive records with the
+# same `key` are repeats, merged by adding up their `count`.
+@kwdef struct LogRecord
+    timestamp::Float64 = time()
+    level::Base.CoreLogging.LogLevel
+    message::String
+    details::String = ""
+    variable::String = ""
+    tid::Int = -1
+    key::UInt64 = 0
+    file::String = ""
+    line::Int = -1
+    count::Int = 1
+end
+
+struct LogMessages <: AbstractMessage
+    records::Vector{LogRecord}
+    # Set for the history sent to a newly connected client
+    replay::Bool
+end
 
 const MessageId = Int
 

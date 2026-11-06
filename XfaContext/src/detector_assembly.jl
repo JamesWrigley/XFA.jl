@@ -1,5 +1,7 @@
 # Holds the single-frame lookup table and the corresponding output image
-# size. The LUT is meant to be obtained from extra-geom.
+# size. The LUT is meant to be obtained from extra-geom, either through the
+# script below or from a geometry object with `AssemblerLUT(geom::Py)` (in the
+# PythonCall extension).
 struct AssemblerLUT
     lut::Vector{UInt64}
     frame_size::Tuple{Int, Int}

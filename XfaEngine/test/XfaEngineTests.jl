@@ -21,6 +21,7 @@ ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
 using Logging: Logging
 using Sockets: Sockets, @ip_str, send, recv
 using Statistics: mean
+using Base.ScopedValues: @with
 using Test: with_logger, TestLogger
 using ReTest: @testset, @test, @test_throws, @test_logs
 
@@ -83,7 +84,9 @@ function server_exists(port)
     end
 end
 
-function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
+function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing,
+                       pattern=KaraboBridge.BridgePattern_REP)
+    pattern_name = chopprefix(string(pattern), "BridgePattern_")
     server = HTTP.serve!("127.0.0.1", port) do request
         if request.target == "/devices.json"
             return HTTP.Response(read(joinpath(@__DIR__, "mid-devices.json"), String))
@@ -97,7 +100,7 @@ function mock_webproxy(f::Function, port, bridge_port=-1; slot_calls=nothing)
                                      "reply": {"success": {"value": true, "timestamp": 0, "tid": 0},
                                                "ttl": {"value": 0.5, "timestamp": 0, "tid": 0}}}""")
         elseif endswith(request.target, "/config.json")
-            return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)"}]}""")
+            return HTTP.Response("""{"zmqOutputs": [{"address": "tcp://localhost:$(bridge_port)", "pattern": "$(pattern_name)"}]}""")
         else
             return HTTP.Response(404, "Path not supported")
         end
@@ -162,8 +165,8 @@ end
             @test package_dirs isa Protocol.PackageDirs
             @test (package_dirs.engine, package_dirs.context) == (pkgdir(XfaEngine), pkgdir(Context))
 
-            Protocol.client_send(ws, Protocol.GetTrainmatchers())
-            @test Protocol.receive(ws).msg isa Protocol.AvailableTrainmatchers
+            Protocol.client_send(ws, Protocol.GetDevices())
+            @test Protocol.receive(ws).msg isa Protocol.AvailableDevices
 
             # Test Ping
             Protocol.client_send(ws, Protocol.Ping())
@@ -220,6 +223,14 @@ end
                 @test msg isa Protocol.ContextInfo
                 @test msg.info isa Dict
                 @test haskey(msg.info["dag"], "x")
+
+                # Changes to the loaded file are broadcast. The watcher only picks up
+                # a newly loaded path when its 1s watch_file() timeout expires.
+                sleep(1.5)
+                write(path, "p = Parameter(1)\n")
+                msg = Protocol.receive(ws).msg
+                @test msg isa Protocol.ContextSource
+                @test msg.source == "p = Parameter(1)\n"
             end
 
             # Test ChangeParameter — engine should ack and then broadcast the
@@ -378,6 +389,50 @@ end
                     Protocol.client_send(ws, Protocol.Stop())
                     msg = Protocol.receive(ws).msg
                     while !(msg isa Protocol.Stopped); msg = Protocol.receive(ws).msg end
+                end
+            end
+        end
+    end
+
+    @testset "Failed restart after loading" begin
+        mktemp() do path, io
+            write(path, raw"""
+            @Input function input(::Context.MockInput, output)
+                for tid in 1:1_000_000
+                    put!(output, (tid, Dict()))
+                    sleep(0.01)
+                end
+            end
+            x = Context.MockInput()
+            # Without any variables the pipeline finishes immediately
+            @Variable foo -> karabo"foo.x"
+            """)
+
+            temp_engine(; log=TestLogger()) do address, stop_event, info_path
+                WebSockets.open(address) do ws
+                    WebSockets.receive(ws) # client id
+
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                    Protocol.client_send(ws, Protocol.Start())
+                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+
+                    # Reloading restarts the pipeline, which fails here
+                    write(path, raw"""
+                    @Group struct Rejecting end
+                    Context.update_sources(::Rejecting, _) = error("Sources rejected")
+                    @Input function input(::Rejecting, output) end
+                    r = Rejecting()
+                    """)
+                    Protocol.client_send(ws, Protocol.LoadContext(path))
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    @test msg.info isa Dict
+                    @test !msg.is_running
+
+                    msg = Protocol.receive(ws).msg
+                    while !(msg isa Protocol.Ack); msg = Protocol.receive(ws).msg end
+                    @test contains(msg.error.text, "Sources rejected")
                 end
             end
         end
@@ -590,6 +645,29 @@ end
             @test eltype(data["src"]["mixed"]) == Int16
         end
     end
+
+    @testset "PUB pattern" begin
+        server = KaraboBridgeServer(endpoint; pattern=KaraboBridge.BridgePattern_PUB)
+        clients = [KaraboBridgeClient(endpoint, KaraboBridge.BridgePattern_PUB) for _ in 1:2]
+        try
+            KaraboBridge.startbridge(server)
+            payload = Dict("src" => Dict("x" => 42))
+
+            # Keep publishing until every client has received a train
+            results = [Threads.@spawn take!(client) for client in clients]
+            @test timedwait(5) do
+                put!(server, payload)
+                all(istaskdone, results)
+            end == :ok
+            @test all(fetch(t)[1] == payload for t in results)
+        finally
+            foreach(close, clients)
+            close(server)
+        end
+
+        @test KaraboBridge.parse_bridge_pattern("PUSH") == KaraboBridge.BridgePattern_PUSH
+        @test_throws ErrorException KaraboBridge.parse_bridge_pattern("DEALER")
+    end
 end
 
 # Test postprocessors, also in Main for load_from_string access.
@@ -619,13 +697,15 @@ end
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === XfaEngine.stream
 
-    @testset "Source leases" begin
+    @testset "Source leases ($(pattern))" for pattern in (KaraboBridge.BridgePattern_REP,
+                                                         KaraboBridge.BridgePattern_PUB)
         # In automatic configuration mode the bridge should lease its
         # dependencies' sources through the subscribeSources slot and keep
-        # renewing them while streaming.
+        # renewing them while streaming. The bridge pattern is looked up from
+        # the trainmatcher's zmqOutputs.
         webproxy_port = XfaEngine.getavailableport(8485)
         bridge_port = XfaEngine.getavailableport(42000)
-        bridge_server = KaraboBridgeServer("tcp://localhost:$(bridge_port)")
+        bridge_server = KaraboBridgeServer("tcp://localhost:$(bridge_port)"; pattern)
         KaraboBridge.startbridge(bridge_server)
 
         ctx = Context.load_from_string("""
@@ -639,11 +719,16 @@ end
         XfaEngine.current_engine_state = XfaEngine.EngineState(; webproxies)
 
         slot_calls = []
-        put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
-        mock_webproxy(webproxy_port, bridge_port; slot_calls) do
+        mock_webproxy(webproxy_port, bridge_port; slot_calls, pattern) do
             Context.run(ctx) do
-                @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
-                @test take!(ctx.stream_output) == VariableData(0, "foo", 42.0)
+                # Keep sending since a PUB socket drops trains published
+                # before the subscription is established.
+                @test timedwait(5) do
+                    put!(bridge_server, Dict("foo" => Dict("x" => 42.0)))
+                    isready(ctx.stream_output)
+                end == :ok
+                result = take!(ctx.stream_output)
+                @test (result.name, result.data) == ("foo", 42.0)
 
                 # The initial subscription leased the karabo dependency, and
                 # the bridge picked up the mocked TTL from the reply
@@ -662,8 +747,8 @@ end
 
 @testset "Offline input" begin
     mktempdir() do dir
-        # Made in a subprocess so the test never has to hold the GIL itself;
-        # PythonCall is loaded lazily by the input under test.
+        # Made in a subprocess since PythonCall is loaded lazily by the input
+        # under test.
         path = joinpath(dir, "RAW-R0450-DA01-S00000.h5")
         run(`$(ENV["JULIA_PYTHONCALL_EXE"]) -c "from extra_data.tests.make_examples import make_fxe_da_file; make_fxe_da_file('$(path)')"`)
 
@@ -1006,7 +1091,7 @@ end
 
 @testset "Serialization" begin
     ctx = Context.load_from_string(raw"""
-        using Main.PostprocessorLibrary: TestWindow
+        using Main.PostprocessorLibrary: TestMean, TestWindow
 
         bridge = KaraboInput(; trainmatcher=KaraboDevice(""))
         bridge._mock_sources = SourceInfo[]
@@ -1026,21 +1111,24 @@ end
         @Variable function bar(data -> xgm)
             @add_subvariable("max_data", max(data))
             @postprocess(TestWindow(; size=5))
+            @postprocess "max_data" TestMean() name="avg"
             @display roi
             mean(data)
         end
         """; prelude=KARABO_PRELUDE)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
+                                       "input_topics" => Dict("bridge.stream" => nothing),
                                        "groups" => ["bridge", "resettable"],
                                        "dag" =>          Dict("xgm" => OD("data" => karabo"xgm.intensity"),
                                                               "foo" => OD(),
                                                               "bar" => OD("data" => Dependency("xgm"))),
                                        "subvariables" => Dict("xgm" => [],
                                                               "foo" => [],
-                                                              "bar" => ["bar.max_data", "bar.window"]),
-                                       "postprocessors" => Dict("bar" => ["bar.window"]),
-                                       "postprocessor_origins" => Dict("bar.window" => "Main.PostprocessorLibrary.TestWindow"),
+                                                              "bar" => ["bar.max_data", "bar.max_data.avg", "bar.window"]),
+                                       "postprocessors" => Dict("bar" => ["bar.window", "bar.max_data.avg"]),
+                                       "postprocessor_origins" => Dict("bar.window" => "Main.PostprocessorLibrary.TestWindow",
+                                                                       "bar.max_data.avg" => "Main.PostprocessorLibrary.TestMean"),
                                        "displays" => Dict("bar" => ["roi"]),
                                        "origins" => Dict("xgm" => "xgm",
                                                          "foo" => "foo",
@@ -1211,6 +1299,72 @@ end
         plain = compress_array(ws, randn(600))
         @test restore_dims(allocate_array(plain), plain) isa Vector{Float64}
     end
+end
+
+@testset "GuiLogger" begin
+    # Only info and above are kept, and only consecutive repeats with the
+    # same variable, message, values and exception are merged.
+    logger = engine.GuiLogger()
+    thrower1() = error("same")
+    thrower2() = error("same")
+    log_failed(value) = @error "Failed" value
+    with_logger(logger) do
+        @debug "Ignored"
+        for (name, tid, msg) in [("x", 1, "a"), ("x", 2, "a"), ("y", 3, "a"), ("x", 4, "a"), ("x", 5, "b")]
+            @with Context.Meta.name => name Context.Meta.tid => tid @warn "Warning" exception=ErrorException(msg)
+        end
+        # The same exception thrown from a different place isn't merged
+        for f in (thrower1, thrower1, thrower2)
+            try
+                f()
+            catch ex
+                @error "Failed" exception=(ex, catch_backtrace())
+            end
+        end
+        log_failed(2)
+        log_failed(1)
+        @with engine.in_log_broadcast => true @error "Suppressed"
+    end
+
+    records = engine.take_pending!(logger)
+    @test [(r.variable, r.tid, r.count) for r in records] ==
+        [("x", 2, 2), ("y", 3, 1), ("x", 4, 1), ("x", 5, 1), ("", -1, 2), ("", -1, 1), ("", -1, 1), ("", -1, 1)]
+    @test records[4].details == "b"
+    @test contains(records[6].details, "thrower2")
+    @test [r.details for r in records[7:8]] == ["value = 2", "value = 1"]
+    @test isempty(engine.take_pending!(logger))
+    @test engine.log_history(logger) == records
+
+    # Repeats spanning two takes are merged in the history
+    with_logger(() -> log_failed(1), logger)
+    @test only(engine.take_pending!(logger)).count == 1
+    history = engine.log_history(logger)
+    @test length(history) == length(records)
+    @test history[end].count == 2
+
+    # Errors from a variable's task are attributed to the variable
+    ctx = Context.load_from_string("""
+    @Input function input(::Context.MockInput, output)
+        for tid in 1:3
+            put!(output, (tid, Dict("foo" => Dict("bar" => tid))))
+        end
+    end
+    i = Context.MockInput()
+
+    @Variable function failing(data -> karabo"foo.bar")
+        error("boom")
+    end
+    """)
+    logger = engine.GuiLogger()
+    with_logger(logger) do
+        Context.run(ctx) do
+            @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+        end
+    end
+
+    failures = filter(r -> r.variable == "failing", engine.take_pending!(logger))
+    @test sum(r.count for r in failures) == 3
+    @test all(r -> contains(r.details, "boom"), failures)
 end
 
 end

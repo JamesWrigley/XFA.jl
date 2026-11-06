@@ -37,18 +37,37 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
         end
     end
 
-    targets = SyntaxNode[]
+    targets = UnitRange{Int}[]
     for vm in variable_macros
-        append!(targets, find_nodes(vm) do node
+        append!(targets, byte_range.(find_nodes(vm) do node
             is_leaf(node) && kind(node) == K"Identifier" && node.val == Symbol(old_name)
-        end)
+        end))
     end
 
     # Groups and inputs are defined by assignment, so they have no @Variable to
     # rename; the references above still cover uses inside other variables.
     assign_node = find_assignment_call(tree, old_name)
     if !isnothing(assign_node)
-        push!(targets, children(assign_node)[1])
+        push!(targets, byte_range(children(assign_node)[1]))
+    end
+
+    # Dependency("old_name") or Dependency("old_name.sub") references, e.g. in
+    # group constructor kwargs. Only the old_name prefix of the string is replaced.
+    dep_strings = find_nodes(tree) do node
+        if kind(node) == K"call" && length(children(node)) == 2
+            func, arg = children(node)
+            if kind(func) == K"Identifier" && func.val == :Dependency &&
+                    kind(arg) == K"string" && length(children(arg)) == 1
+                str = children(arg)[1]
+                return kind(str) == K"String" &&
+                    (str.val == old_name || startswith(str.val, old_name * "."))
+            end
+        end
+        return false
+    end
+    for node in dep_strings
+        start = first(byte_range(children(children(node)[2])[1]))
+        push!(targets, start:start + ncodeunits(old_name) - 1)
     end
 
     if isempty(targets)
@@ -57,9 +76,8 @@ function replace_variable_name(source::String, old_name::String, new_name::Strin
     end
 
     # Replace in reverse byte order to preserve offsets
-    sort!(targets; by=n -> first(byte_range(n)), rev=true)
-    for node in targets
-        br = byte_range(node)
+    sort!(targets; by=first, rev=true)
+    for br in targets
         source = source[1:first(br)-1] * new_name * source[last(br)+1:end]
     end
 
@@ -70,7 +88,7 @@ end
 # the current source and returns the modified source (or the same source if
 # nothing changed). On change, writes the result to the context file and either
 # reloads the context or just updates the in-memory source.
-function apply_source_edit(state, transform; reload::Bool=true)
+function apply_source_edit(transform, state; reload::Bool=true)
     client = state.client
     source = client.context.source
 
@@ -84,13 +102,7 @@ function apply_source_edit(state, transform; reload::Bool=true)
         return
     end
 
-    if client.embedded_engine
-        write(client.context_path, new_source)
-    else
-        open(client.context_path, client.sftp; write=true) do f
-            write(f, new_source)
-        end
-    end
+    write_context_file(client, new_source)
 
     if reload
         load_context(state)
@@ -100,7 +112,67 @@ function apply_source_edit(state, transform; reload::Bool=true)
 end
 
 rename_variable(state, old_name::String, new_name::String) =
-    apply_source_edit(state, s -> replace_variable_name(s, old_name, new_name))
+    apply_source_edit(s -> replace_variable_name(s, old_name, new_name), state)
+
+function read_context_file(client)
+    path = resolve_context_path(client)
+    if client.embedded_engine
+        read(path, String)
+    else
+        with_sftp(sftp -> read(path, sftp, String), client)
+    end
+end
+
+function write_context_file(client, text::String)
+    path = resolve_context_path(client)
+    if client.embedded_engine
+        write(path, text)
+    else
+        with_sftp(client) do sftp
+            open(path, sftp; write=true) do f
+                write(f, text)
+            end
+        end
+    end
+end
+
+# Read the context file into the editor. This may go over SFTP so don't block the GUI.
+function reload_context_editor(client)
+    context_editor = client.context_editor
+    context_editor.busy = true
+    @guiasync try
+        context_editor.pending_text = read_context_file(client)
+    finally
+        context_editor.busy = false
+    end
+end
+
+# Replace the editor text, keeping the cursor and scroll position
+function set_editor_text(editor::TextEditor, text::String)
+    cursor = cte.GetMainCursorPosition(editor)
+    first_row = cte.GetFirstVisibleRow(editor)
+
+    # The order matters, SetCursor() scrolls to the cursor unless ScrollToLine() comes after it
+    cte.SetText(editor, text)
+    cte.SetCursor(editor, cursor)
+    cte.ScrollToLine(editor, first_row, cte.Scroll_alignTop)
+end
+
+function open_context_editor(client)
+    client.context_editor.window_open = true
+    reload_context_editor(client)
+end
+
+function save_context_editor(client)
+    context_editor = client.context_editor
+    text = cte.GetText(context_editor.editor)
+    context_editor.busy = true
+    @guiasync try
+        write_context_file(client, text)
+    finally
+        context_editor.busy = false
+    end
+end
 
 """
 Find all descendant nodes matching a predicate.
@@ -306,45 +378,83 @@ function replace_constructor_kwarg(source::String, var_name::AbstractString,
         return source
     end
 
-    call_node = children(assign_node)[2]
+    return replace_call_kwarg(source, children(assign_node)[2], kwarg_name, new_value)
+end
 
-    # Find the parameters node (kwargs after ;)
-    params_node = nothing
-    for c in children(call_node)
-        if kind(c) == K"parameters"
-            params_node = c
-            break
-        end
+# Replace a keyword argument value in a call node, accepting kwargs both after
+# a `;` and without one. A missing kwarg is appended after the existing ones.
+function replace_call_kwarg(source::String, call_node::SyntaxNode,
+                            kwarg_name::AbstractString, new_value::AbstractString)
+    cs = children(call_node)
+    params_idx = findfirst(c -> kind(c) == K"parameters", cs)
+    params_node = isnothing(params_idx) ? nothing : cs[params_idx]
+    kwarg_nodes = filter(c -> kind(c) == K"=", cs)
+    if !isnothing(params_node)
+        append!(kwarg_nodes, filter(c -> kind(c) == K"=", children(params_node)))
     end
-
+    kwarg_node = findfirst(kwarg_nodes) do c
+        is_leaf(children(c)[1]) && children(c)[1].val == Symbol(kwarg_name)
+    end
     new_kwarg = "$(kwarg_name)=$(new_value)"
 
-    if isnothing(params_node)
-        # No kwargs at all — insert before the closing paren
+    if !isnothing(kwarg_node)
+        # Replace the entire RHS of the kwarg with the new value
+        br = byte_range(children(kwarg_nodes[kwarg_node])[2])
+        return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+    elseif !isempty(kwarg_nodes)
+        last_end = last(byte_range(kwarg_nodes[end]))
+        return source[1:last_end] * ", $(new_kwarg)" * source[last_end+1:end]
+    else
+        # No kwargs at all, insert before the closing paren
         call_end = last(byte_range(call_node))
         return source[1:call_end-1] * "; $(new_kwarg)" * source[call_end:end]
     end
+end
 
-    # Find the kwarg matching kwarg_name
-    kwarg_node = nothing
-    for c in children(params_node)
-        if kind(c) == K"=" && !isempty(children(c)) &&
-           is_leaf(children(c)[1]) && children(c)[1].val == Symbol(kwarg_name)
-            kwarg_node = c
-            break
+# Replace a keyword argument of the postprocessor constructor in the
+# `@postprocess` call defining `pp`. The variable's postprocessors are in
+# declaration order, which is also the order of its `@postprocess` calls. Only
+# variables defined in the context source itself can be edited, so library
+# references and group members are left alone.
+function replace_postprocess_kwarg(source::String, pp::PostprocessorInfo,
+                                   kwarg_name::AbstractString, new_value::AbstractString)
+    var_name = pp.var_name
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    var_node = find_variable_node(tree, var_name)
+    pp_nodes = if isnothing(var_node)
+        SyntaxNode[]
+    else
+        find_nodes(var_node) do node
+            kind(node) == K"macrocall" && macro_name_symbol(children(node)[1]) == Symbol("@postprocess")
         end
     end
 
-    if isnothing(kwarg_node)
-        # Kwarg not present — append it after the existing kwargs
-        br = byte_range(params_node)
-        return source[1:last(br)] * ", $(new_kwarg)" * source[last(br)+1:end]
+    if length(pp_nodes) != length(pp.var_postprocessors)
+        @warn "Could not find the @postprocess calls of '$(var_name)' in the context file"
+        return source
     end
 
-    # Replace the entire RHS of the kwarg with the new value
-    rhs = children(kwarg_node)[2]
-    br = byte_range(rhs)
-    return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+    # Check that the call's source subvariable and name agree with pp.name
+    pp_args = children(pp_nodes[findfirst(==(pp.name), pp.var_postprocessors)])[2:end]
+    positional = filter(c -> kind(c) ∉ (K"=", K"parameters"), pp_args)
+    name_kwargs = filter(pp_args) do c
+        kind(c) == K"=" && children(c)[1].val == :name
+    end
+    subvar = length(positional) == 2 ? children(positional[1])[1].val : nothing
+    name = isempty(name_kwargs) ? nothing : children(children(only(name_kwargs))[2])[1].val
+    prefix = isnothing(subvar) ? "$(var_name)." : "$(var_name).$(subvar)."
+    rest = chopprefix(pp.name, prefix)
+    matches = startswith(pp.name, prefix) && !occursin('.', rest) && (isnothing(name) || rest == name)
+
+    if !matches
+        @warn "The @postprocess calls of '$(var_name)' don't match the loaded context"
+        return source
+    elseif kind(positional[end]) != K"call"
+        @warn "Postprocessor '$(pp.name)' isn't defined by a constructor call"
+        return source
+    else
+        return replace_call_kwarg(source, positional[end], kwarg_name, new_value)
+    end
 end
 
 # Format a parameter value as its Julia source representation for embedding as
@@ -356,8 +466,10 @@ format_param_value(roi::RectROI) =
 format_param_value(roi::LinearROI) = "LinearROI($(roi.start), $(roi.length); axis=:$(roi.axis))"
 format_param_value(x::Union{Integer, AbstractFloat, Bool}) = repr(x)
 format_param_value(d::KaraboDevice) = "KaraboDevice(\"$(d.topic)\", \"$(d.name)\")"
-format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) =
-    "[" * join((repr(x) for x in v), ", ") * "]"
+format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) = repr(v)
+format_param_value(t::Tuple{Vararg{Union{Integer, AbstractFloat}}}) = repr(t)
+format_param_value(d::OptionalDims) = format_param_value(d.dims)
+format_param_value(sel::IndexSelection) = "IndexSelection(\"$(sel)\")"
 format_param_value(_) = nothing
 
 # Replace the first positional argument of a `name = Parameter(...)` assignment.
@@ -457,15 +569,21 @@ end
 
 # Source for a new variable: a @Variable reference to the origin function, with
 # each wired dependency passed as an override. Group deps are skipped since the
-# origin's own definition supplies them.
+# origin's own definition supplies them. A spec without an origin (e.g. the
+# GUI's Karabo property entry) becomes a function returning its dependency.
 function variable_source(spec::VariableSpec, name::String, dep_values)
-    overrides = ["$(arg) -> $(dep_to_source(dep))" for (arg, dep) in dep_values
-                 if dep.kind != DepKind_Group && !isempty(dep.name)]
-
-    if isempty(overrides)
-        "@Variable $(name) -> $(spec.origin)"
+    if isempty(spec.origin)
+        arg, dep = only(dep_values)
+        "@Variable function $(name)($(arg) -> $(dep_to_source(dep)))\n    $(arg)\nend"
     else
-        "@Variable $(name) -> $(spec.origin)($(join(overrides, ", ")))"
+        overrides = ["$(arg) -> $(dep_to_source(dep))" for (arg, dep) in dep_values
+                     if dep.kind != DepKind_Group && !isempty(dep.name)]
+
+        if isempty(overrides)
+            "@Variable $(name) -> $(spec.origin)"
+        else
+            "@Variable $(name) -> $(spec.origin)($(join(overrides, ", ")))"
+        end
     end
 end
 
@@ -499,6 +617,31 @@ function group_source(spec::VariableSpec, name::String, dep_values, param_values
     else
         "$(name) = $(spec.origin)(; $(join(kwargs, ", ")))"
     end
+end
+
+# Prefix `topic//` to every karabo"..." source that doesn't set a topic.
+function add_karabo_topics(source::String, topic::String)
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    strings = find_nodes(tree) do node
+        if kind(node) == K"macrocall"
+            name = children(node)[1]
+            string(kind(name)) == "StrMacroName" && name.val == :karabo
+        else
+            false
+        end
+    end
+
+    # Insert in reverse byte order to preserve offsets
+    sort!(strings; by=n -> first(byte_range(n)), rev=true)
+    for node in strings
+        br = byte_range(children(node)[2])
+        content = source[first(br)+1:last(br)-1]
+        if isempty(first(split_topic(content)))
+            source = source[1:first(br)] * "$(topic)//" * source[first(br)+1:end]
+        end
+    end
+
+    return source
 end
 
 # Append a definition for a new variable/group/input built from `spec` to the
@@ -545,12 +688,16 @@ function remove_variable_source(source::String, name::String)
 end
 
 set_group_param(state, var_name::AbstractString, kwarg_name::AbstractString, new_value::AbstractString; reload::Bool=true) =
-    apply_source_edit(state, s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value);
+    apply_source_edit(s -> replace_constructor_kwarg(s, var_name, kwarg_name, new_value), state;
                       reload)
 
 set_parameter_value(state, var_name::String, new_value::String; reload::Bool=true) =
-    apply_source_edit(state, s -> replace_parameter_value(s, var_name, new_value); reload)
+    apply_source_edit(s -> replace_parameter_value(s, var_name, new_value), state; reload)
+
+set_postprocessor_param(state, pp::PostprocessorInfo, kwarg_name::AbstractString, new_value::AbstractString;
+                        reload::Bool=true) =
+    apply_source_edit(s -> replace_postprocess_kwarg(s, pp, kwarg_name, new_value), state; reload)
 
 # Replace a dependency (Karabo or variable) in the source code and reload.
 rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency) =
-    apply_source_edit(state, s -> replace_dep(s, variable_name, arg_name, new_dep))
+    apply_source_edit(s -> replace_dep(s, variable_name, arg_name, new_dep), state)

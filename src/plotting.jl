@@ -1015,115 +1015,77 @@ function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     end
 end
 
-# Interactive colorbar. Draws ImPlot.ColormapScale spanning the display range
-# and overlays two horizontal handles at clip_min/clip_max. Returns true when
-# the clip range changed and the colormap output needs re-rendering.
+# Interactive colorbar, drawn as a narrow plot whose Y axis is the display
+# range. The bar shows the colormap as the shader applies it: stretched between
+# the clip_min/clip_max handles and clamped outside them. Returns true when the
+# clip range changed and the colormap output needs re-rendering.
 #
-# Hovering: drag a handle to set clip_min/clip_max (disables colorbar
-# autoscale); mouse wheel zooms the display range around the cursor.
+# Dragging a handle sets the clip range (disabling colorbar autoscale);
+# zooming or panning the plot changes the display range.
 function interactive_colorbar(img::ImageState, id, size::ImVec2)
     cb = img.colorbar
     display_min = cb.display_min[]
     display_max = cb.display_max[]
-    clip_min = cb.clip_min[]
-    clip_max = cb.clip_max[]
-    # In log mode all four refs hold log10(value); the colorbar renders that
-    # space directly and tick labels read as exponents.
-    tick_format = img.log_scale[] ? "1e%g" : "%g"
-
-    # ColormapScale itself does not consume mouse input — without an overlay
-    # button, clicks fall through to the parent window and start a window
-    # move. Mark it as overlap-allowed and stack an InvisibleButton on top to
-    # capture clicks/drags for the handles.
-    ig.SetNextItemAllowOverlap()
-    start_pos = ig.GetCursorScreenPos()
-    ImPlot.ColormapScale("##colorbar_$(id)",
-                         display_min, display_max,
-                         size, tick_format,
-                         ImPlot.ImPlotColormapScaleFlags_None,
-                         img.colormap)
-    rect_min = ig.GetItemRectMin()
-    rect_max = ig.GetItemRectMax()
-
-    ig.SetCursorScreenPos(start_pos)
-    ig.InvisibleButton("##colorbar_input_$(id)",
-                       ImVec2(rect_max.x - rect_min.x, rect_max.y - rect_min.y))
-    hovered = ig.IsItemHovered()
-    active = ig.IsItemActive()
-
-    # ColormapScale insets the gradient bar by PlotPadding inside its frame
-    pad_y = unsafe_load(ImPlot.GetStyle().PlotPadding).y
-    bar_top = rect_min.y + pad_y
-    bar_bot = rect_max.y - pad_y
-    bar_h = max(bar_bot - bar_top, 1.0f0)
-    span = display_max - display_min
-    safe_span = span == 0 ? 1.0 : span
-
-    value_to_y(v) = bar_bot - Float32(clamp((v - display_min) / safe_span, 0.0, 1.0)) * bar_h
-    y_to_value(y) = display_min + clamp((bar_bot - y) / bar_h, 0.0f0, 1.0f0) * safe_span
-
-    y_min_px = value_to_y(clip_min)
-    y_max_px = value_to_y(clip_max)
-
-    # Highlight the handle nearest the cursor while hovered/active
-    threshold = 8.0f0
-    near_handle = :none
-    if hovered || active
-        mouse_y = ig.GetMousePos().y
-        d_min = abs(mouse_y - y_min_px)
-        d_max = abs(mouse_y - y_max_px)
-        if active && cb.drag !== :none
-            near_handle = cb.drag
-        elseif d_min <= d_max && d_min < threshold
-            near_handle = :min
-        elseif d_max < threshold
-            near_handle = :max
-        end
-    end
-
-    draw = ig.GetWindowDrawList()
-    base_color = ig.GetColorU32(ig.ImGuiCol_Text, 0.5f0)
-    hover_color = ig.GetColorU32(ImVec4(1.0f0, 0.2f0, 0.2f0, 0.5f0))
-    thickness = 5.0f0
-    min_color = near_handle === :min ? hover_color : base_color
-    max_color = near_handle === :max ? hover_color : base_color
-    ig.AddLine(draw, ImVec2(rect_min.x, y_min_px), ImVec2(rect_max.x, y_min_px), min_color, thickness)
-    ig.AddLine(draw, ImVec2(rect_min.x, y_max_px), ImVec2(rect_max.x, y_max_px), max_color, thickness)
-
     changed = false
 
-    if ig.IsItemActivated()
-        mouse_y = ig.GetMousePos().y
-        d_min = abs(mouse_y - y_min_px)
-        d_max = abs(mouse_y - y_max_px)
-        cb.drag = d_min <= d_max ? :min : :max
+    plot_flags = ImPlot.ImPlotFlags_NoTitle | ImPlot.ImPlotFlags_NoLegend | ImPlot.ImPlotFlags_NoMenus |
+                 ImPlot.ImPlotFlags_NoBoxSelect | ImPlot.ImPlotFlags_NoMouseText
+    if ImPlot.BeginPlot("##colorbar_$(id)", size, plot_flags)
+        try
+            ImPlot.SetupAxes("", "", ImPlot.ImPlotAxisFlags_NoDecorations | ImPlot.ImPlotAxisFlags_Lock,
+                             ImPlot.ImPlotAxisFlags_Opposite | ImPlot.ImPlotAxisFlags_NoGridLines |
+                             ImPlot.ImPlotAxisFlags_NoMenus)
+            ImPlot.SetupAxisLimits(ImPlot.ImAxis_X1, 0, 1, ImPlot.ImPlotCond_Always)
+            # Read at setup, written back with any zoom/pan by EndPlot
+            ImPlot.SetupAxisLinks(ImPlot.ImAxis_Y1, cb.display_min, cb.display_max)
+            # In log mode all four refs hold log10(value), so tick labels read as exponents
+            ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, img.log_scale[] ? "1e%g" : "%g")
+
+            clip_min = cb.clip_min[]
+            clip_max = cb.clip_max[]
+            span = clip_max == clip_min ? 1.0 : clip_max - clip_min
+            color(v) = ig.ColorConvertFloat4ToU32(ImPlot.SampleColormap(clamp((v - clip_min) / span, 0.0, 1.0),
+                                                                        img.colormap))
+            draw = ImPlot.GetPlotDrawList()
+            fill_band(lo, hi) = ig.AddRectFilledMultiColor(draw, ImPlot.PlotToPixels(0, hi), ImPlot.PlotToPixels(1, lo),
+                                                      color(hi), color(hi), color(lo), color(lo))
+            # Solid ends outside the handles, gradient strips between them
+            limits = ImPlot.GetPlotLimits()
+            nstrips = 64
+            ImPlot.PushPlotClipRect()
+            fill_band(limits.Y.Min, clip_min)
+            for k in 1:nstrips
+                fill_band(clip_min + (k - 1) / nstrips * span, clip_min + k / nstrips * span)
+            end
+            fill_band(clip_max, limits.Y.Max)
+            ImPlot.PopPlotClipRect()
+
+            text = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Text))
+            handle_color = ImVec4(text.x, text.y, text.z, 0.5f0)
+            # NoFit leaves double-click with nothing to fit, so it doesn't move the display range
+            min_moved = ImPlot.DragLineY(0, cb.clip_min, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
+            max_moved = ImPlot.DragLineY(1, cb.clip_max, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
+            if min_moved || max_moved
+                eps = 1e-9 * max(abs(span), 1.0)
+                if min_moved
+                    cb.clip_min[] = min(cb.clip_min[], cb.clip_max[] - eps)
+                else
+                    cb.clip_max[] = max(cb.clip_max[], cb.clip_min[] + eps)
+                end
+                cb.autoscale[] = false
+                changed = true
+            end
+            if ImPlot.IsPlotHovered() && ig.IsMouseDoubleClicked(ig.ImGuiMouseButton_Left)
+                cb.autoscale[] = true
+                cb.display_zoomed = false
+            end
+        finally
+            ImPlot.EndPlot()
+        end
     end
 
-    if active && cb.drag !== :none
-        mouse_y = ig.GetMousePos().y
-        new_v = y_to_value(mouse_y)
-        eps = 1e-9 * max(abs(safe_span), 1.0)
-        if cb.drag === :min
-            cb.clip_min[] = min(new_v, cb.clip_max[] - eps)
-        else
-            cb.clip_max[] = max(new_v, cb.clip_min[] + eps)
-        end
-        cb.autoscale[] = false
-        changed = true
-    elseif !active
-        cb.drag = :none
-    end
-
-    if hovered && !active
-        wheel = unsafe_load(ig.GetIO().MouseWheel)
-        if wheel != 0
-            mouse_y = ig.GetMousePos().y
-            anchor = y_to_value(mouse_y)
-            factor = wheel > 0 ? 0.85 : 1 / 0.85
-            cb.display_min[] = anchor + (display_min - anchor) * factor
-            cb.display_max[] = anchor + (display_max - anchor) * factor
-            cb.display_zoomed = true
-        end
+    if cb.display_min[] != display_min || cb.display_max[] != display_max
+        cb.display_zoomed = true
     end
 
     return changed
@@ -1538,10 +1500,11 @@ function field_dim(data, field)
     end
 end
 
-# The values of a field of a 1D variable: `value` is the data itself, `trainId`
+# The values of a field of a variable: `value` is the data itself, `trainId`
 # the train IDs of a scalar history, and a dim gives its coordinates.
 function field_values(name, store, field)
     data = store.data
+    dim = data isa CircularBuffer ? nothing : field_dim(data, field)
     if field == "value"
         if data isa CircularBuffer
             store.scalar_data_cache
@@ -1552,8 +1515,8 @@ function field_values(name, store, field)
         end
     elseif field == "trainId" && data isa CircularBuffer
         store.scalar_tids_cache
-    elseif !(data isa CircularBuffer) && field_dim(data, field) == 1
-        dim_values(store, 1)
+    elseif !isnothing(dim)
+        dim_values(store, dim)
     else
         throw(SpecError("$(name) has no field \"$(field)\""))
     end
@@ -1597,10 +1560,14 @@ end
 # matrix by one dim. An x on `index` runs along each series, i.e. the other dim.
 function series_dims(name, data, spec::LayerSpec)
     color_dim = field_dim(data, spec.color.field)
-    x_dim = if spec.x.field == "index" && data isa AbstractMatrix && !isnothing(color_dim)
-        3 - color_dim
-    else
-        field_dim(data, spec.x.field)
+    x_dim = field_dim(data, spec.x.field)
+    if data isa AbstractMatrix
+        if spec.x.field == "index" && !isnothing(color_dim)
+            x_dim = 3 - color_dim
+        elseif isempty(spec.color.field) && !isnothing(x_dim)
+            # An empty color (see ImageAsLines) groups by the dim x isn't on
+            color_dim = 3 - x_dim
+        end
     end
     if !(data isa AbstractMatrix) || isnothing(x_dim) || isnothing(color_dim) || x_dim == color_dim ||
        spec.y.field != "value"
@@ -1620,9 +1587,14 @@ function group_series!(series, name, store, spec::LayerSpec)
     coords = dim_values(store, color_dim)
     values = data isa DimArray ? parent(data) : data
 
+    title = if isempty(spec.color.field)
+        data isa DimArray ? string(DD.name(DD.dims(data, color_dim))) : ("row", "col")[color_dim]
+    else
+        something(spec.color.title, "")
+    end
+
     empty!(series)
     for (i, ys) in enumerate(eachslice(values; dims = color_dim))
-        title = something(spec.color.title, "")
         label = isempty(title) ? string(coords[i]) : "$(title) - $(coords[i])"
         if spec.mark == Mark_Bar
             bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
@@ -1760,19 +1732,20 @@ function holds_array(variable_data, name)
         !(variable_data[name].data isa CircularBuffer)
 end
 
-# A view with several array layers only shows trains they all hold, and only
-# every `update_every`'th of those. They're drawn from copies since the stores
-# reuse their buffers. Returns `updated_variables` as the view sees it.
+# A view with several array layers, or models, only shows trains they all hold,
+# and only every `update_every`'th of those. They're drawn from copies since the
+# stores reuse their buffers. Returns `updated_variables` as the view sees it.
 function sync_arrays!(view::SpecView, variable_data, updated_variables)
     arrays = Set(layer.spec.data for layer in view.layers
                  if isempty(layer.spec.lookups) && holds_array(variable_data, layer.spec.data))
     snapshots = view.snapshots
-    if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1)
+    if isempty(arrays) || (length(arrays) == 1 && view.update_every[] == 1 && isempty(view.models))
         empty!(snapshots)
         return updated_variables
     end
 
-    # Model parameters follow the shown train, and can arrive after its data
+    # Model parameters follow the shown train, and can arrive before or after its
+    # data (e.g. while a compressed array is still being decoded)
     params = Set(model.overlay.params for model in view.models
                  if holds_array(variable_data, model.overlay.params) && !(model.overlay.params in arrays))
     filter!(p -> p.first in arrays || p.first in params, snapshots)
@@ -1840,6 +1813,7 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
     spec = layer.spec
     name = spec.data
     store = view_store(view, name)
+
     if !isempty(spec.lookups)
         push!(frames, lookup_frame(view, layer, updated_variables))
     elseif isnothing(store) || store.data isa ArrayMetadata
@@ -1887,10 +1861,17 @@ end
 
 # The function of a model with the parameters `p`, which come in a fixed order.
 function model_function(func, name, p)
-    if length(p) != 4
-        throw(SpecError("$(name): a gaussian takes 4 parameters (y0, A, μ, σ), got $(length(p))"))
+    if func == ModelFunction_Linear
+        if length(p) ∉ (2, 3)
+            throw(SpecError("$(name): a line takes 2 parameters (slope, intercept) and optionally R², got $(length(p))"))
+        end
+        x -> p[1] * x + p[2]
+    else
+        if length(p) != 4
+            throw(SpecError("$(name): a gaussian takes 4 parameters (y0, A, μ, σ), got $(length(p))"))
+        end
+        x -> gaussian(x, p[1], p[2], p[3], p[4])
     end
-    x -> gaussian(x, p[1], p[2], p[3], p[4])
 end
 
 # The x extent a model is sampled over: the union of the extents of the layers
@@ -1930,10 +1911,22 @@ function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
 
                 if isfinite(xmin) && isfinite(xmax) && xmin != xmax
                     for (k, p) in enumerate(eachcol(values))
+                        lo, hi = xmin, xmax
+                        if overlay.to_x_intercept && p[1] != 0
+                            x0 = -p[2] / p[1]
+                            lo = min(lo, x0)
+                            hi = max(hi, x0)
+                        end
+                        xs = Float64[]
                         ys = Float64[]
-                        sample_model!(model.xs, ys, model_function(overlay.func, overlay.params, p), xmin, xmax, 200)
+                        sample_model!(xs, ys, model_function(overlay.func, overlay.params, p), lo, hi, 200)
                         label = size(values, 2) == 1 ? title : "$(title) $(k)"
-                        push!(model.curves, Line(model.xs, ys, label, :line, nothing, 1.0))
+                        # The fitted values go in the legend, after ### so the item ID stays stable
+                        if overlay.func == ModelFunction_Linear
+                            r2 = length(p) == 3 ? @sprintf(", R² = %.4f", p[3]) : ""
+                            label = @sprintf("%s: y = %.4gx + %.4g%s###%s", label, p[1], p[2], r2, label)
+                        end
+                        push!(model.curves, Line(xs, ys, label, :line, nothing, 1.0))
                     end
                 end
             end
@@ -2176,7 +2169,7 @@ function fit_colorbar!(cb::ColorbarState, hist_buf, data, log, reset)
     cb.clip_min[] = dmin
     cb.clip_max[] = dmax
     if reset || !cb.display_zoomed
-        margin = 0.1 * (dmax - dmin)
+        margin = dmax > dmin ? 0.1 * (dmax - dmin) : max(0.1 * abs(dmin), 0.5)
         cb.display_min[] = dmin - margin
         cb.display_max[] = dmax + margin
     end
@@ -2218,13 +2211,13 @@ function image_bounds(frame::Image)
     x_max = isnothing(frame.x_axis) ? cols : last(frame.x_axis)
     y_min = isnothing(frame.y_axis) ? 0 : first(frame.y_axis)
     y_max = isnothing(frame.y_axis) ? rows : last(frame.y_axis)
-    # A degenerate range (all lookup values equal) would give the image zero
-    # extent and divide by zero in the hover index math, so fall back to plain
-    # pixel indices for that axis.
-    if x_max == x_min
+    # A degenerate (all lookup values equal) or non-finite range would break the
+    # image extent and the hover index math, so fall back to plain pixel indices
+    # for that axis.
+    if !isfinite(x_min) || !isfinite(x_max) || x_max == x_min
         x_min, x_max = 0, cols
     end
-    if y_max == y_min
+    if !isfinite(y_min) || !isfinite(y_max) || y_max == y_min
         y_min, y_max = 0, rows
     end
     return (rows, cols, x_min, x_max, y_min, y_max)
@@ -2422,46 +2415,40 @@ function image_state(view::SpecView)
     isnothing(i) ? nothing : view.layers[i].image
 end
 
-function draw_plot(plot::Plot, updated_variables)
-    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+function draw_plot_contents(plot::Plot, updated_variables)
     side_panel_width = 320f0
     colorbar_width = 100f0
-
     view = plot.view
-    title = isnothing(view.spec) ? "" : view.spec.title
-    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
 
-    if ig.Begin(win_id, plot.open)
-        plot.dock_id = ig.GetWindowDockID()
+    top_controls(view.source, view.id)
 
-        top_controls(view.source, view.id)
+    plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
 
-        plot_size, plot_area_h = begin_plot_area!(plot, side_panel_width)
+    frames = prepare!(view, plot, updated_variables)
+    all_empty = all(f -> f isa Empty, frames)
+    # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
+    has_image = any(f -> f isa Image, frames)
 
-        frames = prepare!(view, plot, updated_variables)
-        all_empty = all(f -> f isa Empty, frames)
-        # PlotImage stretches the texture linearly between its corners, so log axes would misplace pixels
-        has_image = any(f -> f isa Image, frames)
-
-        if all_empty
-            for f in frames
-                if !isempty(f.message)
-                    ig.TextWrapped(f.message)
-                end
+    if all_empty
+        for f in frames
+            if !isempty(f.message)
+                ig.TextWrapped(f.message)
             end
-        else
-            apply_autoscale(plot)
+        end
+    else
+        apply_autoscale(plot)
 
-            # Reserve room on the right for the side-panel tab button.
-            tab_w = 14.0f0
-            spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
-            img = image_state(view)
-            reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
-            plot_width = max(plot_size.x - reserved, 100f0)
-            plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
-                         ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
+        # Reserve room on the right for the side-panel tab button.
+        tab_w = 14.0f0
+        spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+        img = image_state(view)
+        reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
+        plot_width = max(plot_size.x - reserved, 100f0)
+        plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
+                     ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
 
-            if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+        if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
+            try
                 ImPlot.SetupAxis(ImPlot.ImAxis_X1, axis_label(view.spec, view.spec.xlabel, :x))
                 ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view.spec, view.spec.ylabel, :y))
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
@@ -2476,32 +2463,62 @@ function draw_plot(plot::Plot, updated_variables)
                 end
                 draw_view_overlays(view, frames)
                 check_plot_interaction!(plot)
+            finally
                 ImPlot.EndPlot()
             end
-
-            if !isnothing(img)
-                ig.SameLine()
-                if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
-                   !isnothing(img.gpu_heatmap)
-                    cb = img.colorbar
-                    update_colormap!(get_heatmap_context(), img.colormap)
-                    render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
-                                        cb.clip_min[], cb.clip_max[], img.log_scale[])
-                end
-            end
-
-            side_panel_tab(plot, tab_w, plot_size.y)
         end
 
-        end_plot_area!(plot, side_panel_width, plot_area_h, () -> side_panel(view))
-
-        if !all_empty
-            autoscale_buttons(plot)
-            if !has_image
-                ig.SameLine()
-                log_scale_buttons(plot)
+        if !isnothing(img)
+            ig.SameLine()
+            if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
+               !isnothing(img.gpu_heatmap)
+                cb = img.colorbar
+                update_colormap!(get_heatmap_context(), img.colormap)
+                render_colormapped!(img.gpu_heatmap, get_heatmap_context(),
+                                    cb.clip_min[], cb.clip_max[], img.log_scale[])
             end
-            bottom_controls(view)
+        end
+
+        side_panel_tab(plot, tab_w, plot_size.y)
+    end
+
+    end_plot_area!(plot, side_panel_width, plot_area_h, () -> side_panel(view))
+
+    if !all_empty
+        autoscale_buttons(plot)
+        if !has_image
+            ig.SameLine()
+            log_scale_buttons(plot)
+        end
+        bottom_controls(view)
+    end
+end
+
+function draw_plot(plot::Plot, updated_variables)
+    ig.SetNextWindowSize((800, 500), ig.ImGuiCond_FirstUseEver)
+
+    view = plot.view
+    title = isnothing(view.spec) ? "" : view.spec.title
+    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
+
+    if ig.Begin(win_id, plot.open)
+        plot.dock_id = ig.GetWindowDockID()
+
+        if isnothing(plot.error)
+            try
+                @imgui_recover draw_plot_contents(plot, updated_variables)
+            catch err
+                bt = catch_backtrace()
+                @error "Error drawing plot $(plot.id)" exception=(err, bt)
+                plot.error = sprint(showerror, err, bt)
+            end
+        else
+            message = plot.error
+            if ig.Button("Retry")
+                plot.error = nothing
+            end
+            ig.Text("Error drawing plot:")
+            BoxedText("##plot-error-$(plot.id)", message)
         end
     end
 

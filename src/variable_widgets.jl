@@ -1,5 +1,5 @@
 @kwdef mutable struct KaraboBridgeGuiState
-    zmq_outputs::Union{Vector{String}, Exception, Nothing} = nothing
+    zmq_outputs::Union{Vector{String}, ExceptionMessage, Nothing} = nothing
     zmq_outputs_request::Maybe{Int} = nothing
     selected_output::Cint = 0
     auto_select_output::Bool = false
@@ -108,7 +108,7 @@ function draw_online_bridge(name, params, gui_state)
     client = state[].client
 
     tm_param = params["trainmatcher"]
-    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param, client.trainmatcher_sources)
+    tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
     if tm_modified
         tm_param[] = new_tm
         @guiasync set_group_param(state[], name, "trainmatcher",
@@ -131,7 +131,7 @@ function draw_online_bridge(name, params, gui_state)
                 gui_state.zmq_outputs_request = send_with_callback(
                     client, GetDeviceProperty(tm.topic, tm.name, "zmqOutputs"),
                     msg -> begin
-                        if msg.value isa Exception
+                        if msg.value isa ExceptionMessage
                             gui_state.zmq_outputs = msg.value
                         else
                             gui_state.zmq_outputs = String[out["address"] for out in msg.value]
@@ -144,8 +144,8 @@ function draw_online_bridge(name, params, gui_state)
 
         if is_pending(client, gui_state.zmq_outputs_request)
             Spinner("Fetching outputs...")
-        elseif gui_state.zmq_outputs isa Exception
-            ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), sprint(showerror, gui_state.zmq_outputs))
+        elseif gui_state.zmq_outputs isa ExceptionMessage
+            ig.TextColored(ig.ImVec4(1, 0.4, 0.4, 1), gui_state.zmq_outputs.text)
         elseif gui_state.zmq_outputs isa Vector
             if !isempty(gui_state.zmq_outputs)
                 # After a trainmatcher change, push the first output through as the new address
@@ -169,7 +169,11 @@ function draw_online_bridge(name, params, gui_state)
                     end
                 end
 
-                ig.SetNextItemWidth(350)
+                # Fill up to the node edge, leaving room for the Refresh button
+                style = ig.GetStyle()
+                refresh_w = ig.CalcTextSize("Refresh").x + 2 * unsafe_load(style.FramePadding.x) +
+                            unsafe_load(style.ItemSpacing.x)
+                ig.SetNextItemWidth(client.ne_node_right - ig.GetCursorScreenPos().x - refresh_w)
                 idx = Ref(gui_state.selected_output)
                 if CopyableCombo("Output", gui_state.zmq_outputs, idx)
                     gui_state.selected_output = idx[]
@@ -203,10 +207,7 @@ function draw_variable_content(::Val{Symbol("XfaContext.Scan")}, name, var_data,
 
     ig.Text("Parameters:")
     for (param_name, param) in params
-        if param_name == "scantool"
-            scantools = filter(s -> s.class_id == "Karabacon", state[].client.source_list)
-            draw_parameter(param_name, param, scantools)
-        elseif !(automatic && param_name in ("resolution", "position_property"))
+        if !(automatic && param_name in ("resolution", "position_property"))
             draw_parameter(param_name, param)
         end
     end
@@ -243,14 +244,14 @@ function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, g
     return nothing
 end
 
-function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp, min_node_width)
+function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp)
     param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
     for param_name in param_order
         if param_name == "buffer_size" && !pp.params["windowed"].value
             continue
         end
         if haskey(pp.params, param_name)
-            draw_parameter(param_name, pp.params[param_name]; min_node_width)
+            draw_parameter(param_name, pp.params[param_name])
         end
     end
 end

@@ -1,10 +1,14 @@
 const BASTION = "bastion.desy.de"
 const GATEWAY = "exflgateway.desy.de"
+const DISPLAY_JUMP = "max-exfl-display003.desy.de"
 
-function log_engine_error(state::GuiState, message::String, extra_details::Maybe{String}=nothing)
-    push!(state.client.engine_logs, EngineLog(message, extra_details))
-    state.show_engine_logs = true
-    state.select_engine_logs = true
+# Append a log record, merging it into the last one if it's a repeat
+function push_log!(logs::CircularBuffer{Protocol.LogRecord}, record::Protocol.LogRecord)
+    if !isempty(logs) && logs[end].key == record.key
+        logs[end] = @set record.count = record.count + logs[end].count
+    else
+        push!(logs, record)
+    end
 end
 
 function send(client::ClientState, msg::AbstractMessage)
@@ -29,33 +33,86 @@ function peekall(buffer::IOBuffer)
     return String(take!(copy(buffer)))
 end
 
-# Single ping with a 1s timeout; used to detect whether we can skip bastion/gateway jumps.
+# Try connecting to the SSH port with a 1s timeout; used to detect whether we
+# can skip bastion/gateway jumps. Some hosts answer pings but firewall SSH.
 function is_directly_reachable(address::AbstractString)
-    success(pipeline(`ping -c 1 -W 1 $address`; stdout=devnull, stderr=devnull))
+    sock = Sockets.TCPSocket()
+    timer = Timer(_ -> close(sock), 1)
+    try
+        Sockets.connect(sock, address, 22)
+        # A timed-out connect returns normally with the socket closed
+        isopen(sock)
+    catch
+        false
+    finally
+        close(timer)
+        close(sock)
+    end
+end
+
+# The jump hosts needed to reach `address` from this machine. Blocks for up to
+# 1s on the reachability check.
+function default_jump_hops(address::AbstractString)
+    address = last(split(address, "@"))
+    hops = String[]
+
+    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
+        local_host = first(split(gethostname(), "."))
+        if startswith(local_host, "max-exfl-display") && local_host != first(split(DISPLAY_JUMP, "."))
+            push!(hops, DISPLAY_JUMP)
+        else
+            push!(hops, BASTION)
+            # Maxwell nodes (max-*) are reachable from bastion, the online cluster
+            # needs the gateway hop too.
+            if !startswith(address, "max-")
+                push!(hops, GATEWAY)
+            end
+        end
+    end
+
+    return hops
+end
+
+function detect_jump_hops(state::GuiState)
+    address = state.address
+    hops = default_jump_hops(address)
+
+    @lock state begin
+        state.detecting_jump_hops = false
+        # Drop the result if the address was edited in the meantime, the GUI
+        # will start a new detection.
+        if state.address == address
+            state.jump_hops = hops
+        end
+    end
+end
+
+# Split an optional `user@` prefix off an address
+function split_user(address)
+    if occursin("@", address)
+        user, host = split(address, "@")
+        return String(user), String(host)
+    else
+        return nothing, address
+    end
 end
 
 function ssh_initialize(state::GuiState)
     client = state.client
     client.status = RemoteStatus_Connecting
-    address = state.address
-    user = nothing
-    if occursin("@", address)
-        user, address = split(address, "@")
-    end
+    user, address = split_user(state.address)
 
-    if endswith(address, ".desy.de") && address != GATEWAY && address != BASTION && !is_directly_reachable(address)
-        push!(client.ssh_hops, SshState(; address=BASTION))
-        # Maxwell nodes (max-*) are reachable from bastion, the online cluster
-        # needs the gateway hop too.
-        if !startswith(address, "max-")
-            push!(client.ssh_hops, SshState(; address=GATEWAY))
+    for hop in state.jump_hops
+        if !isempty(hop)
+            hop_user, hop_address = split_user(hop)
+            push!(client.ssh_hops, SshState(; address=hop_address, user=hop_user))
         end
     end
 
     # This is the blocking SSH session used for SFTP
-    push!(client.ssh_hops, SshState(; address))
+    push!(client.ssh_hops, SshState(; address, user))
     # And this is the regular, non-blocking SSH session
-    push!(client.ssh_hops, SshState(; address))
+    push!(client.ssh_hops, SshState(; address, user))
 
     # Start by initializing the first hop
     ssh_initialize_hop(state, 1, user)
@@ -67,8 +124,7 @@ end
 # quieter than the first, which GUI/engine work lands on.
 ssh_pin_tid() = first(Threads.threadpooltids(:default))
 
-function ssh_initialize_hop(state, hop_idx, user)
-    client = state.client
+function ssh_open_session(client::ClientState, hop_idx, user)
     ssh_state = client.ssh_hops[hop_idx]
     forwarder_idx = findlast(x -> !isnothing(x.forwarder), client.ssh_hops)
 
@@ -81,13 +137,73 @@ function ssh_initialize_hop(state, hop_idx, user)
         # Reset the host so that GSSAPI auth works
         session.host = ssh_state.address
 
-        ssh_state.session = session
+        return session
     else
-        ssh_state.session = ssh.Session(ssh_state.address, ssh_state.port;
-                                        user, pin_tid=ssh_pin_tid())
+        return ssh.Session(ssh_state.address, ssh_state.port;
+                           user, pin_tid=ssh_pin_tid())
     end
+end
+
+function ssh_initialize_hop(state, hop_idx, user)
+    client = state.client
+    # Hops without an explicit user inherit the previous hop's
+    if !isnothing(client.ssh_hops[hop_idx].user)
+        user = client.ssh_hops[hop_idx].user
+    end
+    client.ssh_hops[hop_idx].session = ssh_open_session(client, hop_idx, user)
 
     ssh_authenticate_hop(state, hop_idx)
+end
+
+# Authenticate with GSSAPI, or `password` if the server asks for one and it's
+# been entered already.
+function ssh_authenticate_noninteractive(session, password)
+    status = ssh.authenticate(session; throw=false)
+    if status == ssh.AuthMethod_Password && !isempty(password)
+        status = ssh.authenticate(session; password, throw=false)
+    end
+
+    return status
+end
+
+# Replace a dropped SFTP session. The SFTP hop is behind the bastion's 2FA so it
+# only ever needs GSSAPI or the password the user already entered.
+function reconnect_sftp(client::ClientState)
+    hop_idx = lastindex(client.ssh_hops) - 1
+    ssh_state = client.ssh_hops[hop_idx]
+    user = ssh_state.session.user
+    close(ssh_state.session)
+
+    session = ssh_open_session(client, hop_idx, user)
+    ssh_state.session = session
+    status = ssh_authenticate_noninteractive(session, ssh_state.password[])
+    if status != ssh.AuthStatus_Success
+        error("Couldn't re-authenticate the SFTP session to $(ssh_state.address): $(status)")
+    end
+
+    client.sftp = ssh.SftpSession(session)
+    @info "Reconnected the SFTP session to $(ssh_state.address)"
+end
+
+# Call `f(sftp)`, reconnecting and retrying once if the SFTP connection has
+# dropped.
+function with_sftp(f, client::ClientState)
+    @lock client.ssh_hops[end - 1] begin
+        if !ssh.isconnected(client.sftp.session)
+            reconnect_sftp(client)
+        end
+
+        try
+            return f(client.sftp)
+        catch
+            if ssh.isconnected(client.sftp.session)
+                rethrow()
+            end
+        end
+
+        reconnect_sftp(client)
+        return f(client.sftp)
+    end
 end
 
 function ssh_fully_authenticated(client::ClientState)
@@ -103,7 +219,10 @@ function ssh_authenticate_hop(state::GuiState, hop_idx)
 
     ssh_state.auth_state = :authenticating
 
-    new_auth_state = if auth_method == ssh.AuthMethod_Password
+    new_auth_state = if hop_idx == lastindex(client.ssh_hops) && isnothing(auth_method)
+        # The last hop is the same host as the SFTP hop, so reuse its credentials
+        ssh_authenticate_noninteractive(session, client.ssh_hops[end - 1].password[])
+    elseif auth_method == ssh.AuthMethod_Password
         ssh.authenticate(session; password=ssh_state.password[], throw=false)
     elseif auth_method == ssh.AuthMethod_Interactive
         kbdint_answers = [prompt.answer for prompt in ssh_state.kbdint_prompts]
@@ -226,8 +345,10 @@ function sync_files()
                 # This to avoid the file getting truncated by `open(; write=true)`
                 # if we're SSH'ing locally.
                 data = read(local_path)
-                open(joinpath(remote_dir, path), client.sftp; write=true) do f
-                    write(f, data)
+                with_sftp(client) do sftp
+                    open(joinpath(remote_dir, path), sftp; write=true) do f
+                        write(f, data)
+                    end
                 end
                 synced += 1
             end
@@ -252,7 +373,7 @@ function initialize_engine(state)
     julia_module_prefix = if is_local
         "true"
     else
-        "source /etc/profile.d/modules.sh; SASE=0 module load exfel julia/202602 > /dev/null 2>&1"
+        "source /etc/profile.d/modules.sh; SASE=0 module load $(state.julia_module) > /dev/null 2>&1"
     end
 
     bootstrap_process = nothing
@@ -266,7 +387,13 @@ function initialize_engine(state)
             session = ssh_state.session
 
             working_dir = is_local ? pwd() : state.engine_working_dir
-            bootstrap_jl = joinpath(working_dir, "bootstrap.jl")
+            remote_working_dir = if working_dir == "~" || startswith(working_dir, "~/")
+                homedir(client.sftp) * working_dir[2:end]
+            else
+                working_dir
+            end
+            client.remote_working_dir = remote_working_dir
+            bootstrap_jl = joinpath(remote_working_dir, "bootstrap.jl")
             code = read(joinpath(@__DIR__, "bootstrap.jl"))
 
             mkpath(dirname(bootstrap_jl), client.sftp)
@@ -274,9 +401,14 @@ function initialize_engine(state)
                 write(f, code)
             end
 
-            bootstrap_env = Dict("XFA_WORKING_DIR" => working_dir)
+            bootstrap_env = Dict("XFA_WORKING_DIR" => remote_working_dir)
             bootstrap_env_str = join(["$(key)=$(value)" for (key, value) in bootstrap_env], " ")
-            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia --project=$(state.engine_environment) --color=no $(bootstrap_jl)'"
+            project_arg = if isempty(state.engine_environment)
+                ""
+            else
+                "--project=$(state.engine_environment)"
+            end
+            bootstrap_cmd = "$(bootstrap_env_str) bash -c '$(julia_module_prefix); julia $(project_arg) --color=no $(bootstrap_jl)'"
             bootstrap_process = run(bootstrap_cmd, session; wait=false)
 
             while !process_exited(bootstrap_process)
@@ -417,13 +549,17 @@ function add_subvariable!(node, ctx_info, node_name, var_name, subvar, pp_names)
         pp_prefix = "$(subvar)."
         pp_params = Dict{String, Any}()
         for (param_name, param) in ctx_info["parameters"]
-            if startswith(param_name, pp_prefix)
-                pp_params[chopprefix(param_name, pp_prefix)] = param
+            field = chopprefix(param_name, pp_prefix)
+            # A dotted remainder belongs to a postprocessor chained onto this one
+            if startswith(param_name, pp_prefix) && !occursin('.', field)
+                pp_params[field] = param
             end
         end
-        push!(node["postprocessors"], (
+        push!(node["postprocessors"], PostprocessorInfo(;
             id = subvar_id,
             name = subvar,
+            var_name,
+            var_postprocessors = pp_names,
             display_name = chopprefix(subvar, "$(node_name)."),
             tree_id_suffix = "###pp_$(subvar)",
             plot_id = "Plot##pp_plot_$(subvar)",
@@ -482,7 +618,7 @@ function build_context_state(state, ctx_info)
         push!(ctx_state[name]["outputs"], OutputPin(output_id, ""))
         state.client.ne_output_pins[output_id] = OutputPinInfo(name, name)
 
-        pp_names = Set(get(postprocessors_info, name, String[]))
+        pp_names = get(postprocessors_info, name, String[])
         for subvar in ctx_info["subvariables"][name]
             subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, name, subvar, pp_names)
             state.client.ne_output_pins[subvar_id] = OutputPinInfo(name, subvar)
@@ -564,7 +700,7 @@ function build_context_state(state, ctx_info)
             state.client.ne_output_pins[attr_id] = OutputPinInfo(var_name, var_name)
 
             # Its subvariables
-            pp_names = Set(get(postprocessors_info, var_name, String[]))
+            pp_names = get(postprocessors_info, var_name, String[])
             for subvar in ctx_info["subvariables"][var_name]
                 subvar_id = add_subvariable!(ctx_state[name], ctx_info, name, var_name, subvar, pp_names)
                 state.client.ne_output_pins[subvar_id] = OutputPinInfo(var_name, subvar)
@@ -841,9 +977,9 @@ function store_variable_data!(client, variable::VariableData)
         elseif data isa AbstractArray
             client.variable_data[name] = VariableStore(; data)
         elseif data isa CompressedArray
-            # Seed with a buffer of the right eltype/shape so draw_plots can
-            # decompress into it in place rather than allocating per train.
-            client.variable_data[name] = VariableStore(; data=allocate_array(data))
+            # The buffer is uninitialised, so only decode into it
+            client.variable_data[name] = VariableStore(; data=ArrayMetadata(data.original_eltype, data.shape),
+                                                       spare_buffer=allocate_array(data))
         else
             @error "Unsupported variable type: $(typeof(data))"
             return
@@ -927,7 +1063,7 @@ end
 struct ParameterOwner
     kind::ParameterOwnerKind
     var_name::String
-    pp_name::Maybe{String}
+    pp::Maybe{PostprocessorInfo}
     field_name::String
 end
 
@@ -948,7 +1084,7 @@ function find_parameter_owner(client, param_name::String)
         for pp in get(var_data, "postprocessors", ())
             for (field_name, stored) in pp.params
                 if stored.name == param_name
-                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp.name, field_name)
+                    return ParameterOwner(ParameterOwner_Postprocessor, var_name, pp, field_name)
                 end
             end
         end
@@ -986,10 +1122,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.context.pipeline_status = PipelineStatus_Stopped
 
     elseif msg isa InputSources
-        if msg.input_sources isa ExceptionMessage
-            @error "Error from server with INPUTSOURCES" exception=msg.input_sources.text
-            log_engine_error(state, "Failed to get the input sources", msg.input_sources.text)
-        else
+        if !(msg.input_sources isa ExceptionMessage)
             client.sources_by_input = msg.input_sources
             client.source_list = build_source_list(Iterators.flatten(values(msg.input_sources)))
 
@@ -1008,32 +1141,23 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remote_context_dir = msg.context
 
     elseif msg isa AvailableVariables
-        if msg.variables isa ExceptionMessage
-            @error "Error from server with AvailableVariables" exception=msg.variables.text
-            log_engine_error(state, "Failed to get the available variables", msg.variables.text)
-        else
+        if !(msg.variables isa ExceptionMessage)
             client.available_variables = msg.variables
         end
 
-    elseif msg isa AvailableTrainmatchers
+    elseif msg isa AvailableDevices
         trainmatchers = Dict{String, Vector{String}}()
-        whitelisted = Set{KaraboDevice}()
-        for (topic, ms) in msg.topic_trainmatchers
-            names = String[]
-            for (name, in_whitelist) in ms
-                push!(names, name)
-                if in_whitelist
-                    push!(whitelisted, KaraboDevice(topic, name))
-                end
+        for device in msg.devices
+            if device.class_id == "TrainMatcher"
+                push!(get!(Vector{String}, trainmatchers, device.topic), device.name)
             end
-            trainmatchers[topic] = names
         end
+        foreach(sort!, values(trainmatchers))
+
+        client.device_list = build_source_list(msg.devices)
         client.trainmatchers = trainmatchers
-        client.trainmatcher_sources = build_source_list(
-            [SourceInfo(topic, name, "TrainMatcher")
-             for (topic, names) in trainmatchers for name in names])
-        client.whitelisted_trainmatchers = whitelisted
-        client.trainmatchers_request_status = RequestStatus_Idle
+        client.whitelisted_devices = msg.whitelisted
+        client.devices_request_status = RequestStatus_Idle
 
     elseif msg isa RoutingRules
         client.routing_rules = msg.rules
@@ -1043,10 +1167,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         client.remap_rules = msg.rules
 
     elseif msg isa DeviceSchema
-        if msg.schema isa ExceptionMessage
-            @error "Error from server with DEVICESCHEMA" exception=msg.schema.text
-            log_engine_error(state, "Failed to get the schema of $(msg.topic)//$(msg.name)", msg.schema.text)
-        else
+        if !(msg.schema isa ExceptionMessage)
             client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
         end
         delete!(client.device_schema_requests, (msg.topic, msg.name))
@@ -1058,20 +1179,44 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         if msg.info isa Dict
             client.context.context_state = build_context_state(state, msg.info)
             client.context.source = msg.source
+            client.context.input_topics = msg.info["input_topics"]
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
+            filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_logs)
             # The new context has its own inputs, so the sources we complete
             # against have changed.
             get_input_sources(client)
             # A newly loaded context may pull in packages that register more
             # variables, so refresh the add-variable palette.
             get_available_variables(client)
-        else
-            @error "Context failed to load"
-            log_engine_error(state, "Context failed to load", msg.info.text)
         end
 
         client.context.pipeline_status = msg.is_running ? PipelineStatus_Started : PipelineStatus_Stopped
+    elseif msg isa Protocol.ContextSource
+        # Keep the source in sync with the file since edits are applied to it
+        client.context.source = msg.source
+    elseif msg isa Protocol.LogMessages
+        for record in msg.records
+            is_new_error = record.level >= CoreLogging.Error && !msg.replay
+            if isempty(record.variable)
+                push_log!(client.engine_logs, record)
+
+                # Errors from before we connected aren't new, so we don't switch tabs for them
+                if is_new_error
+                    state.show_engine_logs = true
+                    state.select_tab = MainTab_EngineLogs
+                end
+            else
+                if !haskey(client.variable_logs, record.variable)
+                    client.variable_logs[record.variable] = VariableLogs()
+                end
+                logs = client.variable_logs[record.variable]
+                push_log!(logs.records, record)
+                if is_new_error && !logs.window_open
+                    logs.unseen_errors += record.count
+                end
+            end
+        end
     elseif msg isa TrainData
         for variable in msg.variables
             store_variable_data!(client, variable)
@@ -1133,6 +1278,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                     set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)
                 elseif owner.kind == ParameterOwner_Global
                     set_parameter_value(state, owner.var_name, new_value; reload=false)
+                elseif owner.kind == ParameterOwner_Postprocessor
+                    set_postprocessor_param(state, owner.pp, owner.field_name, new_value; reload=false)
                 end
             end
             client.pending_source_edit = nothing
@@ -1140,17 +1287,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa PipelineStats
         client.context.channel_stats = msg.channel_stats
         client.context.input_rates = msg.input_rates
-    elseif msg isa RemoteReplState
-        client.remoterepl_mode[] = msg.enabled
-        client.remoterepl_status = msg.enabled ? RemoteReplStatus_Running : RemoteReplStatus_Stopped
     elseif msg isa Ack
-        # Callback errors are logged with the callback's name by invoke_callback
-        is_callback = !isnothing(replied_to) && replied_to.msg_type == InvokeCallback
-        if !isnothing(msg.error) && !is_callback
-            @error "Server reported an error" exception=msg.error.text
-            log_engine_error(state, "Server reported an error", msg.error.text)
-        end
-
         if !isnothing(replied_to) && replied_to.msg_type == Start
             if isnothing(msg.error)
                 client.context.pipeline_status = PipelineStatus_Started
@@ -1194,10 +1331,11 @@ function handle_server(state)
                 client.client_id = id
 
                 client.status = RemoteStatus_Connected
+                @guiasync check_context_path(client)
                 send(client, GetPackageDirs())
                 get_input_sources(client)
                 get_available_variables(client)
-                get_trainmatchers(client)
+                get_devices(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
 
@@ -1276,9 +1414,9 @@ function get_available_variables(client)
     send(client, GetVariables())
 end
 
-function get_trainmatchers(client)
-    send(client, GetTrainmatchers())
-    client.trainmatchers_request_status = RequestStatus_Waiting
+function get_devices(client)
+    send(client, GetDevices())
+    client.devices_request_status = RequestStatus_Waiting
 end
 
 function get_routing_rules(client)
@@ -1342,7 +1480,7 @@ function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, sou
     end
 
     value = property_ref[]
-    if value isa Exception || !(value isa AbstractVector) || isempty(value)
+    if !(value isa AbstractVector) || isempty(value)
         return nothing, nothing
     end
 
@@ -1405,6 +1543,70 @@ function karabo_property_valid(client::ClientState, source::AbstractString, prop
     return false
 end
 
+# Resolve the context path the same way the engine does, relative to its
+# working directory.
+function resolve_context_path(client)
+    path = client.context_path
+    if client.embedded_engine
+        abspath(expanduser(path))
+    elseif path == "~" || startswith(path, "~/")
+        with_sftp(homedir, client) * path[2:end]
+    else
+        joinpath(client.remote_working_dir, path)
+    end
+end
+
+function check_context_path(client)
+    path = client.context_path
+    valid = if isempty(path)
+        false
+    elseif client.embedded_engine
+        isfile(resolve_context_path(client))
+    else
+        resolved = resolve_context_path(client)
+        with_sftp(sftp -> isfile(resolved, sftp), client)
+    end
+
+    # The path may have been edited again while we were checking
+    if path == client.context_path
+        client.context_path_valid = valid
+    end
+end
+
+# Write the default context to the context path, or to context.jl in the
+# engine working directory if no path is set.
+function initialize_context_file(client)
+    path = resolve_context_path(client)
+
+    if isempty(client.context_path)
+        path = joinpath(path, "context.jl")
+        client.context_path = path
+    end
+
+    code = read(joinpath(@__DIR__, "default_context.jl"))
+    if client.embedded_engine
+        if isfile(path)
+            @warn "Not overwriting existing context file" path
+        else
+            mkpath(dirname(path))
+            write(path, code)
+        end
+    else
+        with_sftp(client) do sftp
+            if isfile(path, sftp)
+                @warn "Not overwriting existing context file" path
+            else
+                mkpath(dirname(path), sftp)
+                open(path, sftp; write=true) do f
+                    write(f, code)
+                end
+            end
+        end
+    end
+
+    check_context_path(client)
+end
+
 function load_context(state)
     client = state.client
     send(client, LoadContext(client.context_path))
@@ -1425,14 +1627,8 @@ function change_parameter(param::Parameter)
 end
 
 function invoke_callback(name::String)
-    gui_state = state[]
-    on_reply = msg -> begin
-        if !isnothing(msg.error)
-            @error "Callback '$(name)' failed" exception=msg.error.text
-            log_engine_error(gui_state, "Callback '$(name)' failed", msg.error.text)
-        end
-    end
-    gui_state.client.callback_requests[name] = send_with_callback(gui_state.client, InvokeCallback(name), on_reply)
+    client = state[].client
+    client.callback_requests[name] = send(client, InvokeCallback(name))
 end
 
 function start(state)
@@ -1456,12 +1652,6 @@ end
 function set_debug_mode(state)
     client = state.client
     client.debug_mode_request = send(client, SetDebugMode(client.debug_mode[]))
-end
-
-function set_remoterepl(state)
-    client = state.client
-    client.remoterepl_status = RemoteReplStatus_Changing
-    send(client, SetRemoteRepl(client.remoterepl_mode[]))
 end
 
 function send_subscriptions(client)

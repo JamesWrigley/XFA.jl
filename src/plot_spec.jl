@@ -297,12 +297,13 @@ function compile_params!(rois, dict, path)
 end
 
 function compile_model(model, path)
-    check_keys(model, ("function", "params", "title"), path)
-    func = choice(("gaussian" => ModelFunction_Gaussian,),
+    check_keys(model, ("function", "params", "title", "to_x_intercept"), path)
+    func = choice(("gaussian" => ModelFunction_Gaussian, "linear" => ModelFunction_Linear),
                   property(model, "function", AbstractString, path), "$(path).function")
     params = property(model, "params", AbstractString, path)
     title = property(model, "title", AbstractString, path, nothing)
-    ModelOverlay(func, String(params), isnothing(title) ? nothing : String(title))
+    to_x_intercept = property(model, "to_x_intercept", Bool, path, false)
+    ModelOverlay(func, String(params), isnothing(title) ? nothing : String(title), to_x_intercept)
 end
 
 const UNIT_KEYS = ("data", "mark", "encoding", "transform", "params")

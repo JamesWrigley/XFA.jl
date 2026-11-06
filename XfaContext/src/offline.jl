@@ -10,83 +10,26 @@ const PythonCall_pkgid = Base.PkgId(Base.UUID("6099a3de-0909-46bc-b1f4-468b9a2df
 # `@invokelatest` extension methods.
 #
 # The importing thread becomes Python's main thread, and finalising Python at
-# exit only works from that thread: any other one gets its own thread state,
-# which finalisation treats as a daemon thread and parks forever when a
-# finaliser (e.g. h5py's) re-takes the GIL. Exit hooks run on thread 1, so
-# the import is pinned there.
+# exit only works from that thread: from any other one, a finaliser (e.g.
+# h5py's) re-taking the GIL under another thread state is parked forever. Exit
+# hooks run on thread 1, so the import is pinned there.
 function load_pythoncall()
     guard_pythoncall_import(() -> Base.require(PythonCall_pkgid))
     return Base.loaded_modules[PythonCall_pkgid]
 end
 
 # Run `f`, which may import PythonCall (directly or through another package),
-# on thread 1 if PythonCall isn't loaded yet. The importing thread is left
-# holding the GIL, so the task is pinned and the GIL released after an import.
+# on thread 1 if PythonCall isn't loaded yet.
 function guard_pythoncall_import(f)
-    if haskey(Base.loaded_modules, PythonCall_pkgid)
-        state = @invokelatest pysafe_enter()
-        try
-            return f()
-        catch ex
-            @invokelatest pysafe_rethrow(ex)
-        finally
-            @invokelatest pysafe_exit(state)
-        end
-    end
-
-    pinned = () -> begin
-        task = current_task()
-        was_sticky = task.sticky
-        task.sticky = true
-        try
-            return f()
-        finally
-            if haskey(Base.loaded_modules, PythonCall_pkgid)
-                PythonCall = Base.loaded_modules[PythonCall_pkgid]
-                @invokelatest PythonCall.C.PyEval_SaveThread()
-
-                # PythonCall's exit hook finalises Python, which needs the GIL
-                # held by the exiting thread. Exit hooks run last-registered-first.
-                atexit(() -> @invokelatest PythonCall.C.PyGILState_Ensure())
-            end
-            task.sticky = was_sticky
-        end
-    end
-
-    if Threads.threadid() == 1
-        return pinned()
+    if haskey(Base.loaded_modules, PythonCall_pkgid) || Threads.threadid() == 1
+        return f()
     else
         # jl_set_task_tid takes a 0-based thread id, so 0 is thread 1
-        task = Task(pinned)
+        task = Task(f)
         ccall(:jl_set_task_tid, Cint, (Any, Cint), task, 0)
         schedule(task)
         return fetch(task)
     end
-end
-
-# Take the GIL and pin the task to its OS thread, undone by `pysafe_exit`, and
-# rethrow Python exceptions as plain errors. Implemented by the PythonCall
-# extension.
-function pysafe_enter end
-function pysafe_exit end
-function pysafe_rethrow end
-
-"""
-    @pysafe expr
-
-Evaluate `expr` holding the Python GIL, for calling Python from a variable.
-Requires PythonCall to be loaded by the context file. Keep Julia blocking
-operations (`put!`, `wait`, `sleep`) out of it. `expr` runs in the enclosing
-scope, so variables it assigns stay visible afterwards.
-"""
-macro pysafe(expr)
-    # The raw :trycatch/:tryfinally forms don't open a scope like `try` does
-    state = gensym("pysafe_state")
-    Expr(:block,
-         :($state = $pysafe_enter()),
-         Expr(:trycatch,
-              Expr(:tryfinally, esc(expr), :($pysafe_exit($state))),
-              :($pysafe_rethrow($(Expr(:the_exception))))))
 end
 
 # Offline input API over an extra-data DataCollection, implemented by the

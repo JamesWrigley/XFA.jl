@@ -7,24 +7,27 @@ using ImPlot: ImPlot
 using GLFW: GLFW
 using ModernGL
 import ImGuiNodeEditor as ne
+using ImGuiColorTextEdit: ImGuiColorTextEdit as cte, TextEditor, REPLCompleter
 
 using LibSSH: LibSSH as ssh
 using HTTP: HTTP, WebSockets
 using XfaEngine: EngineState, getavailableport, RoutingRule, RemapRule, RemapKind,
     RemapKind_Simple, RemapKind_Proxy
-using Dates: Dates, unix2datetime, @dateformat_str
+using Dates: Dates
 using DataStructures: CircularBuffer, OrderedDict
 using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
+using XfaEngine: XfaEngine, Protocol
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
-    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, VariableSpec, VariableKind_Variable,
+    ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, IndexSelection, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
-    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian, ModelFunction_Linear
 include("states.jl")
+include("imgui_helpers.jl")
 
 using NaNStatistics: nanpctile
 using DimensionalData: DimensionalData as DD, DimVector, DimMatrix, DimArray, At, lookup
@@ -36,15 +39,16 @@ using Sockets: Sockets
 using CRC32c: crc32c
 using LibGit2: LibGit2
 using Sentry: Sentry
+using LoggingExtras: TeeLogger
+using Base.CoreLogging: CoreLogging
+using Base.Filesystem: Filesystem, JL_O_WRONLY, JL_O_CREAT, JL_O_APPEND
 using XfaContext: XfaContext
 using Serialization
 using XfaEngine.Protocol
-using XfaEngine: XfaEngine, Protocol
 using XfaContext: Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group,
     subvariable_dependency,
     karabo_dependency, karabo_dep_string, Parameter, KaraboDevice, VariableData, ArrayMetadata, OptionalDims
 
-include("imgui_helpers.jl")
 include("state_inspector.jl")
 include("client.jl")
 include("context_edit.jl")
@@ -152,32 +156,11 @@ function node_tooltip(text)
     # The foreground list is unscaled screen space, but when zoomed in the frame
     # density is cranked up for the canvas-magnified node text; that bakes this
     # tooltip oversized and minifies it (aliasing). Bake at the displayed size.
-    frame_density = ig.GetFontRasterizerDensity()
-    ig.SetFontRasterizerDensity(1f0)
+    frame_density = ne.get_pixel_density()
+    ne.set_pixel_density(1f0)
     ig.AddText(draw_list, font, font_size, pos, IM_COL32(230, 230, 230, 255), text)
-    ig.SetFontRasterizerDensity(frame_density)
+    ne.set_pixel_density(frame_density)
     ig.PopClipRect(draw_list)
-end
-
-# Node names in front-to-back order so the top node under the mouse wins input on
-# overlapping widgets: ImGui gives the first-submitted overlapping item the click,
-# and the editor keeps the active/selected node last in its order. New nodes the
-# editor hasn't seen yet are appended.
-function node_draw_order(ctx_state)
-    id_to_name = Dict{UInt, String}(UInt(var_data["id"]) => name for (name, var_data) in ctx_state)
-    ordered = String[]
-    for id in Iterators.reverse(ne.GetOrderedNodeIds())
-        name = get(id_to_name, id.value, nothing)
-        if !isnothing(name)
-            push!(ordered, name)
-        end
-    end
-    for name in keys(ctx_state)
-        if !(name in ordered)
-            push!(ordered, name)
-        end
-    end
-    return ordered
 end
 
 ## Helper functions for the GUI
@@ -223,10 +206,31 @@ function draw_main_menubar()
             @c MenuItem("Debug log", &state[].show_debug_log)
             @c MenuItem("State inspector", &state[].show_state_inspector)
             if @c MenuItem("Engine logs", &state[].show_engine_logs)
-                state[].select_engine_logs = true
+                state[].select_tab = MainTab_EngineLogs
             end
 
             ig.EndMenu()
+        end
+
+        # This scales all fonts, including the size pushed by the context editor
+        style = ig.GetStyle()
+        font_percent = Ref(round(Cint, unsafe_load(style).FontScaleMain * 100))
+
+        # Pin it to the right edge, otherwise it moves under the mouse as the
+        # items before it resize, which changes the value again.
+        slider_x = ig.GetWindowWidth() - 130 - unsafe_load(style).WindowPadding.x
+        label = "Font size: "
+        ig.SetCursorPosX(slider_x - ig.CalcTextSize(label).x - unsafe_load(style).ItemInnerSpacing.x)
+        ig.Text(label)
+        ig.SetCursorPosX(slider_x)
+        ig.SetNextItemWidth(130)
+        if ig.SliderInt("##font-size", font_percent, 50, 200, "%d%%", ig.ImGuiSliderFlags_AlwaysClamp)
+            style.FontScaleMain = font_percent[] / 100
+        end
+
+        # Don't write the settings file on every step of a drag
+        if ig.IsItemDeactivatedAfterEdit()
+            state[].font_percent = font_percent[]
         end
 
         ig.EndMenuBar()
@@ -293,6 +297,29 @@ function draw_parameter_widget(name, param::Parameter{Vector{Float64}})
     return draw_numeric_vector_widget(name, param)
 end
 
+function index_selection_validator(text)
+    try
+        IndexSelection(text)
+        return nothing
+    catch ex
+        return ex.msg
+    end
+end
+
+function draw_parameter_widget(name, param::Parameter{IndexSelection})
+    current = string(param.value)
+    # Leave room for the marker within the width draw_parameter set
+    marker_w = ig.CalcTextSize("[?]").x + unsafe_load(ig.GetStyle().ItemSpacing.x)
+    ig.SetNextItemWidth(max(50f0, ig.CalcItemWidth() - marker_w))
+    edited, new_text = SafeInputText("##$(name)"; current_text=current, validator=index_selection_validator)
+    ig.SameLine()
+    InfoMarker("Indices and ranges, e.g.:\n  1-10\n  1, 5, 8\n  1-10, 50, 51")
+    if edited
+        return true, IndexSelection(new_text)
+    end
+    return false, nothing
+end
+
 # (lo, hi) range editor. We only commit a new value once lo < hi so the engine
 # isn't bombarded with half-edited input. Tracking of "user-pinned vs auto" is
 # handled engine-side via the parameter's `set_by_user` flag.
@@ -341,19 +368,22 @@ function draw_parameter_widget(name, param::Parameter{OptionalDims})
     return false, nothing
 end
 
-function draw_parameter_widget(name, param::Parameter{KaraboDevice}, sources)
+function draw_parameter_widget(name, param::Parameter{KaraboDevice})
     client = state[].client
     dep_key = hash(param.name)
     dep_state = get!(client.karabo_dep_states, dep_key, KaraboDepTextState())
 
+    sources = param.filter_topics ? client.source_list : client.device_list
+    classes = param.filter_device_classes
     device = param.value
     text = isnothing(device) ? "" : "$(device.topic)//$(device.name)"
     edited, new_text = KaraboDepText("param-$(param.name)", text, dep_state,
-                                     sources, client; device_only=true)
+                                     sources, client; device_only=true, device_classes=classes)
     if edited
         new_device = KaraboDevice(new_text)
         if isempty(new_device.topic)
-            idx = findfirst(s -> s.name == new_device.name, sources)
+            idx = findfirst(s -> s.name == new_device.name && (isempty(classes) || s.class_id in classes),
+                            sources)
             if !isnothing(idx)
                 new_device = KaraboDevice(sources[idx].topic, new_device.name)
             end
@@ -489,10 +519,10 @@ end
 
 # Draw a single parameter with appropriate width, and send a change message
 # if modified.
-function draw_parameter(name, param, widget_args...; min_node_width=150, pending=false)
+function draw_parameter(name, param, widget_args...; pending=false)
     ig.Text(name * ":")
     ig.SameLine()
-    ig.SetNextItemWidth(round(Int, min_node_width * 1.5))
+    ig.SetNextItemWidth(max(50f0, state[].client.ne_node_right - ig.GetCursorScreenPos().x))
     modified, new_value = draw_parameter_widget(name, param, widget_args...)
     if modified
         if pending
@@ -512,11 +542,7 @@ function draw_parameters(var_data; pending=false)
     if haskey(var_data, "parameters")
         ig.Text("Parameters:")
         for (param_name, param) in var_data["parameters"]
-            if param isa Parameter{KaraboDevice}
-                draw_parameter(param_name, param, state[].client.source_list; pending)
-            else
-                draw_parameter(param_name, param; pending)
-            end
+            draw_parameter(param_name, param; pending)
         end
     end
 end
@@ -540,9 +566,9 @@ draw_variable_content(::Val, name, var_data, gui_state) = nothing
 
 # Specialize on Val{Symbol("ModulePath.PostprocessorType")} to draw a custom
 # parameter UI for a postprocessor. Default: list every parameter.
-function draw_postprocessor_params(::Val, pp, min_node_width)
+function draw_postprocessor_params(::Val, pp)
     for (param_name, param) in pp.params
-        draw_parameter(param_name, param; min_node_width)
+        draw_parameter(param_name, param)
     end
 end
 
@@ -662,8 +688,20 @@ end
 # triggers clears the pending nodes, and the committed node comes back through
 # the normal ContextInfo path.
 function commit_pending_node(state, pending)
-    apply_source_edit(state, source -> add_variable_source(source, pending.spec, pending.name,
-                                                          pending.dep_values, pending.param_values))
+    # Once there's a second input, pin the existing sources to the first one's topic
+    topics = state.client.context.input_topics
+    topic = if pending.spec.kind == VariableKind_Input && length(topics) == 1
+        only(values(topics))
+    else
+        nothing
+    end
+
+    apply_source_edit(state) do source
+        if !isnothing(topic)
+            source = add_karabo_topics(source, topic)
+        end
+        add_variable_source(source, pending.spec, pending.name, pending.dep_values, pending.param_values)
+    end
 end
 
 # Draws a variable node. The node shell (titlebar, dependencies, outputs) is
@@ -672,7 +710,6 @@ end
 function draw_variable(name, var_data)
     client = state[].client
     pending = pending_node_for(client, var_data["id"])
-    min_node_width = 150
     variable_store = get(client.variable_data, name, nothing)
 
     ig.PushID(name)
@@ -683,13 +720,11 @@ function draw_variable(name, var_data)
     handle = ne.NodeId(var_data["id"])
     ne.BeginNode(handle)
 
-    # Right-align the output/postprocessor pins to the widest left-anchored row.
-    # `content_measured` accumulates each row's width (via origin-independent
-    # GetItemRectSize) this frame; `content_width` reuses last frame's value to
-    # place the pins. The pins are never measured, so they can't ratchet the node
-    # ever-wider.
-    content_measured = Float32(min_node_width)
-    content_width = get(client.ne_node_content_widths, var_data["id"], Float32(min_node_width))
+    # Nodes have a fixed width that the user can drag with the resize grip at the
+    # bottom. Content that doesn't fit still widens the node so it stays visible.
+    node_width = get(client.ne_node_widths, name, 250f0)
+    node_left = ig.GetCursorScreenPos().x
+    client.ne_node_right = node_left + node_width
 
     @Disabled !graph_editable(client) begin
         # Draw the titlebar at a fixed 1.5x canvas size (1.5*current_scale() keeps
@@ -708,31 +743,53 @@ function draw_variable(name, var_data)
         # Bottom of the title, used to size the header background drawn after
         # EndNode. The Dummy adds breathing room between the header and content.
         title_bottom = ig.GetItemRectMax().y
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
-        # Right-aligned delete button in the header. It does nothing for real
-        # nodes yet; for pending nodes it discards them. Placed on the title row
-        # via content_width (last frame's width), then the cursor is restored to
-        # below the title so the rest of the node stacks normally.
-        after_title = ig.GetCursorPos()
+        # Logs and delete buttons, right-aligned on the title row
         del_w = ig.GetTextLineHeight()
-        ig.SetCursorPos((title_pos.x + content_width - del_w, title_pos.y))
+        spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
+
+        # The logs button shows the number of unseen errors, and widens for it
+        logs = get(client.variable_logs, name, nothing)
+        has_logs = !isnothing(logs) && !isempty(logs.records)
+        unseen_errors = has_logs ? logs.unseen_errors : 0
+        logs_text = unseen_errors > 0 ? "\uf03a $(unseen_errors)" : "\uf03a"
+        logs_w = unseen_errors > 0 ? ig.CalcTextSize(logs_text).x + del_w / 2 : del_w
+
+        after_title = ig.GetCursorPos()
+        # The icons only fit in the buttons without the horizontal frame padding,
+        # and 3/4 of the vertical padding centers them vertically
+        ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(0, 0.75 * unsafe_load(ig.GetStyle().FramePadding.y)))
+
+        ig.SetCursorPos((title_pos.x + node_width - del_w - spacing - logs_w, title_pos.y))
+        if unseen_errors > 0
+            ig.PushStyleColor(ig.ImGuiCol_Button, ImVec4(0.8, 0.2, 0.2, 1))
+            ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ImVec4(0.9, 0.3, 0.3, 1))
+        end
+        @Disabled !has_logs begin
+            if ig.Button("$(logs_text)###logs-$(var_data["id"])", (logs_w, del_w))
+                logs.window_open = true
+                logs.unseen_errors = 0
+                ig.SetWindowFocus("###logs-$(name)")
+            end
+        end
+        if unseen_errors > 0
+            ig.PopStyleColor(2)
+        end
+
+        ig.SetCursorPos((title_pos.x + node_width - del_w, title_pos.y))
         if ig.Button("##delete-$(var_data["id"])", (del_w, del_w))
             if !isnothing(pending)
                 filter!(p -> p !== pending, client.pending_nodes)
             end
         end
+        ig.PopStyleVar()
         ig.SetCursorPos(after_title)
 
         if !isnothing(pending)
             ig.TextDisabled("(pending)")
-            content_measured = max(content_measured, ig.GetItemRectSize().x)
         end
 
         ig.Dummy(0, 6)
-        # Group the custom content so we can measure its full width; the helpers
-        # draw several rows and GetItemRectMax alone would only see the last one.
-        ig.BeginGroup()
         origin = var_data["origin"]
         # Skip custom content for pending nodes: it targets live engine state
         # (fires parameter changes, reads runtime data) that a not-yet-added node
@@ -745,8 +802,9 @@ function draw_variable(name, var_data)
             new_gui_state = try
                 draw_variable_content(Val(Symbol(origin)), name, var_data, gui_state)
             catch ex
-                @error "Error while drawing node '$(name)'" exception=(ex, catch_backtrace())
-                state[].disable_rendering = true
+                bt = catch_backtrace()
+                @error "Error while drawing node '$(name)'" exception=(ex, bt)
+                state[].render_error = sprint(showerror, ex, bt)
                 nothing
             end
             if !isnothing(new_gui_state) && !haskey(client.variable_gui_states, name)
@@ -760,10 +818,8 @@ function draw_variable(name, var_data)
         if haskey(var_data, "callbacks")
             draw_callbacks(var_data)
         end
-        ig.EndGroup()
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
 
-        ig.Dummy(min_node_width, 20)
+        ig.Dummy(0, 20)
 
         # Draw dependencies
         for pin in var_data["dependencies"]
@@ -781,8 +837,6 @@ function draw_variable(name, var_data)
             # row; the label/editor are drawn after EndPin on the same line.
             draw_pin(client, dep_id, ne.PinKind_Input)
             ig.SameLine()
-            # Group the post-pin content so we can size the row from it. The pin
-            # icon to its left is a fixed advance (icon + SameLine spacing).
             ig.BeginGroup()
             if var_data["type"] == :group
                 label = something(pin.field, arg_name)
@@ -808,8 +862,6 @@ function draw_variable(name, var_data)
                 node_tooltip(isempty(dep.name) ? "Set by the engine, not known yet" :
                              "Set by the engine to $(dep.name)")
             end
-            pin_advance = ig.GetTextLineHeight() + unsafe_load(ig.GetStyle().ItemSpacing.x)
-            content_measured = max(content_measured, pin_advance + ig.GetItemRectSize().x)
             if edited
                 if !isnothing(pending)
                     pending.dep_values[arg_name] = new_dep
@@ -822,14 +874,14 @@ function draw_variable(name, var_data)
         end
     end # @Disabled
 
-    ig.Dummy(min_node_width, 10)
+    ig.Dummy(0, 10)
 
     ig.TextDisabled("Outputs")
     draw_list = ig.GetWindowDrawList()
     start_pos = ig.GetCursorScreenPos()
     gray = ig.IM_COL32(100, 100, 100, 255)
-    ig.AddLine(draw_list, start_pos, (start_pos.x + min_node_width / 2f0, start_pos.y), gray, 2)
-    ig.Dummy(min_node_width, 2)
+    ig.AddLineH(draw_list, start_pos.x, start_pos.x + node_width / 2f0, start_pos.y, gray, 2)
+    ig.Dummy(0, 2)
 
     # Draw outputs
     for output in var_data["outputs"]
@@ -837,10 +889,6 @@ function draw_variable(name, var_data)
         output_name = isempty(label) ? name : "$(name).$(label)"
         pin_start = ig.GetCursorPos()
 
-        # Measure the label group before placing the pin. BeginPin leaves the
-        # cursor's max-x at the far-right pin position, so measuring after it would
-        # make content_width self-sustaining (the node would never shrink). The pin
-        # is drawn afterwards via SetCursorPos.
         ig.BeginGroup()
         typestr = get_variable_typeinfo(output_name)
         if !isempty(typestr)
@@ -885,13 +933,12 @@ function draw_variable(name, var_data)
             end
         end
         ig.EndGroup()
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
         after_label = ig.GetCursorPos()
 
         # Right-aligned output pin on the label's row. Drawing it (icon Dummy) after
         # the rightward SetCursorPos validates the extent (no boundary assert).
         icon_w = ig.GetTextLineHeight()
-        ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+        ig.SetCursorPos((pin_start.x + node_width - icon_w, pin_start.y))
         draw_pin(client, output.id, ne.PinKind_Output)
         # Continue below both the label and the pin icon so rows don't overlap.
         # The trailing Dummy validates the SetCursorPos extent so ImGui's boundary
@@ -903,11 +950,11 @@ function draw_variable(name, var_data)
     # Draw postprocessors
     postprocessors = get(var_data, "postprocessors", [])
     if !isempty(postprocessors)
-        ig.Dummy(min_node_width, 8)
+        ig.Dummy(0, 8)
         ig.TextDisabled("Postprocessors")
         pp_sep_pos = ig.GetCursorScreenPos()
-        ig.AddLine(draw_list, pp_sep_pos, (pp_sep_pos.x + min_node_width / 2f0, pp_sep_pos.y), gray, 2)
-        ig.Dummy(min_node_width, 2)
+        ig.AddLineH(draw_list, pp_sep_pos.x, pp_sep_pos.x + node_width / 2f0, pp_sep_pos.y, gray, 2)
+        ig.Dummy(0, 2)
 
         for pp in postprocessors
             label = pp.display_name * pp.tree_id_suffix
@@ -917,7 +964,7 @@ function draw_variable(name, var_data)
             # The pin wraps only the icon (right-aligned to the node edge) so its
             # hover rect doesn't span the whole row; the tree is drawn after EndPin
             # from the left.
-            ig.SetCursorPos((pin_start.x + content_width - icon_w, pin_start.y))
+            ig.SetCursorPos((pin_start.x + node_width - icon_w, pin_start.y))
             draw_pin(client, pp.id, ne.PinKind_Output)
             ig.SetCursorPos(pin_start)
 
@@ -927,7 +974,7 @@ function draw_variable(name, var_data)
             ig.BeginColumns("##pp-$(pp.id)", 2,
                             ig.ImGuiOldColumnFlags_NoBorder | ig.ImGuiOldColumnFlags_NoResize |
                             ig.ImGuiOldColumnFlags_NoPreserveWidths | ig.ImGuiOldColumnFlags_NoForceWithinWindow)
-            ig.SetColumnWidth(0, content_width - icon_w)
+            ig.SetColumnWidth(0, node_width - icon_w)
 
             expanded = ig.TreeNode(label)
             if haskey(client.variable_data, pp.name)
@@ -945,7 +992,7 @@ function draw_variable(name, var_data)
                 if isempty(pp.params)
                     ig.TextDisabled("(no parameters)")
                 else
-                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp, min_node_width)
+                    draw_postprocessor_params(Val(Symbol(pp.origin)), pp)
                 end
                 ig.TreePop()
             end
@@ -957,7 +1004,7 @@ function draw_variable(name, var_data)
     # Commit button for a pending node. Enabled once the name is valid and every
     # dependency has been wired to something.
     if !isnothing(pending)
-        ig.Dummy(min_node_width, 8)
+        ig.Dummy(0, 8)
         valid = isnothing(variable_name_validator(name, name)) &&
                 all(!isempty(dep.name) for (arg, dep) in pending.dep_values
                     if !optional_dep(pending, arg))
@@ -966,15 +1013,46 @@ function draw_variable(name, var_data)
                 @guiasync commit_pending_node(state[], pending)
             end
         end
-        content_measured = max(content_measured, ig.GetItemRectSize().x)
     end
 
-    # Stash the widest content row for next frame's pin alignment. Postprocessors
-    # are excluded: their tree column is sized to content_width, so measuring it
-    # would feed the imposed width back and re-introduce the ratchet.
-    client.ne_node_content_widths[var_data["id"]] = content_measured
+    # Resize grip in the bottom-right corner, drawn like ImGui's window grip
+    grip_w = round(0.75f0 * ig.GetTextLineHeight())
+    ig.SetCursorPosX(ig.GetCursorPos().x + node_width - grip_w)
+    ig.InvisibleButton("##resize-$(var_data["id"])", (grip_w, grip_w))
+    grip_active = ig.IsItemActive()
+    grip_hovered = item_has_hover()
+    if ig.IsItemActivated()
+        client.ne_resize_min = 0f0
+    end
+    if grip_active
+        client.ne_node_widths[name] = max(100f0, ig.GetMousePos().x - node_left + grip_w / 2)
+    end
+    if grip_active || grip_hovered
+        ig.SetMouseCursor(ig.ImGuiMouseCursor_ResizeEW)
+    end
+    grip_color = if grip_active
+        ig.GetColorU32(ig.ImGuiCol_ResizeGripActive)
+    elseif grip_hovered
+        ig.GetColorU32(ig.ImGuiCol_ResizeGripHovered)
+    else
+        ig.GetColorU32(ig.ImGuiCol_ResizeGrip)
+    end
+    grip_max = ig.GetItemRectMax()
+    ig.AddTriangleFilled(draw_list, grip_max, (grip_max.x, grip_max.y - grip_w),
+                         (grip_max.x - grip_w, grip_max.y), grip_color)
 
     ne.EndNode()
+
+    # Content that can't shrink overflows once the node is dragged narrow enough,
+    # and that width becomes the minimum for the rest of the drag.
+    if grip_active
+        padding = unsafe_load(ne.GetStyle().NodePadding)
+        content_w = ne.GetNodeSize(handle).x - padding.x - padding.z
+        if content_w > node_width + 1
+            client.ne_resize_min = max(client.ne_resize_min, content_w)
+        end
+        client.ne_node_widths[name] = max(client.ne_node_widths[name], client.ne_resize_min)
+    end
 
     # Dark blue header background behind the title (following builders.cpp
     # BlueprintNodeBuilder::End): drawn after EndNode on the node's background draw
@@ -992,7 +1070,7 @@ function draw_variable(name, var_data)
     ig.AddRectFilled(ne.GetNodeBackgroundDrawList(handle),
                      (node_pos.x + border, node_pos.y + border),
                      (node_pos.x + node_size.x - border, title_bottom),
-                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundCornersTop)
+                     IM_COL32(55, 62, 82, node_alpha), rounding, ig.ImDrawFlags_RoundTop)
 
     if !isnothing(pending)
         ne.PopStyleColor()
@@ -1109,10 +1187,10 @@ function draw_routing_rules()
             set_routing_rules(client, client.routing_rules)
         end
         ig.SameLine()
-        if ig.Button("Refresh trainmatchers")
-            get_trainmatchers(client)
+        if ig.Button("Refresh devices")
+            get_devices(client)
         end
-        if client.trainmatchers_request_status == RequestStatus_Waiting
+        if client.devices_request_status == RequestStatus_Waiting
             ig.SameLine()
             Spinner()
         end
@@ -1204,9 +1282,9 @@ function draw_routing_rules()
                 # A yellow warning icon appears when the selected device isn't whitelisted
                 # in the topic's webproxy.
                 ig.TableNextColumn()
-                tm_names = sort!(get(client.trainmatchers, rule.topic, String[]))
+                tm_names = get(client.trainmatchers, rule.topic, String[])
                 tm_warn = rule.input in tm_names &&
-                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_trainmatchers)
+                          !(KaraboDevice(rule.topic, rule.input) in client.whitelisted_devices)
 
                 # Reserve space at the right edge of the cell for the warning icon
                 # so the combo doesn't push it out of the column.
@@ -1266,23 +1344,38 @@ function draw_dag()
 
     ig.Dummy(0, 10)
     @Disabled isempty(ctx_state) || context.pipeline_status != PipelineStatus_Stopped begin
+        ig.PushStyleColor(ig.ImGuiCol_Button, ig.ImVec4(0.15, 0.55, 0.2, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ig.ImVec4(0.2, 0.7, 0.25, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonActive, ig.ImVec4(0.1, 0.45, 0.15, 1))
         if ig.Button(" Start ")
             start(state[])
         end
+        ig.PopStyleColor(3)
     end
 
     ig.SameLine()
 
     @Disabled context.pipeline_status != PipelineStatus_Started begin
+        ig.PushStyleColor(ig.ImGuiCol_Button, ig.ImVec4(0.65, 0.15, 0.15, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonHovered, ig.ImVec4(0.8, 0.2, 0.2, 1))
+        ig.PushStyleColor(ig.ImGuiCol_ButtonActive, ig.ImVec4(0.55, 0.1, 0.1, 1))
         if ig.Button(" Stop ")
             stop(state[])
         end
+        ig.PopStyleColor(3)
     end
 
     ig.SameLine()
     @Disabled isempty(client.variable_data) begin
         if ig.Button("Clear all")
             clear_variables()
+        end
+    end
+
+    ig.SameLine()
+    @Disabled !client.context_path_valid begin
+        if ig.Button("Edit context")
+            open_context_editor(client)
         end
     end
 
@@ -1309,13 +1402,20 @@ function draw_dag()
     end
 
     ig.SameLine()
-    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - 100)
+    label = "Add variable"
+    button_width = ig.CalcTextSize(label).x + 2 * unsafe_load(ig.GetStyle()).FramePadding.x
+    ig.SetCursorPosX(ig.GetCursorPos().x + ig.GetContentRegionAvail().x - button_width)
     @Disabled isempty(ctx_state) begin
-        if ig.Button("Add variable")
+        if ig.Button(label)
             ig.OpenPopup("add_variable_popup")
         end
     end
     if ig.BeginPopup("add_variable_popup")
+        if ig.Selectable("Karabo property ($(VariableKind_Variable))")
+            add_pending_node!(client, VariableSpec("karabo_property", VariableKind_Variable, "",
+                                                   OrderedDict("data" => Dependency(; kind=DepKind_Karabo, name="")),
+                                                   String[], String[], OrderedDict{Symbol, Parameter}()))
+        end
         for spec in client.available_variables
             if ig.Selectable("$(spec.name) ($(spec.kind))")
                 add_pending_node!(client, spec)
@@ -1330,10 +1430,10 @@ function draw_dag()
     # that context's saved layout. Persist the outgoing context's layout first.
     if client.ne_editor_path != client.context_path
         if client.ne_editor != C_NULL
-            save_node_editor_state(client.ne_editor_path, client.ne_settings)
+            save_node_editor_state(client.ne_editor_path, client.ne_settings, client.ne_node_widths)
             ne.DestroyEditor(client.ne_editor)
         end
-        client.ne_settings = load_node_editor_state(client.context_path)
+        client.ne_settings, client.ne_node_widths = load_node_editor_state(client.context_path)
         create_node_editor!(client)
     end
 
@@ -1346,10 +1446,9 @@ function draw_dag()
         # base size. Match the font rasterizer density to the magnification (snapped
         # up to a power of two so the bake cache stays warm) to keep text crisp.
         magnification = ne.current_scale()
-        ig.SetFontRasterizerDensity(exp2(ceil(log2(max(magnification, 1f0)))))
+        ne.set_pixel_density(exp2(ceil(log2(max(magnification, 1f0)))))
 
-        for name in node_draw_order(ctx_state)
-            var_data = ctx_state[name]
+        for (name, var_data) in ctx_state
             ig.PushID(name)
 
             draw_variable(name, var_data)
@@ -1486,6 +1585,49 @@ function draw_dag()
         if !isempty(ctx_state)
             save_settings(client)
         end
+    end
+end
+
+function draw_jump_hops_editor()
+    gui = state[]
+    hops = gui.jump_hops
+    if isnothing(hops)
+        if !gui.detecting_jump_hops
+            gui.detecting_jump_hops = true
+            @guiasync detect_jump_hops(gui)
+        end
+        Spinner("Detecting...")
+        return
+    end
+
+    remove_idx = nothing
+    button_w = ig.GetFrameHeight()
+    for i in eachindex(hops)
+        ig.PushID(i)
+        ig.SetNextItemWidth(-(button_w + unsafe_load(ig.GetStyle().ItemSpacing.x)))
+        _, hops[i] = SafeInputText("##jump-hop"; hint="host", current_text=hops[i])
+        ig.SameLine()
+        if ig.Button("-", ImVec2(button_w, button_w))
+            remove_idx = i
+        end
+        ig.PopID()
+    end
+
+    if !isnothing(remove_idx)
+        deleteat!(hops, remove_idx)
+    end
+
+    if isempty(hops)
+        ig.AlignTextToFramePadding()
+        ig.TextDisabled("None (direct connection)")
+        ig.SameLine()
+    end
+    if ig.Button("Add jump")
+        push!(hops, "")
+    end
+    ig.SameLine()
+    if ig.Button("Reset")
+        gui.jump_hops = nothing
     end
 end
 
@@ -1773,38 +1915,143 @@ function draw_plots()
     end
 end
 
-function draw_engine_logs()
-    client = state[].client
-
+function draw_logs(records::CircularBuffer{Protocol.LogRecord}; expanded::Bool=false)
     ig.Dummy(0, 5)
     if ig.Button("Clear all logs")
-        empty!(client.engine_logs)
+        empty!(records)
     end
 
     ig.Dummy(0, 5)
     ig.Separator()
 
-    for (i, log) in enumerate(client.engine_logs)
+    ig.BeginChild("##logs")
+    for (i, log) in enumerate(records)
         ig.PushID(i)
 
-        timestamp = Dates.format(unix2datetime(log.timestamp), client.log_dateformat)
+        timestamp = Libc.strftime("%Y-%m-%d %H:%M:%S", log.timestamp)
         ig.Text(timestamp)
         ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  ").x)
 
-        if !isnothing(log.extra_details)
-            CopyButton("log", log.message * "\n" * log.extra_details)
+        if log.level >= CoreLogging.Error
+            ig.TextColored(ImVec4(0.9, 0.3, 0.3, 1), string(log.level))
+        elseif log.level >= CoreLogging.Warn
+            ig.TextColored(ImVec4(0.9, 0.7, 0.2, 1), string(log.level))
+        else
+            ig.TextDisabled(string(log.level))
+        end
+        ig.SameLine(ig.CalcTextSize("0000-00-00 00:00:00  Error  ").x)
+
+        message = log.message
+        if log.count > 1
+            message *= " (x$(log.count))"
+        end
+
+        if !isempty(log.details)
+            CopyButton("log", message * "\n" * log.details)
             ig.SameLine()
-            if ig.TreeNode(log.message)
-                ig.TextUnformatted(log.extra_details)
+            if expanded
+                ig.SetNextItemOpen(true, ig.ImGuiCond_Once)
+            end
+            if ig.TreeNode("$(message)###log")
+                ig.TextUnformatted(log.details)
                 ig.TreePop()
             end
         else
-            CopyButton("log", log.message)
+            CopyButton("log", message)
             ig.SameLine()
-            ig.BulletText(log.message)
+            # Not BulletText(), which would treat the message as a format string
+            ig.Bullet()
+            ig.TextUnformatted(message)
         end
 
         ig.PopID()
+    end
+
+    # Follow new logs while scrolled to the bottom
+    if ig.GetScrollY() >= ig.GetScrollMaxY()
+        ig.SetScrollHereY(1.0)
+    end
+    ig.EndChild()
+end
+
+function draw_variable_logs(client::ClientState)
+    for (name, logs) in client.variable_logs
+        if logs.window_open
+            ig.SetNextWindowSize((800, 400), ig.ImGuiCond_FirstUseEver)
+            if @c ig.Begin("Logs: $(name)###logs-$(name)", &logs.window_open)
+                draw_logs(logs.records; expanded=true)
+            end
+            ig.End()
+        end
+    end
+end
+
+function draw_context_editor(client::ClientState)
+    context_editor = client.context_editor
+
+    # Follow changes to the context source unless there are local changes
+    source = client.context.source
+    if source != context_editor.synced_source
+        context_editor.disk_changed = cte.GetText(context_editor.editor) != context_editor.synced_source
+        if !context_editor.disk_changed
+            set_editor_text(context_editor.editor, source)
+        end
+        context_editor.synced_source = source
+    end
+
+    if context_editor.window_open
+        text = context_editor.pending_text
+        if !isnothing(text)
+            set_editor_text(context_editor.editor, text)
+            context_editor.pending_text = nothing
+        end
+
+        ig.SetNextWindowSize((800, 600), ig.ImGuiCond_FirstUseEver)
+        if @c ig.Begin("Context: $(client.context_path)###context-editor", &context_editor.window_open)
+            busy = context_editor.busy
+            @Disabled busy begin
+                # Shortcut() ignores the disabled state, so check busy explicitly
+                if ig.Button("Save") || (!busy && ig.Shortcut(ig.ImGuiMod_Ctrl | ig.ImGuiKey_S))
+                    save_context_editor(client)
+                end
+                ig.SetItemTooltip("Ctrl+S")
+
+                ig.SameLine()
+                if ig.Button("Reload from disk")
+                    reload_context_editor(client)
+                end
+
+                # TODO: GetText() copies the whole document every frame (~0.2ms for
+                # 120KB), only compare when the text or loaded source changes.
+                source = client.context.source
+                in_sync = cte.GetText(context_editor.editor) == source
+                ig.SameLine()
+                @Disabled isempty(source) || in_sync begin
+                    if ig.Button("Reset to loaded context")
+                        set_editor_text(context_editor.editor, client.context.source)
+                    end
+                end
+            end
+
+            if busy
+                ig.SameLine()
+                Spinner()
+            end
+
+            if context_editor.disk_changed && !in_sync
+                ig.TextColored(ImVec4(0.9, 0.7, 0.2, 1),
+                               "The context file has changed on disk, click 'Reload from disk' to load the changes (this will discard local changes).")
+            end
+
+            # The editor ignores the disabled state, so it needs to be read-only too
+            cte.SetReadOnlyEnabled(context_editor.editor, busy)
+            @Disabled busy begin
+                ig.PushFont(state[].mono_font, 18f0)
+                cte.Render(context_editor.editor, "##context-editor")
+                ig.PopFont()
+            end
+        end
+        ig.End()
     end
 end
 
@@ -1812,68 +2059,14 @@ end
 
 default(value, default="") = something(value, default)
 
-# ImGui's GLFW backend (1.92.6+) remembers the last cursor it applied in a
-# single field shared by all viewports, so after the main window is updated
-# every secondary viewport window is skipped and never changes cursor. Apply
-# the frame's cursor to those windows ourselves. GLFW.jl's wrappers assert the
-# main thread, which the render loop isn't on, hence calling libglfw directly.
-const glfw_cursors = Dict{ig.ImGuiMouseCursor_, Ptr{Cvoid}}()
-const viewport_cursors = Dict{Ptr{Cvoid}, ig.ImGuiMouseCursor_}()
-
-function update_viewport_cursors()
-    cursor = ig.ImGuiMouseCursor_(ig.GetMouseCursor())
-    if cursor == ig.ImGuiMouseCursor_None || unsafe_load(ig.GetIO().MouseDrawCursor)
-        return
+# Consumes a pending state[].select_tab request for `tab`
+function tab_flags(tab::MainTab)
+    if state[].select_tab == tab
+        state[].select_tab = nothing
+        ig.ImGuiTabItemFlags_SetSelected
+    else
+        ig.ImGuiTabItemFlags_None
     end
-    if !haskey(glfw_cursors, cursor)
-        shape = if cursor == ig.ImGuiMouseCursor_TextInput
-            GLFW.IBEAM_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeAll
-            GLFW.RESIZE_ALL_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNS
-            GLFW.RESIZE_NS_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeEW
-            GLFW.RESIZE_EW_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNESW
-            GLFW.RESIZE_NESW_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_ResizeNWSE
-            GLFW.RESIZE_NWSE_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_Hand
-            GLFW.POINTING_HAND_CURSOR
-        elseif cursor == ig.ImGuiMouseCursor_NotAllowed
-            GLFW.NOT_ALLOWED_CURSOR
-        else
-            GLFW.ARROW_CURSOR
-        end
-        # Not every X11 cursor theme has the GLFW 3.4 shapes; like ImGui's
-        # backend, fall back to the arrow for those.
-        glfw_cursors[cursor] = try
-            @ccall GLFW.libglfw.glfwCreateStandardCursor(shape::Cint)::Ptr{Cvoid}
-        catch err
-            if !(err isa GLFW.GLFWError)
-                rethrow()
-            end
-            @ccall GLFW.libglfw.glfwCreateStandardCursor(GLFW.ARROW_CURSOR::Cint)::Ptr{Cvoid}
-        end
-    end
-
-    main_window = unsafe_load(ig.GetMainViewport().PlatformHandle)
-    viewports = unsafe_load(ig.GetPlatformIO().Viewports)
-    windows = Set{Ptr{Cvoid}}()
-    for i in 1:viewports.Size
-        window = unsafe_load(unsafe_load(viewports.Data, i).PlatformHandle)
-        if window == C_NULL || window == main_window
-            continue
-        end
-        push!(windows, window)
-        if !haskey(viewport_cursors, window) || viewport_cursors[window] != cursor
-            viewport_cursors[window] = cursor
-            @ccall GLFW.libglfw.glfwSetCursor(window::Ptr{Cvoid}, glfw_cursors[cursor]::Ptr{Cvoid})::Cvoid
-        end
-    end
-    # A closed window's address may be reused by a new one that starts out with
-    # the default cursor, so forget windows that are gone.
-    filter!(kv -> kv.first in windows, viewport_cursors)
 end
 
 function draw_gui()
@@ -1900,7 +2093,7 @@ function draw_gui()
         end
 
         ig.BeginTabBar("main-tab-bar")
-        if ig.BeginTabItem("Setup")
+        if ig.BeginTabItem("Setup", C_NULL, tab_flags(MainTab_Setup))
             ig.EndTabItem()
 
             initializing = client.status == RemoteStatus_Initializing
@@ -1919,39 +2112,72 @@ function draw_gui()
 
                 ig.Spacing()
 
-                if !state[].client.embedded_engine
+                if !state[].client.embedded_engine && ig.BeginTable("##connection-settings", 2, 0,
+                                                                    (ig.GetFontSize() * 40, 0f0))
+                    ig.TableSetupColumn("label", ig.ImGuiTableColumnFlags_WidthFixed)
+                    ig.TableSetupColumn("input", ig.ImGuiTableColumnFlags_WidthStretch)
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
                     ig.Text("Connect to node:")
-
-                    ig.SameLine()
-
-                    edited, new_address = SafeInputText("##client"; hint="exflonc24.desy.de",
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    edited, new_address = SafeInputText("##client"; hint="sa2-onc-mid.desy.de",
                                                         current_text=default(state[].address))
-
-                    ig.Text("Use environment:")
-                    ig.SameLine()
-                    env_edited, new_environment = SafeInputText("##engine-environment";
-                                                                current_text=default(state[].engine_environment))
-
-                    ig.Text("Working directory:")
-                    ig.SameLine()
-                    wd_edited, new_working_dir = SafeInputText("##engine-working-dir";
-                                                               current_text=default(state[].engine_working_dir))
-
-                    if edited
+                    if edited && new_address != state[].address
                         state[].address = new_address
+                        state[].jump_hops = nothing
                     end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("SSH jumps:")
+                    ig.TableNextColumn()
+                    draw_jump_hops_editor()
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Julia module:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    module_edited, new_module = SafeInputText("##julia-module";
+                                                              current_text=default(state[].julia_module))
+                    if module_edited
+                        state[].julia_module = new_module
+                    end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Use environment:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    env_edited, new_environment = SafeInputText("##engine-environment"; hint="(optional)",
+                                                                current_text=default(state[].engine_environment))
                     if env_edited
                         state[].engine_environment = new_environment
                     end
+
+                    ig.TableNextColumn()
+                    ig.AlignTextToFramePadding()
+                    ig.Text("Working directory:")
+                    ig.TableNextColumn()
+                    ig.SetNextItemWidth(-1)
+                    wd_edited, new_working_dir = SafeInputText("##engine-working-dir";
+                                                               current_text=default(state[].engine_working_dir))
                     if wd_edited
                         state[].engine_working_dir = new_working_dir
                     end
+
+                    ig.EndTable()
                 end
             end
 
             ig.Spacing()
 
             disable_connect = !can_connect || length(state[].address) == 0
+            if !client.embedded_engine && isnothing(state[].jump_hops)
+                disable_connect = true
+            end
             @Disabled disable_connect begin
                 if ig.Button("Connect")
                     client.cmd_output = ""
@@ -2025,49 +2251,49 @@ function draw_gui()
                     end
                 end
 
-                @Disabled client.remoterepl_status == RemoteReplStatus_Changing begin
-                    ig.Text("Remote REPL")
-                    ig.SameLine()
-                    if client.remoterepl_status == RemoteReplStatus_Changing
-                        Spinner()
-                    elseif ig.Checkbox("##remoterepl-mode", client.remoterepl_mode)
-                        set_remoterepl(state[])
-                    end
-                end
-
                 ig.Text("Use context file:")
                 ig.SameLine()
                 edited, new_context_path = SafeInputText("##context-file";
                                                          current_text=default(client.context_path))
                 if edited
                     client.context_path = new_context_path
+                    @guiasync check_context_path(client)
                 end
 
                 if !client.context_path_valid
-                    ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
+                    if !isempty(client.context_path)
+                        ig.TextColored(ImVec4(1, 0.2, 0.5, 1), "Path does not point to a valid file!")
+                        ig.SameLine()
+                    end
+                    ig.Text("(would you like to")
+                    ig.SameLine()
+                    if ig.SmallButton("initialize a context file")
+                        @guiasync begin
+                            initialize_context_file(client)
+                            load_context(state[])
+                            state[].select_tab = MainTab_Pipeline
+                        end
+                    end
+                    ig.SameLine(0, 0)
+                    ig.Text("?)")
                 end
 
-                ig.Dummy(0, 10)
+                ig.Dummy(0, 30)
 
                 draw_routing_rules()
             end
         end
 
         @Disabled client.status != RemoteStatus_Connected || isempty(client.context_path) begin
-            if ig.BeginTabItem("Analysis pipeline")
+            if ig.BeginTabItem("Analysis pipeline", C_NULL, tab_flags(MainTab_Pipeline))
                 draw_dag()
                 ig.EndTabItem()
             end
         end
 
         if state[].show_engine_logs
-            engine_log_flags = ig.ImGuiTabItemFlags_None
-            if state[].select_engine_logs
-                engine_log_flags |= ig.ImGuiTabItemFlags_SetSelected
-                state[].select_engine_logs = false
-            end
-            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, engine_log_flags)
-                draw_engine_logs()
+            if @c ig.BeginTabItem("Engine logs", &state[].show_engine_logs, tab_flags(MainTab_EngineLogs))
+                draw_logs(client.engine_logs)
                 ig.EndTabItem()
             end
         end
@@ -2082,6 +2308,9 @@ function draw_gui()
     # The Karabo source editor, opened by any inline KaraboDepText widget. Drawn
     # here at the top level so it escapes the node canvas and works from any tab.
     draw_karabo_editor(client)
+
+    draw_variable_logs(client)
+    draw_context_editor(client)
 
     # Display tooling windows
     for (window_sym, window_func) in [(:show_imgui_demo,     ig.ShowDemoWindow),
@@ -2102,8 +2331,47 @@ function draw_gui()
         save_settings(client)
         io.WantSaveIniSettings = false
     end
+end
 
-    update_viewport_cursors()
+function timestamped_metafmt(level, _module, group, id, file, line)
+    color, prefix, suffix = Base.CoreLogging.default_metafmt(level, _module, group, id, file, line)
+    ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    return color, "$(ts) $(prefix)", suffix
+end
+
+# glibc's struct mallinfo2
+struct Mallinfo2
+    arena::Csize_t
+    ordblks::Csize_t
+    smblks::Csize_t
+    hblks::Csize_t
+    hblkhd::Csize_t
+    usmblks::Csize_t
+    fsmblks::Csize_t
+    uordblks::Csize_t
+    fordblks::Csize_t
+    keepcost::Csize_t
+end
+
+function rss_mib()
+    rss = Ref{Csize_t}(0)
+    @ccall uv_resident_set_memory(rss::Ref{Csize_t})::Cint
+    return round(Int, rss[] / 2^20)
+end
+
+# malloc_trim() returns freed arena memory to the OS, so the RSS drop measures
+# how much of the RSS is memory retained by glibc rather than leaked.
+function log_memory_stats(client, trim::Bool)
+    mi = @ccall mallinfo2()::Mallinfo2
+    gc = Base.gc_num()
+    queued = sum(store -> Base.n_avail(store.updates), values(client.variable_data); init=0)
+    @info "Memory stats" rss_mib=rss_mib() live_mib=round(Int, Base.gc_live_bytes() / 2^20) malloc_used_mib=round(Int, mi.uordblks / 2^20) malloc_free_mib=round(Int, mi.fordblks / 2^20) malloc_arena_mib=round(Int, mi.arena / 2^20) malloc_mmap_mib=round(Int, mi.hblkhd / 2^20) full_sweeps=gc.full_sweep collections=gc.pause plots=length(client.plots) variables=length(client.variable_data) queued
+
+    if trim
+        rss_before = rss_mib()
+        elapsed = @elapsed @ccall malloc_trim(0::Csize_t)::Cint
+        @info "malloc_trim" rss_before rss_after=rss_mib() seconds=round(elapsed; digits=3)
+    end
 end
 
 """Start the XFA GUI."""
@@ -2118,12 +2386,18 @@ function setup_sentry(settings)
     end
 end
 
-function main(; test_engine=nothing)
+function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
     if !haskey(ENV, "XCURSOR_PATH")
         ENV["XCURSOR_PATH"] = "~/.icons:/usr/share/icons:/usr/share/pixmaps"
     end
+
+    # Append the logs to gui.log
+    mkpath(config_dir())
+    log_file = Filesystem.open(joinpath(config_dir(), "gui.log"), JL_O_WRONLY | JL_O_CREAT | JL_O_APPEND, 0o644)
+    Base.CoreLogging.global_logger(TeeLogger(Base.CoreLogging.ConsoleLogger(; meta_formatter=timestamped_metafmt),
+                                             Base.CoreLogging.ConsoleLogger(log_file; meta_formatter=timestamped_metafmt)))
 
     settings = load_settings()
     setup_sentry(settings)
@@ -2138,6 +2412,7 @@ function main(; test_engine=nothing)
     ig.StyleColorsDark()
     style = ig.GetStyle()
     style.FrameBorderSize = 1
+    style.FontScaleMain = gui_state.font_percent / 100
 
     # Load fonts
     font_config = ig.ImFontConfig()
@@ -2151,7 +2426,8 @@ function main(; test_engine=nothing)
         (joinpath(font_dir, "JuliaMono-Regular.ttf"), 16),
     ]
     for (font, font_size) in fonts
-        ig.AddFontFromFileTTF(font_atlas, font, font_size)
+        # This ends up as the last font, which must be monospaced for the context editor
+        gui_state.mono_font = ig.AddFontFromFileTTF(font_atlas, font, font_size)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
         ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, font_config)
     end
@@ -2188,7 +2464,11 @@ function main(; test_engine=nothing)
 
         # Clean up GPU heatmap resources before destroying contexts
         for plot in client.plots
-            close(plot)
+            for layer in plot.view.layers
+                if !isnothing(layer.image)
+                    close(layer.image)
+                end
+            end
         end
         destroy_heatmap_context!()
 
@@ -2200,13 +2480,15 @@ function main(; test_engine=nothing)
         close(gui_state)
     end
 
-    t = ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine) do
+    last_memory_log = Ref(0.0)
+    last_malloc_trim = Ref(time())
+    t =ig.render(imgui_ctx; on_exit, window_title="XFA", wait=false, spawn=true, engine=test_engine, fps_limit) do
         # Bake GL-backed resources on the first frame, once a GL context exists.
         if isnothing(gui_state.window_shadow)
             gui_state.window_shadow = build_window_shadow()
         end
 
-        if gui_state.disable_rendering
+        if !isnothing(gui_state.render_error)
             # Occasionally an exception will occur in the middle of a disabled
             # section, which helpfully also disables the continue button
             # below. So here we check if we're currently disabled and end it if
@@ -2215,20 +2497,33 @@ function main(; test_engine=nothing)
                 ig.igEndDisabled()
             end
 
-            ig.Text("Render loop crashed, continue when ready:")
+            message = gui_state.render_error
             @with state => gui_state draw_revise()
             ig.SameLine()
-            gui_state.disable_rendering = !ig.Button("Continue")
+            if ig.Button("Continue")
+                gui_state.render_error = nothing
+            end
+            ig.Text("Render loop crashed, continue when ready:")
+            BoxedText("##render-error", message)
             return
         end
 
         try
             @lock gui_state begin
+                if memory_log && time() - last_memory_log[] >= 60
+                    trim = time() - last_malloc_trim[] >= 30 * 60
+                    log_memory_stats(gui_state.client, trim)
+                    last_memory_log[] = time()
+                    if trim
+                        last_malloc_trim[] = time()
+                    end
+                end
                 @with state => gui_state @invokelatest draw_gui()
             end
         catch ex
-            @error "Error while rendering:" exception=(ex, catch_backtrace())
-            gui_state.disable_rendering = true
+            bt = catch_backtrace()
+            @error "Error while rendering:" exception=(ex, bt)
+            gui_state.render_error = sprint(showerror, ex, bt)
         end
     end
 

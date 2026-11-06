@@ -28,6 +28,12 @@ end
     PipelineStatus_Stopped
 end
 
+@enum MainTab begin
+    MainTab_Setup
+    MainTab_Pipeline
+    MainTab_EngineLogs
+end
+
 # This enum tracks the original type of the variables. We need to distinguish
 # this from how they're stored because both scalars and vectors are stored as
 # vectors.
@@ -182,7 +188,6 @@ end
     const clip_max::Ref{Cdouble} = Ref(1.0)
     const display_min::Ref{Cdouble} = Ref(0.0)
     const display_max::Ref{Cdouble} = Ref(1.0)
-    drag::Symbol = :none
     display_zoomed::Bool = false
 end
 
@@ -250,7 +255,6 @@ end
 # The curves of one of a spec's models, resampled when its parameters update.
 @kwdef struct ViewModel
     overlay::ModelOverlay
-    xs::Vector{Float64} = Float64[]
     curves::Vector{PlotType} = PlotType[]
 end
 
@@ -344,6 +348,7 @@ end
     const log_y::Ref{Bool} = Ref(false)
     const show_side_panel::Ref{Bool} = Ref(false)
     dock_id::UInt32 = 0
+    error::Maybe{String} = nothing
 end
 
 ### GUI state types
@@ -361,12 +366,6 @@ struct DeviceProperties
     fast::Dict{String, PropertyList}
 end
 DeviceProperties() = DeviceProperties(PropertyList(), Dict{String, PropertyList}())
-
-@enum RemoteReplStatus begin
-    RemoteReplStatus_Running
-    RemoteReplStatus_Changing
-    RemoteReplStatus_Stopped
-end
 
 @kwdef mutable struct KaraboDepTextState
     # Working copies of the source/property/proxy fields while the editor window
@@ -387,6 +386,9 @@ end
     # topic-filtered) source list to complete against.
     label::String = ""
     source_list::Vector{SourceInfo} = SourceInfo[]
+    device_classes::Vector{String} = String[]
+    qualify_topics::Bool = false
+    initial_source::String = ""
     device_only::Bool = false
     allow_slow::Bool = true
     # One-shot flag to open/focus the window on its first drawn frame.
@@ -452,6 +454,7 @@ end
 
 @kwdef mutable struct ElidedTextState
     edit::ElidedEditState = ElidedEditState_NoEdit
+    edit_text::String = ""
     selected_idx::Int = 1
     cached_query::String = ""
     cached_source::String = ""
@@ -532,6 +535,7 @@ end
 @kwdef mutable struct SshState
     address::String
     port::Int = 22
+    user::Maybe{String} = nothing
 
     auth_state::Any = nothing
     auth_method::Maybe{ssh.AuthMethod} = nothing
@@ -575,6 +579,18 @@ struct OutputPin
 end
 OutputPin(id, label) = OutputPin(id, label, false)
 
+@kwdef struct PostprocessorInfo
+    id::UInt
+    name::String
+    var_name::String
+    var_postprocessors::Vector{String}
+    display_name::String
+    tree_id_suffix::String
+    plot_id::String
+    params::Dict{String, Any}
+    origin::String
+end
+
 # An input pin of a node: a variable argument or, for groups, a
 # Parameter{Dependency} field (`field` is then the constructor kwarg rewritten
 # in source). Readonly pins are engine-managed and drawn disabled.
@@ -606,6 +622,7 @@ end
     context_state::Dict{String, Any} = Dict()
     context_path::String = ""
     source::String = ""
+    input_topics::Dict{String, Union{String, Nothing}} = Dict()
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 
@@ -650,13 +667,36 @@ struct PendingRequest
     sent_at::Float64
 end
 
-struct EngineLog
-    timestamp::Float64
-    message::String
-    extra_details::Maybe{String}
+@kwdef mutable struct VariableLogs
+    records::CircularBuffer{Protocol.LogRecord} = CircularBuffer{Protocol.LogRecord}(100)
+    # Errors received while the log window was closed
+    unseen_errors::Int = 0
+    window_open::Bool = false
 end
 
-EngineLog(message::String, extra_details::Maybe{String}=nothing) = EngineLog(time(), message, extra_details)
+mutable struct ContextEditor
+    editor::TextEditor
+    window_open::Bool
+    # Text read by a background task, picked up by the render thread on the next
+    # frame since the editor isn't thread-safe.
+    pending_text::Maybe{String}
+    # The context source the editor last followed, for detecting local changes
+    synced_source::String
+    disk_changed::Bool
+    busy::Bool
+end
+
+function ContextEditor()
+    editor = TextEditor()
+    cte.SetLanguage(editor, cte.Language_Julia())
+    cte.SetPalette(editor, cte.GetDarkPalette())
+    cte.SetShowWhitespacesEnabled(editor, false)
+    cte.SetInsertSpacesOnTabs(editor, true)
+    cte.SetTabSize(editor, 4)
+    cte.SetAutoCompleteConfig(editor, cte.Completions(REPLCompleter(; symbols_only=true), cte.DocumentCompleter()))
+
+    ContextEditor(editor, false, nothing, "", false, false)
+end
 
 # Per-variable subscription state. `count` tracks open plots referencing the
 # variable; when it drops to zero we flip `active` off (so the engine stops
@@ -703,6 +743,7 @@ end
     ws_forwarder::Maybe{ssh.Forwarder} = nothing
     remote_engine_dir::String = ""
     remote_context_dir::String = ""
+    remote_working_dir::String = ""
 
     cmd_output::String = ""
     last_error::String = ""
@@ -710,13 +751,11 @@ end
     embedded_engine::Bool = false
     engine::Maybe{EngineState} = nothing
 
-    remoterepl_mode::Ref{Bool} = Ref(false)
-    remoterepl_status::RemoteReplStatus = RemoteReplStatus_Stopped
-
     # Context file and pipeline
     context_path::String = ""
     context_path_valid::Bool = true
     context::ContextState = ContextState()
+    context_editor::ContextEditor = ContextEditor()
 
     available_variables::Vector{VariableSpec} = VariableSpec[]
     # Nodes being assembled in the add-variable flow, not yet written to source.
@@ -726,7 +765,11 @@ end
 
     ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     ne_editor_path::String = ""
-    ne_node_content_widths::Dict{UInt, Float32} = Dict{UInt, Float32}()
+    # User-set node widths keyed by variable name, and the right edge of the node
+    # being drawn so parameter widgets can fill up to it.
+    ne_node_widths::Dict{String, Float32} = Dict{String, Float32}()
+    ne_node_right::Float32 = 0f0
+    ne_resize_min::Float32 = 0f0
     ne_settings::String = ""
 
     # Pin registries for link dragging, keyed by pin id. Pins that can't take part
@@ -746,11 +789,9 @@ end
 
     # Karabo status
     trainmatchers::Dict{String, Vector{String}} = Dict()
-    # The trainmatchers as a source list, which is what Parameter{KaraboDevice}
-    # (i.e. an input's trainmatcher) is completed against.
-    trainmatcher_sources::Vector{SourceInfo} = SourceInfo[]
-    whitelisted_trainmatchers::Set{KaraboDevice} = Set{KaraboDevice}()
-    trainmatchers_request_status::RequestStatus = RequestStatus_Idle
+    device_list::Vector{SourceInfo} = SourceInfo[]
+    whitelisted_devices::Set{KaraboDevice} = Set{KaraboDevice}()
+    devices_request_status::RequestStatus = RequestStatus_Idle
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     routing_rules_request_status::RequestStatus = RequestStatus_Idle
     routing_rules_set_request::Maybe{Int} = nothing
@@ -803,9 +844,9 @@ end
     # the decompression scratch buffers don't get resized on every payload.
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
-    # Engine log messages
-    engine_logs::Vector{EngineLog} = EngineLog[]
-    log_dateformat::Dates.DateFormat = dateformat"yyyy-mm-dd HH:MM:SS"
+    # Engine log messages, with consecutive repeats merged
+    engine_logs::CircularBuffer{Protocol.LogRecord} = CircularBuffer{Protocol.LogRecord}(500)
+    variable_logs::Dict{String, VariableLogs} = Dict{String, VariableLogs}()
 
     # Message tracking
     pending_requests::Dict{Int, PendingRequest} = Dict()
@@ -893,10 +934,12 @@ struct WindowShadow
 end
 
 @kwdef mutable struct GuiState
-    disable_rendering::Bool = false
+    render_error::Maybe{String} = nothing
 
     # Baked drop-shadow for the Karabo source editor, built on first use.
     window_shadow::Maybe{WindowShadow} = nothing
+    mono_font::Ptr{ig.lib.ImFont} = C_NULL
+    font_percent::Cint = Cint(100)
 
     # Showing external tool windows
     show_imgui_demo::Bool = false
@@ -907,13 +950,17 @@ end
     show_debug_log::Bool = false
     show_state_inspector::Bool = false
     show_engine_logs::Bool = false
-    select_engine_logs::Bool = false
+    select_tab::Maybe{MainTab} = nothing
 
     # Connections to remote things
-    address::String = "wrigleyj@exflonc202.desy.de"
+    address::String = "$(Sys.username())@sa2-onc-mid.desy.de"
+    # SSH jump hosts in front of `address`, `nothing` until auto-detected
+    jump_hops::Maybe{Vector{String}} = nothing
+    detecting_jump_hops::Bool = false
     client::ClientState = ClientState()
-    engine_environment::String = "@xfa-default"
-    engine_working_dir::String = "/scratch/xfa"
+    julia_module::String = "exfel xfa"
+    engine_environment::String = ""
+    engine_working_dir::String = "~/xfa"
     client_type_current_item::Cint = Cint(0)
 
     # Plot layout persistence, keyed by context path
@@ -926,18 +973,20 @@ function GuiState(settings::Dict; kwargs...)
     gui = get(settings, "GuiState", Dict{String, Any}())
     client_settings = get(settings, "ClientState", Dict{String, Any}())
 
-    address = get(gui, "address", "wrigleyj@exflonc202.desy.de")
-    engine_environment = get(gui, "engine_environment", "@xfa-default")
-    engine_working_dir = get(gui, "engine_working_dir", "/scratch/xfa")
+    address = get(gui, "address", "$(Sys.username())@sa2-onc-mid.desy.de")
+    julia_module = get(gui, "julia_module", "exfel xfa")
+    engine_environment = get(gui, "engine_environment", "")
+    engine_working_dir = get(gui, "engine_working_dir", "~/xfa")
     client_type_current_item = Cint(get(gui, "client_type", 0))
+    font_percent = Cint(get(gui, "font_percent", 100))
     saved_contexts = Dict{String, Dict{String, Any}}(
         k => Dict{String, Any}(v) for (k, v)
             in get(client_settings, "contexts", Dict()))
 
     client = ClientState(settings; embedded_engine = client_type_current_item == 1)
 
-    GuiState(; address, engine_environment, engine_working_dir,
-             client_type_current_item, saved_contexts, client, kwargs...)
+    GuiState(; address, julia_module, engine_environment, engine_working_dir,
+             client_type_current_item, font_percent, saved_contexts, client, kwargs...)
 end
 
 function Base.setproperty!(state::GuiState, sym::Symbol, x)

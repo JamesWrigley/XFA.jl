@@ -185,7 +185,8 @@ end
 
     # A model fit drawn over the spec's layers
     fit = Context.ModelOverlay(:gaussian; params="spectrum.fit")
-    @test fit == Context.ModelOverlay(Context.ModelFunction_Gaussian, "spectrum.fit", nothing)
+    @test fit == Context.ModelOverlay(Context.ModelFunction_Gaussian, "spectrum.fit", nothing, false)
+    @test_throws "only supported for linear" Context.ModelOverlay(:gaussian; params="a", to_x_intercept=true)
     @test PlotSpec("fits", ["spectrum"]; models=[fit]).models == [fit]
     @test_throws "unsupported model function" Context.ModelOverlay(:lorentzian; params="a")
 
@@ -193,7 +194,17 @@ end
     own = PlotSpec("own", [LayerSpec(; color=:pulseId), LayerSpec(; data="baseline")]; models=[fit])
     bound = only(Context.wrap_result(VariableData(; data=1, plot_specs=own), 1, "spectra").plot_specs)
     @test [layer.data for layer in bound.layers] == ["spectra", "baseline"]
-    @test Context.bind_variable(bound, "other") === bound
+    @test Context.bind_variable(bound, "other") == bound
+
+    # ImageAsLines draws the advertising variable, one of its subvariables, or another variable
+    lines_data(; kwargs...) = only(Context.bind_variable(ImageAsLines("lines"; x=:X, kwargs...), "spectra").layers).data
+    @test lines_data() == "spectra"
+    @test lines_data(; subvariable="bg") == "spectra.bg"
+    @test lines_data(; variable="other") == "other"
+    @test lines_data(; variable="other", subvariable="bg") == "other.bg"
+    # A named x leaves the color to the client, a positional one names the other dim
+    @test only(ImageAsLines("lines"; x=:X).layers).color.field == ""
+    @test only(ImageAsLines("lines"; x=2).layers).color.field == "row"
     @test PlotSpec("own"; ylabel="counts") == PlotSpec("own", [LayerSpec()]; ylabel="counts")
     @test VariableData(1; plot_specs=own) == VariableData(; data=1, plot_specs=[own])
 
@@ -421,10 +432,10 @@ end
     correlation = by_name["Correlation"]
     @test correlation.kind == Context.VariableKind_Group
     @test correlation.group_parameters[:x] isa Parameter{Dependency}
-    @test correlation.group_parameters[:buffer_size].value == 10_000
+    @test correlation.group_parameters[:trains].value == 10_000
     @test !haskey(correlation.group_parameters, :histogram)
     # Handlers are stripped for wire safety.
-    @test isnothing(correlation.group_parameters[:buffer_size].update_handler)
+    @test isnothing(correlation.group_parameters[:trains].update_handler)
 
     # A @Group backing an @Input is reported as an input, not a plain group.
     testsource = by_name["TestSource"]
@@ -447,14 +458,18 @@ end
 
     @Variable function foo(data -> karabo"foo.bar")
         @postprocess(TestWindow(; size=2))
-        @postprocess("avg", TestMean())
+        @postprocess(TestMean(); name="avg")
+        @postprocess "double" TestMean()
+        @postprocess "window" TestMean() name="wmean"
+        @add_subvariable("double", data .* 2)
         return data
     end
     """)
-    @test Set(ctx.subvariables["foo"]) == Set(["foo.avg", "foo.window"])
+    pp_names = ["foo.window", "foo.avg", "foo.double.mean", "foo.window.wmean"]
+    @test issetequal(ctx.subvariables["foo"], ["foo.double"; pp_names])
     @test ctx.parameters["foo.window.size"][] == 2
-    @test issetequal(["foo.avg", "foo.window"], keys(ctx.postprocessors))
-    @test ctx.variable_postprocessors["foo"] == ["foo.window", "foo.avg"]
+    @test issetequal(pp_names, keys(ctx.postprocessors))
+    @test ctx.variable_postprocessors["foo"] == pp_names
 
     Context.run(ctx) do
         @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
@@ -462,6 +477,23 @@ end
     result = take!(ctx.stream_output)
     @test result.subvariables["foo.window"] == VariableData(0, "foo.window", [1, 2])
     @test result.subvariables["foo.avg"] == VariableData(0, "foo.avg", 2.0)
+    @test result.subvariables["foo.double.mean"] == VariableData(0, "foo.double.mean", 4.0)
+    @test result.subvariables["foo.window.wmean"] == VariableData(0, "foo.window.wmean", 1.5)
+
+    # Sources must be known subvariables, and only a `name` keyword is supported
+    @test_throws "unknown source subvariable" Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestMean
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess "missing" TestMean()
+        return data
+    end
+    """)
+    @test_throws "`name` keyword" Context._variable(@__MODULE__, quote
+        function foo(data -> karabo"foo.bar")
+            @postprocess TestMean() size=2
+            return data
+        end
+    end, false)
 
     # Changing a postprocessor parameter should update its value, invoke the
     # update handler with the postprocessor object, and affect subsequent runs.
@@ -1252,7 +1284,11 @@ end
     @testset "Topological sort" begin
         # Test sorting a DAG with a cycle
         dag = Dict("foo" => ["bar"], "bar" => ["foo"])
-        @test_throws XfaContextException Context.topological_sort(dag)
+        @test_throws r"cycle" Context.topological_sort(dag)
+
+        # Unknown dependencies are reported as such rather than as a cycle
+        dag = Dict("foo" => [Dependency("bar")])
+        @test_throws r"'foo' depends on unknown variable 'bar'" Context.topological_sort(dag)
 
         # Sort an empty DAG
         @test Context.topological_sort(Dict("foo" => [])) == ["foo"]
@@ -1701,6 +1737,28 @@ end
         end
         @test take!(ctx.stream_output) == VariableData(0, "motor_pos", 42)
     end
+
+    @testset "Stopping skips the backlog" begin
+        # A slow leaf variable with a full backlog should stop after its current train
+        ctx = Context.load_from_string(raw"""
+        @Input function input(::Context.MockInput, output)
+            for tid in 1:50
+                put!(output, (tid, Dict("det" => Dict("value" => tid))))
+            end
+        end
+        x = Context.MockInput()
+
+        @Variable function slow(value -> karabo"det.value")
+            sleep(0.2)
+            return value
+        end
+        """)
+
+        Context.start_pipeline(ctx)
+        @test timedwait(() -> isready(ctx.stream_output), 5) == :ok
+        @test @elapsed(Context.stop_pipeline(ctx)) < 1
+        @test count(v -> v.name == "slow", ctx.stream_output) < 5
+    end
 end
 
 @testset "Pipeline drops" begin
@@ -1983,7 +2041,25 @@ end
         @test length(scn.binner.history) == 1
     end
 
+    @testset "IndexSelection" begin
+        @test IndexSelection("1-3").indices == [1, 2, 3]
+        @test IndexSelection("8, 1 , 5,").indices == [1, 5, 8]
+        @test IndexSelection("50, 1 - 3, 2, 51").indices == [1, 2, 3, 50, 51]
+        @test isempty(IndexSelection("").indices)
+        @test string(IndexSelection("50, 1-10, 51, 60")) == "1-10, 50, 51, 60"
+        @test_throws ArgumentError IndexSelection("1-x")
+        @test_throws ArgumentError IndexSelection("5-1")
+    end
+
     @testset "Correlation" begin
+        runcorr(corr, x, y) = begin
+            subvars = Dict{String, Any}()
+            out = Base.ScopedValues.@with(Context.Meta.name => "correlate",
+                                          Context.Meta.subvariables => subvars,
+                                          Context.correlate(corr, x, y))
+            (out, subvars)
+        end
+
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
 
         # compute_edges: empty samples → [-1,1]; otherwise min/max range
@@ -1996,53 +2072,73 @@ end
         @test Context.compute_edges(Context.pulse_samples([cb1, cb2], []), 4) == 1:24.75:100
 
         # Parameter update handlers should trigger rebuilding
-        for handler in (corr.buffer_size.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
+        for handler in (corr.trains.update_handler, corr.nbins.update_handler, corr.pulses.update_handler)
             corr.rebuild_histogram = false
             handler(corr, nothing)
             @test corr.rebuild_histogram
         end
 
-        # update_buffer_size resizes existing buffers and invalidates
+        # resize_buffers resizes existing buffers and invalidates
         push!(corr.x_buffers, CircularBuffer{Float64}(10))
         push!(corr.y_buffers, CircularBuffer{Float64}(10))
         corr.rebuild_histogram = false
-        Context.update_buffer_size(corr, 500)
+        Context.resize_buffers(corr, 500)
         @test capacity(corr.x_buffers[1]) == 500
         @test capacity(corr.y_buffers[1]) == 500
         @test corr.rebuild_histogram
 
-        # Scalar inputs allocate a single per-pulse buffer at buffer_size
+        # Scalar inputs allocate a single per-pulse buffer holding `trains` trains
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
         corr.nbins[] = 10
-        corr.buffer_size[] = 50
-        Context.correlate(corr, 1.0, 2.0)
+        corr.trains[] = 50
+        runcorr(corr, 1.0, 2.0)
         @test length(corr.x_buffers) == 1
         @test capacity(corr.x_buffers[1]) == 50
         @test binedges(corr.histogram)[1] == -1:0.2:1
 
         # Vector inputs create one buffer per pulse; shrinking pops the extras
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
-        Context.correlate(corr, [1.0, 2.0], [10.0, 20.0])
+        runcorr(corr, [1.0, 2.0], [10.0, 20.0])
         @test length(corr.x_buffers) == 2
-        Context.correlate(corr, [3.0], [30.0])
+        runcorr(corr, [3.0], [30.0])
         @test length(corr.x_buffers) == 1
 
         # Changing nbins rebuilds the histogram with the new bin count
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
         corr.nbins[] = 10
-        Context.correlate(corr, 1.0, 2.0)
+        runcorr(corr, 1.0, 2.0)
         @test length(binedges(corr.histogram)[1]) == 11
         corr.nbins[] = 20
         corr.rebuild_histogram = true
-        Context.correlate(corr, 2.0, 3.0)
+        runcorr(corr, 2.0, 3.0)
         @test length(binedges(corr.histogram)[1]) == 21
 
         # `pulses` restricts which pulses contribute to edges and counts
         corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
-        corr.pulses[] = [1]
-        Context.correlate(corr, [1.0, 999.0], [2.0, 999.0])
+        corr.pulses[] = IndexSelection([1])
+        runcorr(corr, [1.0, 999.0], [2.0, 999.0])
         @test last(binedges(corr.histogram)[1]) ≤ 1.0
         @test sum(bincounts(corr.histogram)) == 1
+
+        # Selecting more pulses than there are uses the ones present
+        corr.pulses[] = IndexSelection([1, 2])
+        corr.fit[] = true
+        corr.rebuild_histogram = true
+        _, subvars = runcorr(corr, [3.0], [4.0])
+        @test sum(bincounts(corr.histogram)) == 2
+        @test subvars["correlate.fit"] ≈ [1.0, 1.0, 1.0]
+
+        # Non-finite pairs are dropped, and the fit only runs when enabled
+        corr = Context.Correlation(; x=karabo"foo.bar", y=karabo"foo.baz")
+        out, subvars = runcorr(corr, [1.0, NaN], [3.0, 1.0])
+        @test isnothing(subvars["correlate.fit"]) && isempty(out.plot_specs)
+        @test length(corr.x_buffers[2]) == 0
+        corr.fit[] = true
+        for x in 2.0:4.0
+            out, subvars = runcorr(corr, [x, Inf], [2x + 1, 1.0])
+        end
+        @test subvars["correlate.fit"] ≈ [2.0, 1.0, 1.0]
+        @test only(only(out.plot_specs).models).params == "correlate.fit"
     end
 
     @testset "Histogram1D" begin
@@ -2154,16 +2250,14 @@ end
     stack = rand(2, 2, 3)
     @test isequal(Context.assemble(asm, [stack[:, 1, :], stack[:, 2, :]]), Context.assemble(asm, stack))
 
-    # ReTest may run this body on a migrated task, so hold the GIL around all
-    # the PythonCall work to avoid calling into CPython without it.
-    PythonCall.GIL.@lock begin
+    # XfaEngine works with dim-reversed arrays (e.g. (nfs, nss, nmod) rather
+    # than numpy's (nmod, nss, nfs)), so flip dimensions when crossing to or
+    # from extra-geom's numpy arrays.
+    revdims(a) = permutedims(a, ndims(a):-1:1)
+
+    @pyregion begin
         eg = pyimport("extra_geom")
         python = pyconvert(String, pyimport("sys").executable)
-
-        # XfaEngine works with dim-reversed arrays (e.g. (nfs, nss, nmod) rather
-        # than numpy's (nmod, nss, nfs)), so flip dimensions when crossing to or
-        # from extra-geom's numpy arrays.
-        revdims(a) = permutedims(a, ndims(a):-1:1)
 
         # For each detector, check assembly matches extra-geom's own
         # position_modules_fast pixel for pixel (gaps included). ePix100 and
@@ -2184,6 +2278,11 @@ end
                     (cls.from_crystfel_geom(geomfile), Context.AssemblerLUT(name; geom_file=geomfile, python))
                 end
                 nmod, nss, nfs = pyconvert(Tuple{Int, Int, Int}, loaded.expected_data_shape)
+
+                # Building from the geometry object directly matches the script
+                from_geom = Context.AssemblerLUT(loaded)
+                @test from_geom.lut == asm.lut
+                @test from_geom.frame_size == asm.frame_size
 
                 # Test single frame
                 frame = rand(nfs, nss, nmod)
@@ -2313,16 +2412,16 @@ end
         end
 
         @Variable itime_proxied -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime@proxy:output"
+
+        @Variable absent -> karabo"NOT/A/DEVICE.foo"
         """)
 
         mktempdir() do dir
-            dc = PythonCall.GIL.@lock begin
-                pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
-                pyimport("extra_data").RunDirectory(dir)
-            end
+            pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
+            dc = pyimport("extra_data").RunDirectory(dir)
 
             # The type check rejects a Py object that isn't a DataCollection
-            @test_throws ArgumentError Context.run(ctx, PythonCall.GIL.@lock(pylist([1, 2, 3])))
+            @test_throws ArgumentError Context.run(ctx, pylist([1, 2, 3]))
 
             # Test returning scalars
             r = Context.run(ctx, dc; select=["double"])
@@ -2346,19 +2445,24 @@ end
             @test parent(r1["module0"]) == parent(r["module0"])
 
             # Unwrapping aliases the numpy memory and rejects non-contiguous arrays
-            arr = PythonCall.GIL.@lock pyconvert(DimArray, dc["SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "integrationTime.value"].xarray(); copy=false)
+            arr = pyconvert(DimArray, dc["SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "integrationTime.value"].xarray(); copy=false)
             unwrapped = Context.unwrap_python(arr)
             @test parent(unwrapped) isa Vector && pointer(parent(unwrapped)) == parent(arr).ptr
             @test parent(lookup(unwrapped, :trainId)) isa Vector && lookup(unwrapped, :trainId) == lookup(arr, :trainId)
             viewed = Context.unwrap_python(@view arr[1:3])
             @test parent(viewed) isa SubArray{<:Any, 1, <:Vector} && viewed == arr[1:3]
-            strided = PythonCall.GIL.@lock PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
+            strided = PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
             @test_throws ArgumentError Context.unwrap_python(strided)
 
             # Test that proxied dependencies are ignored
             r = Context.run(ctx, dc; select=["itime_proxied"])
             @test keyset(r) == Set(["itime_proxied"])
             @test all(==(15), r["itime_proxied"])
+
+            # Dependencies missing from the run are skipped
+            r = @test_logs (:warn, r"aren't in the run") match_mode=:any Context.run(ctx, dc; select=["itime", "absent"])
+            @test keyset(r) == Set(["itime"])
+            @test length(r["itime"]) == 100
 
             devices = Context.data_collection_devices(dc)
             @test ("SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "") in devices
@@ -2373,28 +2477,44 @@ end
     end
 end
 
-@testset "@pysafe" begin
+@testset "Python in variables" begin
+    # Variables run on pipeline tasks and call Python with no wrapper; a Python
+    # error fails the variable like any other exception.
     ctx = Context.load_from_string(raw"""
     using PythonCall
 
     @Variable foo -> karabo"camera.data"
     @Variable function root(x -> foo)
-        @pysafe begin
-            math = pyimport("math")
-            y = pyconvert(Float64, math.sqrt(x))
-        end
-        # Assignments stay in the enclosing scope
-        y + (@pysafe pyconvert(Float64, math.floor(0.5)))
+        pyconvert(Float64, pyimport("math").sqrt(x))
     end
     """)
     vals = Dict("camera.data" => DimArray([1, 4, 9], (Dim{:trainId}([10, 11, 12]),)))
+    @test collect(Context.run(ctx, vals)["root"]) == [1.0, 2.0, 3.0]
 
-    # The test thread holds the GIL, which the pipeline's tasks need
-    r = PythonCall.GIL.unlock(() -> Context.run(ctx, vals))
-    @test collect(r["root"]) == [1.0, 2.0, 3.0]
+    vals = Dict("camera.data" => DimArray([-1], (Dim{:trainId}([10]),)))
+    @test_logs (:error, r"Execution of variable 'root' failed") match_mode=:any Context.run(ctx, vals)
 
-    # Python exceptions are rendered as plain errors
-    @test_throws "math domain error" Context.@pysafe pyimport("math").sqrt(-1)
+    ctx = Context.load_from_string(raw"""
+    using PythonCall
+
+    @Variable foo -> karabo"camera.data"
+    @Variable function arrays(x -> foo)
+        np = pyimport("numpy")
+        @add_subvariable("xr", pyimport("xarray").DataArray(np.zeros((2, 3)); dims=("a", "b")))
+        @add_subvariable("scalar", np.float64(x))
+        np.arange(6).reshape(2, 3)
+    end
+    @Variable function bad(x -> foo)
+        pylist([x])
+    end
+    """)
+    vals = Dict("camera.data" => DimArray([1], (Dim{:trainId}([10]),)))
+    r = @test_logs (:error, r"Execution of variable 'bad' failed") match_mode=:any Context.run(ctx, vals)
+    @test r["arrays"][:, :, 1] == [0 3; 1 4; 2 5]
+    @test size(r["arrays.xr"]) == (3, 2, 1)
+    @test hasdim(r["arrays.xr"], :b)
+    @test r["arrays.scalar"] == [1.0]
+    @test !haskey(r, "bad")
 end
 
 end

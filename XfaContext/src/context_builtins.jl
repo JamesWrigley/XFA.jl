@@ -32,9 +32,11 @@ end
 ## Correlation group
 
 @Group mutable struct Correlation
-    buffer_size::Parameter{Int} = Parameter(update_buffer_size, 10_000)
+    trains::Parameter{Int} = Parameter(resize_buffers, 10_000)
     nbins::Parameter{Int} = Parameter(invalidate_histogram, 100)
-    pulses::Parameter{Vector{Int}} = Parameter(invalidate_histogram, Int[])
+    pulses::Parameter{IndexSelection} = Parameter(invalidate_histogram, IndexSelection())
+    fit::Parameter{Bool} = Parameter(false)
+    clear::Callback = Callback("Clear", clear_buffers)
     x::Parameter{Dependency}
     y::Parameter{Dependency}
 
@@ -51,7 +53,7 @@ function Base.show(io::IO, corr::Correlation)
     print(io, Correlation, "(x=$(x), y=$(y))")
 end
 
-function update_buffer_size(corr::Correlation, value)
+function resize_buffers(corr::Correlation, value)
     for buf in corr.x_buffers
         resize!(buf, value)
     end
@@ -61,12 +63,18 @@ function update_buffer_size(corr::Correlation, value)
     invalidate_histogram(corr, nothing)
 end
 
+function clear_buffers(corr::Correlation)
+    foreach(empty!, corr.x_buffers)
+    foreach(empty!, corr.y_buffers)
+    invalidate_histogram(corr, nothing)
+end
+
 function invalidate_histogram(corr::Correlation, _)
     corr.rebuild_histogram = true
 end
 
 function compute_edges(samples, nbins)
-    lo, hi = floatmax(), floatmin()
+    lo, hi = Inf, -Inf
     any_seen = false
     for x in samples
         if !isfinite(x)
@@ -86,20 +94,24 @@ function compute_edges(samples, nbins)
     return range(lo, hi; length=nbins + 1)
 end
 
+# The selected pulses that are present in `buffers`, all of them if none are
+# selected.
+function active_pulses(buffers, pulses)
+    isempty(pulses) ? eachindex(buffers) : intersect(pulses, eachindex(buffers))
+end
+
 # Flatten the active pulses of a per-pulse buffer list into a single iterator
 # of samples, for feeding into compute_edges.
 function pulse_samples(buffers::Vector{CircularBuffer{Float64}}, pulses)
-    idxs = isempty(pulses) ? eachindex(buffers) : pulses
-    Iterators.flatten(buffers[i] for i in idxs if i <= length(buffers))
+    Iterators.flatten(buffers[i] for i in active_pulses(buffers, pulses))
 end
 
 function build_histogram(corr::Correlation)
-    binedges = (compute_edges(pulse_samples(corr.x_buffers, corr.pulses[]), corr.nbins[]),
-                compute_edges(pulse_samples(corr.y_buffers, corr.pulses[]), corr.nbins[]))
+    binedges = (compute_edges(pulse_samples(corr.x_buffers, corr.pulses[].indices), corr.nbins[]),
+                compute_edges(pulse_samples(corr.y_buffers, corr.pulses[].indices), corr.nbins[]))
     corr.histogram = Hist2D(; binedges, overflow=true)
 
-    pulses = isempty(corr.pulses[]) ? eachindex(corr.x_buffers) : corr.pulses[]
-    for i in pulses
+    for i in active_pulses(corr.x_buffers, corr.pulses[].indices)
         for (x, y) in zip(corr.x_buffers[i], corr.y_buffers[i])
             push!(corr.histogram, x, y)
         end
@@ -107,6 +119,24 @@ function build_histogram(corr::Correlation)
 
     corr.rebuild_histogram = false
     corr.last_edge_update = time()
+end
+
+function linear_fit(corr::Correlation)
+    pulses = active_pulses(corr.x_buffers, corr.pulses[].indices)
+    xs = reduce(vcat, (corr.x_buffers[i] for i in pulses); init=Float64[])
+    ys = reduce(vcat, (corr.y_buffers[i] for i in pulses); init=Float64[])
+
+    if length(xs) < 2
+        return nothing
+    else
+        sol = solve(CurveFitProblem(xs, ys), LinearCurveFitAlgorithm())
+        if successful_retcode(sol.retcode)
+            r2 = 1 - rss(sol) / sum(abs2, ys .- nanmean(ys))
+            return [sol.u..., r2]
+        else
+            return nothing
+        end
+    end
 end
 
 # Correlate two vector-valued variables by accumulating their points in
@@ -129,8 +159,8 @@ end
     # Adjust the internal buffers to the number of pulses
     if length(corr.x_buffers) < n_pulses
         while length(corr.x_buffers) < n_pulses
-            push!(corr.x_buffers, CircularBuffer{Float64}(corr.buffer_size[]))
-            push!(corr.y_buffers, CircularBuffer{Float64}(corr.buffer_size[]))
+            push!(corr.x_buffers, CircularBuffer{Float64}(corr.trains[]))
+            push!(corr.y_buffers, CircularBuffer{Float64}(corr.trains[]))
         end
     elseif length(corr.x_buffers) > n_pulses
         while length(corr.x_buffers) > n_pulses
@@ -150,12 +180,26 @@ end
     end
 
     for i in 1:n_pulses
+        if !isfinite(x[i]) || !isfinite(y[i])
+            continue
+        end
+
         push!(corr.x_buffers[i], x[i])
         push!(corr.y_buffers[i], y[i])
 
-        if isempty(corr.pulses[]) || i ∈ corr.pulses[]
+        if isempty(corr.pulses[].indices) || i ∈ corr.pulses[].indices
             push!(corr.histogram, x[i], y[i])
         end
+    end
+
+    # [slope, intercept, R^2]
+    fit = corr.fit[] ? linear_fit(corr) : nothing
+    @add_subvariable("fit", fit)
+    plot_specs = if isnothing(fit)
+        PlotSpec[]
+    else
+        overlay = ModelOverlay(:linear; params="$(Meta.name[]).fit", title="linear fit", to_x_intercept=true)
+        [PlotSpec("fit", [LayerSpec(; mark=:image)]; models=[overlay], fixed_aspect=false)]
     end
 
     # Transform histogram weights (indexed [x_bin, y_bin]) into image-style
@@ -166,7 +210,7 @@ end
     return VariableData(; data,
                         x_axis=collect(xe), y_axis=collect(ye),
                         xlabel=corr.x.value.name, ylabel=corr.y.value.name,
-                        fixed_aspect=false, compress=false)
+                        fixed_aspect=false, compress=false, plot_specs)
 end
 
 ## Histogram1D
@@ -470,7 +514,8 @@ end
     # Optional so the pipeline can start before a scantool has assigned a motor.
     position1::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
     position2::Parameter{Dependency} = Parameter{Dependency}(; optional=true)
-    scantool::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; update_handler=scantool_changed, optional=true)
+    scantool::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; update_handler=scantool_changed, optional=true,
+                                                                                      filter_device_classes=["Karabacon"])
     # The motors' position property. Karabacon's motor interfaces differ here
     # (e.g. slits use actualPositionX, monochromators actualEnergy).
     position_property::Parameter{String} = Parameter("actualPosition")

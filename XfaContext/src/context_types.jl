@@ -77,6 +77,9 @@ end
     update_handler::Union{Function, Nothing} = nothing
     initializer::Union{Function, Nothing} = nothing
     optional::Bool = false
+
+    filter_topics::Bool = true
+    filter_device_classes::Vector{String} = String[]
 end
 
 @enum VariableKind VariableKind_Variable VariableKind_Group VariableKind_Input
@@ -201,6 +204,56 @@ function (r::LinearROI)(image::AbstractArray)
 end
 
 (r::LinearROI)(v::AbstractVector) = @view v[roi_range(r.start, r.length, axes(v, 1))]
+
+# A set of indices, constructible from strings like "1-10, 50, 51".
+struct IndexSelection
+    indices::Vector{Int}
+end
+
+IndexSelection() = IndexSelection(Int[])
+
+function IndexSelection(str::AbstractString)
+    indices = Int[]
+    for part in split(str, ',')
+        part = strip(part)
+        if isempty(part)
+            continue
+        end
+
+        m = match(r"^(\d+)(?:\s*-\s*(\d+))?$", part)
+        if isnothing(m)
+            throw(ArgumentError("Invalid index or range: '$(part)'"))
+        end
+        lo = parse(Int, m[1])
+        hi = isnothing(m[2]) ? lo : parse(Int, m[2])
+        if hi < lo
+            throw(ArgumentError("Range ends before it starts: '$(part)'"))
+        end
+        append!(indices, lo:hi)
+    end
+
+    IndexSelection(sort!(unique!(indices)))
+end
+
+# Show in the string constructor's format, collapsing runs of 3+ indices into ranges.
+function Base.show(io::IO, sel::IndexSelection)
+    idxs = sel.indices
+    parts = String[]
+    start = 1
+    while start <= length(idxs)
+        stop = start
+        while stop < length(idxs) && idxs[stop + 1] == idxs[stop] + 1
+            stop += 1
+        end
+        if stop - start >= 2
+            push!(parts, "$(idxs[start])-$(idxs[stop])")
+        else
+            append!(parts, string.(idxs[start:stop]))
+        end
+        start = stop + 1
+    end
+    join(io, parts, ", ")
+end
 
 struct OptionalDims
     dims::Union{Vector{Int}, Vector{String}}
@@ -477,19 +530,20 @@ function _variable(ctx_module, expr, side_effects)
         # Note that we capture the macro name and check it explicitly because
         # MacroTools doesn't handle the underscore in the name properly.
         subvariables = String[]
-        postprocessors = []  # (name_expr, pp_expr) tuples
+        postprocessors = []  # (prefix, name, pp_expr) tuples
         postprocessor_indices = Int[]
         displays = Pair{String, String}[]  # plot target => fully-qualified parameter name
         display_indices = Int[]
         for (i, body_expr) in enumerate(body.args)
             if @capture(body_expr, @macroname_(subvar_name_, _)) && macroname == Symbol("@add_subvariable")
                 push!(subvariables, "$(func_name).$(subvar_name)")
-            elseif @capture(body_expr, @macroname_(pp_name_, pp_expr_)) && macroname == Symbol("@postprocess")
-                push!(postprocessors, (pp_name, pp_expr))
-                push!(subvariables, "$(func_name).$(pp_name)")
-                push!(postprocessor_indices, i)
-            elseif @capture(body_expr, @macroname_(pp_expr_)) && macroname == Symbol("@postprocess")
-                push!(postprocessors, (nothing, pp_expr))
+            elseif @capture(body_expr, @macroname_(pp_args__)) && macroname == Symbol("@postprocess")
+                source, pp_name, pp_expr = parse_postprocess_args(pp_args)
+                prefix = isnothing(source) ? "$(func_name)" : "$(func_name).$(source)"
+                push!(postprocessors, (prefix, pp_name, pp_expr))
+                if !isnothing(pp_name)
+                    push!(subvariables, "$(prefix).$(pp_name)")
+                end
                 push!(postprocessor_indices, i)
             elseif @capture(body_expr, @macroname_(disp_args__)) && macroname == Symbol("@display")
                 push!(display_indices, i)
@@ -536,15 +590,14 @@ function _variable(ctx_module, expr, side_effects)
         deleteat!(body.args, sort!(vcat(postprocessor_indices, display_indices)))
 
         # Build the postprocessors expression. Each entry evaluates the
-        # constructor once, then resolves the name — either from the
-        # explicit string or via default_name() for the one-arg form.
-        func_name_str = "$func_name"
+        # constructor once, then resolves the name — either from the `name`
+        # keyword or via default_name().
         postprocessors_expr = Expr(:vect,
             [:(let _pp = $(pp_expr)
-                   _name = $(isnothing(name) ? :(Context.default_name(_pp)) : "$name")
-                   ("$($(func_name_str)).$(_name)", _pp)
+                   _name = $(isnothing(name) ? :(Context.default_name(_pp)) : name)
+                   ("$($(prefix)).$(_name)", _pp)
                end)
-             for (name, pp_expr) in postprocessors]...)
+             for (prefix, name, pp_expr) in postprocessors]...)
 
         # Combine all the dependency expressions into a vector expr, which will
         # get interpolated/evaluated properly.
@@ -592,6 +645,42 @@ macro add_subvariable(name, value)
     end)
 end
 
+# Splits macro args into positional args and a Dict of keyword args, accepting
+# both `@m(a; k=v)` and `@m a k=v` syntax.
+function split_macro_args(args)
+    positional = []
+    kwargs = Dict{Symbol, Any}()
+    for arg in args
+        if Base.Meta.isexpr(arg, :parameters)
+            for kw in arg.args
+                kwargs[kw.args[1]] = kw.args[2]
+            end
+        elseif Base.Meta.isexpr(arg, :(=))
+            kwargs[arg.args[1]] = arg.args[2]
+        else
+            push!(positional, arg)
+        end
+    end
+    return positional, kwargs
+end
+
+# Parses `@postprocess ["source"] pp [name="out"]` into (source, name, pp_expr).
+function parse_postprocess_args(args)
+    positional, kwargs = split_macro_args(args)
+    name = get(kwargs, :name, nothing)
+    if !issubset(keys(kwargs), (:name,)) || !(isnothing(name) || (name isa String && !occursin('.', name)))
+        throw(ArgumentError("@postprocess only supports a `name` keyword argument with a string literal without dots, got: $(kwargs)"))
+    end
+
+    if length(positional) == 1
+        return nothing, name, positional[1]
+    elseif length(positional) == 2 && positional[1] isa String
+        return positional[1], name, positional[2]
+    else
+        throw(ArgumentError("@postprocess takes an optional source subvariable name and a postprocessor, got: $(join(args, ' '))"))
+    end
+end
+
 """
     @get_scratch(name, ex; key=nothing)
 
@@ -601,31 +690,16 @@ Names are namespaced by `Meta.name[]` so a variable's postprocessors can't
 collide with it.
 """
 macro get_scratch(args...)
-    positional = []
-    kwargs = []
-    for arg in args
-        if Base.Meta.isexpr(arg, :parameters)
-            append!(kwargs, arg.args)
-        elseif Base.Meta.isexpr(arg, :(=))
-            push!(kwargs, arg)
-        else
-            push!(positional, arg)
-        end
-    end
-
+    positional, kwargs = split_macro_args(args)
     if length(positional) != 2
         throw(ArgumentError("@get_scratch expects a name and an expression, got: $(args)"))
     end
     name, ex = positional
 
-    key = nothing
-    for kw in kwargs
-        if Base.Meta.isexpr(kw, (:kw, :(=))) && kw.args[1] == :key
-            key = kw.args[2]
-        else
-            throw(ArgumentError("@get_scratch only supports a `key` keyword argument, got: $(kw)"))
-        end
+    if !issubset(keys(kwargs), (:key,))
+        throw(ArgumentError("@get_scratch only supports a `key` keyword argument, got: $(collect(keys(kwargs)))"))
     end
+    key = get(kwargs, :key, nothing)
 
     quote
         let s = $Meta.scratch[], name = string($Meta.name[], '/', $(esc(name))), k = $(esc(key))
@@ -664,16 +738,14 @@ _wrap_param(val::Parameter) = val
 _wrap_param(val) = Parameter(val)
 # Merge a raw value into a default Parameter, preserving handlers
 _wrap_param(val::Parameter, ::Parameter) = val
-_wrap_param(val, default::Parameter) = Parameter(default.name, val, default.set_by_user,
-                                                  default.update_handler, default.initializer,
-                                                  default.optional)
+_wrap_param(val, default::Parameter) = @set default.value = val
 
 function Parameter(f::Base.Callable, value; optional=false)
     if !isnothing(f) && !any(m -> m.nargs in (2, 3), methods(f))
         throw(ArgumentError("Parameter update handler must be either `nothing` or a callable that takes one argument (value) or two arguments (group, value)"))
     end
 
-    Parameter("", value, false, f, f, optional)
+    Parameter(; value, update_handler=f, initializer=f, optional)
 end
 
 function tryset(param::Parameter, value; force=false)

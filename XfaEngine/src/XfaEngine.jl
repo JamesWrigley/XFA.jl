@@ -14,28 +14,34 @@ import Glob
 include("settings.jl")
 include("protocol.jl")
 
-using .KaraboBridge: KaraboBridgeClient, BufferPool
+using .KaraboBridge: KaraboBridgeClient, BufferPool, BridgePattern_REP, parse_bridge_pattern
 include("webproxy.jl")
 
 import TOML
 import Sockets
-import Sockets: listen, close, @ip_str, TCPServer
+import Sockets: listen, close, @ip_str
 import DistributedNext: @everywhere, @fetchfrom, workers, procs
 using Serialization
 
 import HTTP
 import HTTP: WebSockets
 import Revise
-import RemoteREPL
 using DimensionalData: DimArray
 
 using .Protocol
 using .ZfpWorkspaces: ZfpWorkspace, CompressedArray, compress_array, should_compress
-using Accessors: @set
+using Accessors: @set, setproperties
 
 # The KaraboInput @Group/@Input lives here (not in Context) because it depends
 # on the engine's webproxy/device discovery and the ZMQ KaraboBridge transport.
 include("karabo_input.jl")
+
+using Base.CoreLogging: AbstractLogger, LogLevel, Info, global_logger
+using Base.ScopedValues: ScopedValue, @with
+using DataStructures: CircularBuffer
+using FileWatching: watch_file
+using LoggingExtras: TeeLogger
+include("gui_logger.jl")
 
 
 """Find the closest available port to `port_hint`."""
@@ -73,6 +79,9 @@ end
     # forwarded, mapped to the noise multiplier k (0 lossless, -1 for default).
     # Updated via `SetVariableSubscriptions`.
     subscriptions::Dict{String, Float64} = Dict{String, Float64}()
+
+    # Set once broadcast_logs() has sent the log history
+    logs_seeded::Bool = false
 end
 
 @kwdef mutable struct EngineState
@@ -85,9 +94,6 @@ end
     routing_rules::Vector{RoutingRule} = RoutingRule[]
     remap_rules::Vector{RemapRule} = copy(BUILTIN_REMAP_RULES)
 
-    remoterepl_server::TCPServer = TCPServer()
-    remoterepl_task::Union{Task, Nothing} = nothing
-
     ctx::ContextState = ContextState()
     # Keeps the pipeline running across rewires, see start_pipeline(::EngineState).
     pipeline_task::Union{Task, Nothing} = nothing
@@ -99,6 +105,11 @@ end
     zfp_workspaces::Dict{String, ZfpWorkspace} = Dict{String, ZfpWorkspace}()
 
     channel_stats_task::Union{Task, Nothing} = nothing
+    context_watch_task::Union{Task, Nothing} = nothing
+
+    gui_logger::GuiLogger = GuiLogger()
+    previous_logger::Union{AbstractLogger, Nothing} = nothing
+    log_broadcast_task::Union{Task, Nothing} = nothing
 
     stop_event::Base.Event = Base.Event()
     stop_task::Union{Task, Nothing} = nothing
@@ -250,6 +261,38 @@ function broadcast_context_info(state::EngineState)
     end
 end
 
+# Broadcast the loaded context file whenever it changes, e.g. when a client
+# writes a parameter change to it. The timeout lets us notice a newly loaded
+# context or a shutdown.
+function watch_context_file(state::EngineState)
+    last_source = ""
+    while !state.stop_event.set
+        path = state.ctx.path
+        try
+            if isempty(path) || !isfile(path)
+                sleep(1)
+            elseif !watch_file(path, 1).timedout && isfile(path)
+                source = read(path, String)
+                # A single write can fire several events
+                if source != last_source
+                    last_source = source
+                    msg = Protocol.ContextSource(source)
+                    for (id, client) in state.clients
+                        try
+                            Protocol.server_send(client.websocket, msg)
+                        catch ex
+                            @warn "Failed to broadcast ContextSource to client '$(id)'" exception=ex
+                        end
+                    end
+                end
+            end
+        catch ex
+            @error "Failed to watch context file $(path)" exception=(ex, catch_backtrace())
+            sleep(1)
+        end
+    end
+end
+
 # Start the pipeline, and the task that restarts it whenever a group rewires
 # its dependencies (see Context.wait_pipeline). Starting synchronously lets
 # callers report a failed start; the task only ever restarts.
@@ -366,6 +409,38 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
     end
 end
 
+# Periodically send the logs collected by the GuiLogger to all clients
+function broadcast_logs(state::EngineState; period=0.3)
+    @with in_log_broadcast => true while !state.stop_event.set
+        sleep(period)
+        records = take_pending!(state.gui_logger)
+        clients = collect(values(state.clients))
+
+        # New clients get the whole history instead, which already includes the
+        # pending records, so nothing is sent twice or out of order.
+        history = if any(client -> !client.logs_seeded, clients)
+            log_history(state.gui_logger)
+        else
+            Protocol.LogRecord[]
+        end
+
+        for client in clients
+            replay = !client.logs_seeded
+            to_send = replay ? history : records
+            client.logs_seeded = true
+            if isempty(to_send)
+                continue
+            end
+
+            try
+                Protocol.server_send(client.websocket, Protocol.LogMessages(to_send, replay))
+            catch ex
+                @debug "Failed to send LogMessages to client" exception=(ex, catch_backtrace())
+            end
+        end
+    end
+end
+
 """Close connections to all clients and optionally the websocket listener."""
 function shutdown(state::EngineState, ws_server=nothing)
     if ws_server != nothing
@@ -376,6 +451,10 @@ function shutdown(state::EngineState, ws_server=nothing)
 
     for client in values(state.clients)
         close(client.websocket)
+    end
+
+    if !isnothing(state.previous_logger)
+        global_logger(state.previous_logger)
     end
 end
 
@@ -466,9 +545,10 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             Protocol.server_send(ws, AvailableVariables(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
 
-    elseif msg isa GetTrainmatchers
-        trainmatchers = get_all_trainmatchers(state.webproxies)
-        Protocol.server_send(ws, AvailableTrainmatchers(trainmatchers); reply_to)
+    elseif msg isa GetDevices
+        devices = get_all_devices(state.webproxies)
+        whitelisted = get_device_whitelist(state.webproxies)
+        Protocol.server_send(ws, AvailableDevices(devices, whitelisted); reply_to)
 
     elseif msg isa LoadContext
         path = abspath(expanduser(msg.path))
@@ -496,20 +576,31 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
             ctx
         catch ex
+            @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
             Protocol.ExceptionMessage(ex, catch_backtrace())
         end
 
         if new_ctx_or_ex isa ContextState
             state.ctx = new_ctx_or_ex
+            start_error = nothing
             if was_running
-                start_pipeline(state)
+                try
+                    start_pipeline(state)
+                catch ex
+                    @error "Failed to restart the pipeline after loading $(path)" exception=(ex, catch_backtrace())
+                    start_error = Protocol.ExceptionMessage(ex, catch_backtrace())
+                end
             end
 
             @info "Loaded context file $(path): $(state.ctx)"
             source = read(path, String)
             Protocol.server_send(ws, ContextInfo(state.ctx, source); reply_to)
+
+            # The context itself loaded, so the start failure is reported separately
+            if !isnothing(start_error)
+                Protocol.server_send(ws, Ack(start_error))
+            end
         else
-            @error "Loading context file at $(path) failed" exception=new_ctx_or_ex
             Protocol.server_send(ws, ContextInfo(new_ctx_or_ex, state.ctx.is_running[], ""); reply_to)
         end
     elseif msg isa ReviseCode
@@ -573,18 +664,6 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
         end
 
         Protocol.server_send(ws, Ack(); reply_to)
-    elseif msg isa SetRemoteRepl
-        if msg.enable
-            @info "Starting RemoteREPL"
-            port, state.remoterepl_server = Sockets.listenany(27754)
-            state.remoterepl_task = Threads.@spawn :samepool RemoteREPL.serve_repl(state.remoterepl_server)
-            Protocol.server_send(ws, RemoteReplState(true, Int(port)); reply_to)
-        else
-            @info "Stopping RemoteREPL"
-            close(state.remoterepl_server)
-            wait(state.remoterepl_task)
-            Protocol.server_send(ws, RemoteReplState(false, -1); reply_to)
-        end
     else
         @error "Received unsupported message: $(typeof(msg))"
     end
@@ -630,6 +709,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     websocket_port = getavailableport(1331)
     state = EngineState(; websocket_port, stop_event)
     global current_engine_state = state
+    state.previous_logger = global_logger(TeeLogger(global_logger(), state.gui_logger))
 
     if haskey(ENV, "SASE")
         merge!(state.webproxies, Dict(instrument => WebProxy(address)
@@ -643,15 +723,11 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
         # First run: seed one {topic, "*", first_matcher} rule per discovered
         # topic and persist, so subsequent runs read the file verbatim.
         rules = RoutingRule[]
-        if !isempty(state.webproxies)
-            try
-                for (topic, matchers) in get_all_trainmatchers(state.webproxies)
-                    if !isempty(matchers)
-                        push!(rules, RoutingRule(topic, "*", first(matchers)[1]))
-                    end
-                end
-            catch ex
-                @warn "Failed to query trainmatchers while seeding routing rules" exception=(ex, catch_backtrace())
+        trainmatchers = get_all_devices(state.webproxies; classId="TrainMatcher")
+        for topic in keys(state.webproxies)
+            names = sort!([d.name for d in trainmatchers if d.topic == topic])
+            if !isempty(names)
+                push!(rules, RoutingRule(topic, "*", first(names)))
             end
         end
         write_routing_rules(rules)
@@ -713,6 +789,12 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     state.channel_stats_task = Threads.@spawn :interactive broadcast_channel_stats(state)
     errormonitor(state.channel_stats_task)
 
+    state.log_broadcast_task = Threads.@spawn :interactive broadcast_logs(state)
+    errormonitor(state.log_broadcast_task)
+
+    state.context_watch_task = Threads.@spawn :interactive watch_context_file(state)
+    errormonitor(state.context_watch_task)
+
     state.stop_task = Threads.@spawn :interactive try
         Base.wait(state.stop_event)
     catch ex
@@ -728,6 +810,8 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
     if wait
         Base.wait(state.stop_task)
         Base.wait(state.channel_stats_task)
+        Base.wait(state.log_broadcast_task)
+        Base.wait(state.context_watch_task)
     end
 
     return state
@@ -756,7 +840,7 @@ precompile(Context.get_sources, (KaraboInput,))
                 WebSockets.open("ws://localhost:$(state.websocket_port)"; proxy=nothing,
                                 maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                     WebSockets.receive(ws)
-                    for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetTrainmatchers(),
+                    for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetDevices(),
                                 GetRoutingRules(), GetRemapRules())
                         Protocol.client_send(ws, msg)
                         Protocol.receive(ws)
@@ -766,6 +850,8 @@ precompile(Context.get_sources, (KaraboInput,))
                 notify(state.stop_event)
                 wait(state.stop_task)
                 wait(state.channel_stats_task)
+                wait(state.log_broadcast_task)
+                wait(state.context_watch_task)
             end
         end
     end

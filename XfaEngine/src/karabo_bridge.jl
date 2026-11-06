@@ -149,30 +149,60 @@ end
 
 ZMQ.recv_multipart(socket::ThreadsafeSocket) = ZMQ.recv_multipart(socket, ZMQ.Message)
 
-"""
-    KaraboBridgeClient("tcp://127.0.0.1:1234")
+# The server-side socket pattern of a Karabo bridge, as listed in a
+# trainmatcher's zmqOutputs.
+@enum BridgePattern begin
+    BridgePattern_REP
+    BridgePattern_PUB
+    BridgePattern_PUSH
+end
 
-Connect to the Karabo bridge at the given endpoint.
+function parse_bridge_pattern(pattern::AbstractString)
+    if pattern == "REP"
+        BridgePattern_REP
+    elseif pattern == "PUB"
+        BridgePattern_PUB
+    elseif pattern == "PUSH"
+        BridgePattern_PUSH
+    else
+        error("Unsupported Karabo bridge pattern: '$(pattern)'")
+    end
+end
+
+server_socket_type(pattern::BridgePattern) =
+    (ZMQ.REP, ZMQ.PUB, ZMQ.PUSH)[Int(pattern) + 1]
+client_socket_type(pattern::BridgePattern) =
+    (ZMQ.REQ, ZMQ.SUB, ZMQ.PULL)[Int(pattern) + 1]
+
+"""
+    KaraboBridgeClient("tcp://127.0.0.1:1234", BridgePattern_REP)
+
+Connect to the Karabo bridge at the given endpoint, using the client socket type
+matching the server's `pattern`.
 """
 mutable struct KaraboBridgeClient
     socket::ThreadsafeSocket
     context::ZMQ.Context
+    pattern::BridgePattern
     ready::Bool
 
-    function KaraboBridgeClient(endpoint::String)
+    function KaraboBridgeClient(endpoint::String, pattern::BridgePattern=BridgePattern_REP)
         context = ZMQ.Context()
-        socket = ZMQ.Socket(context, ZMQ.REQ)
+        socket = ZMQ.Socket(context, client_socket_type(pattern))
         socket.linger = 1
         socket.rcvhwm = 10
         socket.sndhwm = 10
+        if pattern == BridgePattern_PUB
+            ZMQ.subscribe(socket, "")
+        end
         Sockets.connect(socket, endpoint)
 
-        new_client = new(ThreadsafeSocket(socket), context, false)
+        new_client = new(ThreadsafeSocket(socket), context, pattern, false)
     end
 end
 
 """
-    KaraboBridgeServer("tcp://127.0.0.1:45454", buffer_size=10)
+    KaraboBridgeServer("tcp://127.0.0.1:45454"; buffer_size=10, pattern=BridgePattern_REP)
 
 Create a Karabo bridge server.
 """
@@ -180,14 +210,16 @@ mutable struct KaraboBridgeServer
     socket::ThreadsafeSocket
     context::ZMQ.Context
     endpoint::String
+    pattern::BridgePattern
     is_running::Bool
     channel::Channel
     buffer_size::Int
     server_task::Union{Task, Nothing}
 
-    function KaraboBridgeServer(endpoint::String; buffer_size::Int=10)
+    function KaraboBridgeServer(endpoint::String; buffer_size::Int=10,
+                                pattern::BridgePattern=BridgePattern_REP)
         context = ZMQ.Context()
-        socket = ZMQ.Socket(context, ZMQ.REP)
+        socket = ZMQ.Socket(context, server_socket_type(pattern))
         socket.linger = 1
         socket.rcvhwm = 10
         socket.sndhwm = 10
@@ -195,7 +227,7 @@ mutable struct KaraboBridgeServer
         ch = Channel()
         close(ch)
 
-        new_server = new(ThreadsafeSocket(socket), context, endpoint, false, ch, buffer_size, nothing)
+        new_server = new(ThreadsafeSocket(socket), context, endpoint, pattern, false, ch, buffer_size, nothing)
     end
 end
 
@@ -305,23 +337,25 @@ function startbridge(server::KaraboBridgeServer)
                 fake_tid += 1
             end
 
-            # Wait for the client to request some data
-            msg = nothing
-            try
-                msg = Sockets.recv(server.socket, String)
-            catch ex
-                if ex isa ZMQ.StateError || ex isa EOFError
-                    # If the socket was closed or is somehow corrupted,
-                    # exit the loop.
-                    break
-                else
-                    rethrow()
+            # Only REP clients request data, PUB/PUSH sockets send it directly
+            if server.pattern == BridgePattern_REP
+                msg = nothing
+                try
+                    msg = Sockets.recv(server.socket, String)
+                catch ex
+                    if ex isa ZMQ.StateError || ex isa EOFError
+                        # If the socket was closed or is somehow corrupted,
+                        # exit the loop.
+                        break
+                    else
+                        rethrow()
+                    end
                 end
-            end
 
-            if msg != "next"
-                @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
-                continue
+                if msg != "next"
+                    @error "Unexpected message from Karabo bridge client: '$(msg)'. Expected 'next'."
+                    continue
+                end
             end
 
             # Serialize the data and send it to the client
@@ -344,7 +378,7 @@ Base.put!(server::KaraboBridgeServer, data, metadata=nothing) = put!(server.chan
 Get the next message from a bridge client.
 """
 function Base.take!(client::KaraboBridgeClient, pool::Union{BufferPool, Nothing}=nothing)
-    if !client.ready
+    if client.pattern == BridgePattern_REP && !client.ready
         ZMQ.send(client.socket, "next")
         client.ready = true
     end

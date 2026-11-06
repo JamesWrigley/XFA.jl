@@ -140,8 +140,8 @@ function BoxedText(label, text)
         CopyButton("$label-copy", text)
         ig.SetCursorPos(ImVec2(0, 0))
         ig.TextUnformatted(text)
-        ig.EndChild()
     end
+    ig.EndChild()
 end
 
 # Diabolically stolen from: https://github.com/ocornut/imgui/issues/1901#issuecomment-400563921
@@ -193,8 +193,31 @@ macro NodeEditor(editor, name, expr)
             $(esc(expr))
         finally
             ne.End()
-            ig.SetFontRasterizerDensity(1f0)
+            ne.set_pixel_density(1f0)
             ne.SetCurrentEditor(C_NULL)
+        end
+    end
+end
+
+# Runs `expr` and, if it throws, unwinds the ImGui stacks (windows, IDs, styles
+# etc.) back to how they were before rethrowing. The assert and tooltip ImGui
+# raises for each missing End/Pop it fixes up are silenced.
+macro imgui_recover(expr)
+    quote
+        local recovery = Ref{ig.lib.ImGuiErrorRecoveryState}()
+        ig.ErrorRecoveryStoreState(recovery)
+        try
+            $(esc(expr))
+        catch
+            local io = ig.GetIO()
+            local enable_assert = unsafe_load(io.ConfigErrorRecoveryEnableAssert)
+            local enable_tooltip = unsafe_load(io.ConfigErrorRecoveryEnableTooltip)
+            io.ConfigErrorRecoveryEnableAssert = false
+            io.ConfigErrorRecoveryEnableTooltip = false
+            ig.ErrorRecoveryTryToRecoverState(recovery)
+            io.ConfigErrorRecoveryEnableAssert = enable_assert
+            io.ConfigErrorRecoveryEnableTooltip = enable_tooltip
+            rethrow()
         end
     end
 end
@@ -347,6 +370,10 @@ function draw_autocomplete_popup(label, state::ElidedTextState, ac::CompletionRe
     return result, popup_hovered
 end
 
+# IsItemHovered() doesn't check whether another item holds the hover, which is
+# how the node editor keeps the widgets of covered nodes from being hovered
+item_has_hover() = ig.IsItemHovered() && ig.GetHoveredID() == ig.GetItemID()
+
 function ElidedText(label::AbstractString, text::AbstractString;
                     max_chars::Int=30, editable::Bool=false,
                     focus::Bool=false,
@@ -358,7 +385,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
         field_state.edit = ElidedEditState_WantEdit
     end
 
-    min_width = ig.CalcTextSize("m").x * 13  # minimum clickable width
+    char_width = ig.CalcTextSize("m").x
+    min_width = char_width * 3  # minimum clickable width
 
     if editable && field_state.edit != ElidedEditState_NoEdit
         just_started = field_state.edit == ElidedEditState_WantEdit
@@ -366,10 +394,13 @@ function ElidedText(label::AbstractString, text::AbstractString;
             ig.SetKeyboardFocusHere()
             field_state.edit = ElidedEditState_Edit
             field_state.selected_idx = 1
+            field_state.edit_text = text
         end
-        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(text).x + 40))
+        frame_padding = unsafe_load(ig.GetStyle().FramePadding.x)
+        ig.SetNextItemWidth(max(min_width, ig.CalcTextSize(field_state.edit_text).x + 2 * frame_padding + char_width))
         edited, new_text = SafeInputText("##elided-$(label)"; current_text=text, reset=just_started,
                                          callback, user_data, validator)
+        field_state.edit_text = new_text
         lost_focus = !just_started && ig.IsItemDeactivated() && !ig.IsItemActive()
         input_min, input_max = editor_item_rect()
 
@@ -434,8 +465,8 @@ function ElidedText(label::AbstractString, text::AbstractString;
             cursor = ig.GetCursorPos()
             ig.SetCursorPos(ImVec2(cursor.x, cursor.y - padding.y))
             ig.InvisibleButton("##elided-btn-$(label)", ImVec2(max(text_size.x, min_width) + 2 * padding.x, text_size.y + 2 * padding.y))
-            hovered = ig.IsItemHovered()
-            clicked = ig.IsItemClicked()
+            hovered = item_has_hover()
+            clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
 
             draw_list = ig.GetWindowDrawList()
             p_min = ig.GetItemRectMin()
@@ -654,17 +685,12 @@ strip_channel(s) = (i = findfirst(':', s); isnothing(i) ? s : s[1:i-1])
 # source names a slow device.
 source_channel(s) = (i = findfirst(':', s); isnothing(i) ? "" : s[i+1:end])
 
-# Resolve the (topic, device) schema key for a source string, honouring an
-# explicit "topic//" prefix and otherwise looking the device up in the source
-# list. Returns nothing if the device isn't known.
+# The (topic, device) schema key for a source string, or nothing if the device
+# isn't in the source list.
 function source_key(client, source)
     topic, device = split_topic(strip_channel(source))
-    if isempty(topic)
-        idx = findfirst(s -> s.name == device, client.source_list)
-        isnothing(idx) ? nothing : (client.source_list[idx].topic, device)
-    else
-        (topic, device)
-    end
+    idx = findfirst(s -> s.name == device && (isempty(topic) || s.topic == topic), client.source_list)
+    isnothing(idx) ? nothing : (client.source_list[idx].topic, device)
 end
 
 # DeviceProperties for a source, honouring an explicit "topic//" prefix so the
@@ -706,7 +732,13 @@ function seed_karabo_editor!(dep_state::KaraboDepTextState, text, device_only)
     catch
         nothing
     end
-    dep_state.source = isnothing(dep) ? text : dep.source
+    dep_state.source = if isnothing(dep)
+        text
+    elseif isnothing(dep.topic)
+        dep.source
+    else
+        "$(dep.topic)//$(dep.source)"
+    end
     dep_state.property = isnothing(dep) ? "" : @something(dep.property, "")
     dep_state.proxy = (isnothing(dep) || isnothing(dep.proxy)) ? "" : dep.proxy
     dep_state.proxy_expanded = !isempty(dep_state.proxy)
@@ -756,7 +788,8 @@ committed result (running the remap) on the following frame.
 function KaraboDepText(label, text, dep_state::KaraboDepTextState,
                        source_list, client::ClientState;
                        device_only::Bool=false, allow_slow::Bool=true,
-                       focus::Bool=false)
+                       focus::Bool=false, device_classes::Vector{String}=String[],
+                       qualify_topics::Bool=false)
     # If a previous commit kicked off an async remap, either resolve it now or
     # show a disabled spinner placeholder until the request lands.
     if !isnothing(dep_state.pending_remap_id)
@@ -794,8 +827,11 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
     clicked = KaraboDepDisplay(label, text)
     if clicked || focus
         seed_karabo_editor!(dep_state, text, device_only)
+        dep_state.initial_source = dep_state.source
         dep_state.label = label
         dep_state.source_list = source_list
+        dep_state.device_classes = device_classes
+        dep_state.qualify_topics = qualify_topics
         dep_state.device_only = device_only
         dep_state.allow_slow = allow_slow
         dep_state.trigger = true
@@ -807,22 +843,28 @@ function KaraboDepText(label, text, dep_state::KaraboDepTextState,
 end
 
 # A framed, clickable read-only field that looks like a text input and shows the
-# current (elided) source with a trailing edit icon. Returns true when clicked.
+# current source with a trailing edit icon, elided to the item width. Returns true
+# when clicked.
 function KaraboDepDisplay(label, text)
-    max_chars = 30
     empty = isempty(text)
-    display = empty ? "set source\u2026" : (length(text) > max_chars ? text[1:max_chars] * "\u2026" : text)
-
     icon = "\uf044"  # pencil
     icon_w = ig.CalcTextSize(icon).x
     padding = ImVec2(4, 2)
-    min_width = ig.CalcTextSize("m").x * 13
-    text_w = ig.CalcTextSize(display).x
-    width = max(text_w + icon_w + 8, min_width) + 2 * padding.x
+    width = max(ig.CalcTextSize("m").x * 13, ig.CalcItemWidth())
+
+    avail = width - icon_w - 8 - 2 * padding.x
+    display = empty ? "set source\u2026" : text
+    if ig.CalcTextSize(display).x > avail
+        while !isempty(display) && ig.CalcTextSize(display * "\u2026").x > avail
+            display = display[1:prevind(display, lastindex(display))]
+        end
+        display *= "\u2026"
+    end
+    elided = !empty && display != text
 
     ig.InvisibleButton("##karabo-display-$(label)", ImVec2(width, ig.GetFontSize() + 2 * padding.y))
-    hovered = ig.IsItemHovered()
-    clicked = ig.IsItemClicked()
+    hovered = item_has_hover()
+    clicked = hovered && ig.IsMouseClicked(ig.ImGuiMouseButton_Left)
 
     draw_list = ig.GetWindowDrawList()
     p_min = ig.GetItemRectMin()
@@ -837,7 +879,7 @@ function KaraboDepDisplay(label, text)
     ig.AddText(draw_list, ImVec2(p_max.x - icon_w - padding.x, p_min.y + padding.y),
                ig.GetColorU32(ig.ImGuiCol_TextDisabled), icon)
 
-    if hovered && length(text) > max_chars
+    if hovered && elided
         node_tooltip(text)
     end
 
@@ -1030,9 +1072,13 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
 
     result = nothing
     if field_state.edit != ElidedEditState_NoEdit
-        result, hovered = draw_source_completions(popup_id, field_state, dep_state.source,
+        # Offer every device until a device-only field is edited, rather than
+        # just the current one.
+        unedited = dep_state.device_only && dep_state.source == dep_state.initial_source
+        result, hovered = draw_source_completions(popup_id, field_state, unedited ? "" : dep_state.source,
                                                   dep_state.source_list, dep_state.allow_slow, client;
-                                                  device_only=dep_state.device_only)
+                                                  device_only=dep_state.device_only,
+                                                  dep_state.device_classes, dep_state.qualify_topics)
         dep_state.ac_hovered |= hovered
         dep_state.ac_active = true
         if !ig.IsItemActive() && !hovered
@@ -1053,8 +1099,9 @@ function karabo_source_field(dep_state::KaraboDepTextState, client::ClientState)
     end
 end
 
-# The source string for a device, topic-qualified when its name is ambiguous.
-source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
+# The source string for a device, topic-qualified when asked to or when its name
+# is ambiguous.
+source_base(dev::SourceInfo, qualify::Bool) = qualify || dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev.name
 
 # Draw the source completion popup: a fuzzy-matched device list on the left, and
 # the selected device's pipeline channels in a column on the right (menu style,
@@ -1064,10 +1111,18 @@ source_base(dev::SourceInfo) = dev.ambiguous ? "$(dev.topic)//$(dev.name)" : dev
 # bare devices: no channel column, no schema fetches. Returns (selected, hovered).
 function draw_source_completions(popup_id, field_state::ElidedTextState, text::AbstractString,
                                  source_list::Vector{SourceInfo}, allow_slow::Bool,
-                                 client::ClientState; device_only::Bool=false)
+                                 client::ClientState; device_only::Bool=false,
+                                 device_classes::Vector{String}=String[], qualify_topics::Bool=false)
     topic_fixed, query = split_topic(strip_channel(text))
-    sources = isempty(topic_fixed) ? source_list :
-              filter(s -> s.topic == topic_fixed, source_list)
+    # Keep a topic the user typed
+    qualify = qualify_topics || !isempty(topic_fixed)
+    sources = if isempty(topic_fixed) && isempty(device_classes)
+        source_list
+    else
+        filter(source_list) do s
+            (isempty(topic_fixed) || s.topic == topic_fixed) && (isempty(device_classes) || s.class_id in device_classes)
+        end
+    end
 
     now = ig.GetTime()
     if text != field_state.last_query
@@ -1198,7 +1253,7 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
                 end
                 if picked
                     if allow_slow
-                        result = source_base(dev)
+                        result = source_base(dev, qualify)
                     elseif has_channels
                         field_state.channel_idx = 1
                     end
@@ -1235,7 +1290,7 @@ function draw_source_completions(popup_id, field_state::ElidedTextState, text::A
                         picked = true
                     end
                     if picked
-                        result = "$(source_base(selected_dev)):$(ch)"
+                        result = "$(source_base(selected_dev, qualify)):$(ch)"
                     end
                     if ig.IsItemHovered()
                         field_state.channel_idx = ci
@@ -1396,9 +1451,12 @@ function DepText(label, dep::Dependency, dep_state::DepTextState,
     if dep_state.is_karabo
         text = dep.kind == DepKind_Karabo ? string(dep) : ""
         focus &= isempty(text)
+        ig.SetNextItemWidth(client.ne_node_right - ig.GetCursorScreenPos().x)
+        # With several inputs the topic decides which one serves the dependency
         edited, new_text = KaraboDepText(label, text, dep_state.karabo_state,
                                          source_list, client;
-                                         device_only, focus)
+                                         device_only, focus,
+                                         qualify_topics=length(client.sources_by_input) > 1)
         if edited
             return true, karabo_dependency(new_text)
         end

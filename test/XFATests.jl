@@ -336,6 +336,16 @@ end
         end
         """
 
+        # Dependency("...") strings are renamed, including subvariable references
+        source = """
+        @Variable foo -> karabo"A/B.prop"
+        my_group = MyGroup(; x=Dependency("foo"), y=Dependency("foo.mean"), z=Dependency("foobar"))
+        """
+        @test XFA.replace_variable_name(source, "foo", "baz") == """
+        @Variable baz -> karabo"A/B.prop"
+        my_group = MyGroup(; x=Dependency("baz"), y=Dependency("baz.mean"), z=Dependency("foobar"))
+        """
+
         # Unknown names still warn and change nothing
         @test_logs (:warn, r"No occurrences") begin
             @test XFA.replace_variable_name(source, "nonexistent", "baz") == source
@@ -430,7 +440,8 @@ end
     @testset "Edit vector parameter" begin
         @test XFA.format_param_value([1, 2, 3]) == "[1, 2, 3]"
         @test XFA.format_param_value([1.5, 2.0]) == "[1.5, 2.0]"
-        @test XFA.format_param_value(Int[]) == "[]"
+        # An empty vector keeps its element type, a bare [] would be a Vector{Any}
+        @test XFA.format_param_value(Int[]) == "Int64[]"
 
         source = """
         bins = Parameter([0, 1])
@@ -476,6 +487,29 @@ end
         """
     end
 
+    @testset "Edit postprocessor parameter" begin
+        source = """
+        @Variable function foo(x -> karabo"A/B.c")
+            @postprocess Histogram1D(nbins=5)
+            @postprocess "fit" Mean() name="m"
+            x
+        end
+        """
+        pp_info(name, pp_names) = XFA.PostprocessorInfo(; id=0, name, var_name="foo", var_postprocessors=pp_names,
+                                                        display_name="", tree_id_suffix="", plot_id="",
+                                                        params=Dict{String, Any}(), origin="")
+        pp_names = ["foo.histogram", "foo.fit.m"]
+        edit(pp_name, kwarg, value) = XFA.replace_postprocess_kwarg(source, pp_info(pp_name, pp_names), kwarg, value)
+
+        @test occursin("Histogram1D(nbins=10)", edit("foo.histogram", "nbins", "10"))
+        @test occursin("Mean(; dims=[2]) name=\"m\"", edit("foo.fit.m", "dims", XFA.format_param_value(Context.OptionalDims([2]))))
+
+        # A postprocessor list that doesn't match the source is left alone
+        @test_logs (:warn, r"Could not find the @postprocess") begin
+            @test XFA.replace_postprocess_kwarg(source, pp_info("foo.mean", ["foo.mean"]), "dims", "[2]") == source
+        end
+    end
+
     @testset "Add variable" begin
         variable_spec(origin) = Context.VariableSpec("scan", Context.VariableKind_Variable, origin,
                                                      Context.OrderedDict{String, Dependency}(),
@@ -503,6 +537,26 @@ end
         @Variable foo -> karabo"A/B.prop"
 
         @Variable my_scan -> XfaContext.scan(x -> karabo"C/D.prop", y -> foo, z -> foo.mean)
+        """
+
+        # Without an origin the variable is defined as a function returning its dependency
+        @test add(variable_spec(""), "camera"; deps=Context.OrderedDict("data" => karabo"CAM/DET:output[data.image]")) == """
+        @Variable foo -> karabo"A/B.prop"
+
+        @Variable function camera(data -> karabo"CAM/DET:output[data.image]")
+            data
+        end
+        """
+
+        # Sources without a topic get one, the rest are left alone
+        @test XFA.add_karabo_topics("""
+        @Variable foo -> karabo"A/B.prop"
+        @Variable bar -> karabo"SA2//C:out[d]"
+        g = Group(; s=karabo"D/E.prop")
+        """, "SA1") == """
+        @Variable foo -> karabo"SA1//A/B.prop"
+        @Variable bar -> karabo"SA2//C:out[d]"
+        g = Group(; s=karabo"SA1//D/E.prop")
         """
 
         # Unwired and group deps are left off, so a bare reference is emitted
@@ -628,10 +682,11 @@ end
                    SI("SA2", "MID_DET/CAM/1", true)]
 
     # A device is inserted bare when its name is unique, and topic-qualified
-    # when the same name exists under more than one topic.
-    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false)) == "MID_EXP/MOTOR/1"
-    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true)) == "MID//MID_DET/CAM/1"
-    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true)) == "SA2//MID_DET/CAM/1"
+    # when asked to or when the same name exists under more than one topic.
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false), false) == "MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_EXP/MOTOR/1", false), true) == "MID//MID_EXP/MOTOR/1"
+    @test XFA.source_base(SI("MID", "MID_DET/CAM/1", true), false) == "MID//MID_DET/CAM/1"
+    @test XFA.source_base(SI("SA2", "MID_DET/CAM/1", true), false) == "SA2//MID_DET/CAM/1"
 
     # A "TOPIC//" prefix splits off as the fixed topic, leaving the fuzzy query
     @test XFA.split_topic("MID//DET") == ("MID", "DET")
@@ -902,7 +957,9 @@ end
         "usermeta" => Dict("other" => 1,
                            "xfa" => Dict("fixed_aspect" => false,
                                          "models" => [Dict("function" => "gaussian",
-                                                           "params" => "spectra.fit")])))
+                                                           "params" => "spectra.fit"),
+                                                      Dict("function" => "linear", "params" => "spectra.line",
+                                                           "to_x_intercept" => true)])))
     compiled = XFA.compile_spec("spectra", spec)
     spectra, correlation = compiled.layers
 
@@ -918,11 +975,13 @@ end
     @test correlation.lookups == (XFA.LookupTransform(XFA.LookupKey_TrainId, "motor", "value", "motor"),)
     @test compiled.rois == [XFA.RoiParam("grp.roi", XFA.RectROI()),
                             XFA.RoiParam("grp.band", XFA.LinearROI(2.0, 3.0; axis=:x))]
-    @test compiled.models == [XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "spectra.fit", nothing)]
+    @test compiled.models == [XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "spectra.fit", nothing, false),
+                              XFA.ModelOverlay(XFA.ModelFunction_Linear, "spectra.line", nothing, true)]
     # A model's parameters come in a fixed order
     @test XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0, 0.0, 1.0])(0.0) == 3.0
+    @test XFA.model_function(XFA.ModelFunction_Linear, "fit", [2.0, 1.0])(3.0) == 7.0
     @test_throws "a gaussian takes 4 parameters" XFA.model_function(XFA.ModelFunction_Gaussian, "fit", [1.0, 2.0])
-    @test XFA.datasets(compiled) == Set(["spectra", "intensity", "motor", "spectra.fit"])
+    @test XFA.datasets(compiled) == Set(["spectra", "intensity", "motor", "spectra.fit", "spectra.line"])
 
     # A unit spec: an image, with the defaults
     image = XFA.compile_spec("detector", Dict(
@@ -1109,6 +1168,8 @@ end
         @test (layer.mark, layer.x.field, layer.y.field, layer.color.scheme) == (XFA.Mark_Rect, "col", "row", "turbo")
         @test !spec.fixed_aspect
         @test (XFA.field_dim(image.data, "row"), XFA.field_dim(image.data, "col")) == (1, 2)
+        image.x_axis = [10, 20, 30]
+        @test (XFA.field_values("image", image, "row"), XFA.field_values("image", image, "col")) == (1:2, [10, 20, 30])
 
         # A scalar history is plotted against its train IDs
         scalar = XFA.VariableStore(; data=XFA.CircularBuffer{Float64}(10), xlabel="trainId")
@@ -1127,6 +1188,11 @@ end
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", x=:col, color=:row)) == (2, 1)
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:pulseId)) == (1, 2)
         @test XFA.series_dims("spectra", spectra.data, XFA.LayerSpec(; data="spectra", color=:X)) == (2, 1)
+        # ImageAsLines leaves the color to the dim x isn't on
+        for (x, dims) in ((:X, (1, 2)), (:pulseId, (2, 1)))
+            layer = only(XFA.XfaContext.ImageAsLines("lines"; x).layers)
+            @test XFA.series_dims("spectra", spectra.data, layer) == dims
+        end
         @test (XFA.dim_values(spectra, 1), XFA.dim_values(spectra, 2)) == ([1.0, 2.0, 3.0], [10, 20])
         # An explicit x_axis runs along the columns
         spectra.x_axis = [0.1, 0.2]
@@ -1186,7 +1252,7 @@ end
     variable_data = Dict("a" => a, "b" => b, "fit" => fit, "scalar" => scalar)
     view = XFA.SpecView(; source=XFA.DefaultSpec("a", XFA.ModelOverlay[]), id="view")
     append!(view.layers, [XFA.ViewLayer(; spec=XFA.LayerSpec(; data)) for data in ("a", "b", "scalar")])
-    push!(view.models, XFA.ViewModel(; overlay=XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "fit", nothing)))
+    push!(view.models, XFA.ViewModel(; overlay=XFA.ModelOverlay(XFA.ModelFunction_Gaussian, "fit", nothing, false)))
     sync(names...) = keys(XFA.sync_arrays!(view, variable_data, Dict(name => Set(1) for name in names)))
 
     # Nothing is shown until the arrays hold the same train, scalars aren't held
@@ -1205,19 +1271,27 @@ end
     @test (view.snapshots["a"].data, view.snapshots["a"].trainId) == ([1.0, 2.0], 2)
     @test XFA.DD.dims(view.snapshots["b"].data) == XFA.DD.dims(b.data)
 
-    # A lone array is drawn live
+    # With a model a lone array is still synced, as the fit can arrive ahead of it
     deleteat!(view.layers, 2)
+    @test sync("a") == Set(["a"])
+    fit.trainId = 4
+    @test isempty(sync("fit"))
+    a.trainId = 4
+    @test sync("a") == Set(["a", "fit"])
+
+    # Without one it's drawn live
+    empty!(view.models)
     @test sync("a") == Set(["a"])
     @test isempty(view.snapshots)
 
     # Unless only every n'th train is shown, the first straight away
     view.update_every[] = 2
     @test sync("a") == Set(["a"])
-    a.trainId = 4
-    @test isempty(sync("a"))
     a.trainId = 5
+    @test isempty(sync("a"))
+    a.trainId = 6
     @test sync("a") == Set(["a"])
-    @test view.snapshots["a"].trainId == 5
+    @test view.snapshots["a"].trainId == 6
 end
 
 @testset "GUI" begin

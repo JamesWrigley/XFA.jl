@@ -3,7 +3,7 @@ module XfaContext
 export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_scratch, Parameter, Callback, tryset, KaraboDevice, SourceInfo,
     Dependency, DependencyKind, DepKind_Variable, DepKind_Subvariable, DepKind_Karabo, DepKind_Group, DepKind_GroupParameter,
     karabo_dependency, subvariable_dependency, group_dependency, group_parameter_dependency,
-    RectROI, LinearROI, Context
+    RectROI, LinearROI, IndexSelection, ImageAsLines, Context
 
 # Macro-generated code and context files refer to this module as `Context`. It's
 # exported so `using XfaContext` binds it the way `using XfaEngine.Context` used
@@ -138,6 +138,8 @@ include("detector_assembly.jl")
 include("binning.jl")
 
 using DataStructures: CircularBuffer
+using CurveFit: CurveFitProblem, LinearCurveFitAlgorithm, solve, rss
+using SciMLBase: successful_retcode
 using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges
 using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
 include("context_builtins.jl")
@@ -437,7 +439,8 @@ function to_dict(ctx::ContextState)
         # Preserve the concrete type so an unassigned (nothing-valued) parameter
         # keeps its element type instead of failing to infer it.
         parameters[name] = typeof(param)(; name=param.name, value=param.value,
-                                         set_by_user=param.set_by_user, optional=param.optional)
+                                         set_by_user=param.set_by_user, optional=param.optional,
+                                         param.filter_topics, param.filter_device_classes)
     end
 
     # group_type holds a DataType that may live in the context's anonymous
@@ -490,6 +493,9 @@ function to_dict(ctx::ContextState)
     # Only the titles, the functions live in the context module
     callbacks = OrderedDict{String, String}(name => cb.title for (name, cb) in ctx.callbacks)
 
+    input_topics = Dict{String, Union{String, Nothing}}(name => input_topic(get_input_group(ctx, name))
+                                                        for name in keys(ctx.inputs))
+
     return Dict("dag" => dag,
                 "subvariables" => ctx.subvariables,
                 "postprocessors" => ctx.variable_postprocessors,
@@ -499,6 +505,7 @@ function to_dict(ctx::ContextState)
                 "displayables" => displayables,
                 "callbacks" => callbacks,
                 "inputs" => inputs,
+                "input_topics" => input_topics,
                 "groups" => groups,
                 "origins" => origins,
                 "dep_to_input" => ctx.dep_to_input,
@@ -559,6 +566,14 @@ function topological_sort(dag)
         internal_dag[name] = [x isa Dependency && x.kind == DepKind_Subvariable ? x.parent : string(x)
                               for x in values(deps)
                               if !(x isa Dependency && x.kind ∈ (DepKind_Karabo, DepKind_Group)) && !(x isa Parameter)]
+    end
+
+    for (name, deps) in internal_dag
+        for dep in deps
+            if !haskey(internal_dag, dep)
+                throw(XfaContextException("Variable '$(name)' depends on unknown variable '$(dep)'"))
+            end
+        end
     end
 
     sorted_graph = String[]
@@ -697,6 +712,11 @@ function input_wrapper(name, group, channel)
         close(channel)
     end
 end
+
+# Convert Python values returned by a variable into Julia ones, implemented by
+# the PythonCall extension.
+convert_python(x) = x
+convert_python(v::VariableData) = @set v.data = convert_python(v.data)
 
 function wrap_result(result, tid, name; subvariables=Dict{String, Any}(), update_rate=0.0)
     if result isa VariableData
@@ -897,6 +917,11 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             tid, matched_data = only(matched_trains)
             empty!(matched_trains)
 
+            # stop_pipeline() closes the output, don't start another train
+            if !isopen(stream_output)
+                break
+            end
+
             f = worker_state.dag_functions[name]
             subvar_values = Dict{String, Any}()
             empty_result = VariableData(tid, name, nothing)
@@ -934,6 +959,13 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                                 Meta.scratch => scratch,
                                 Meta.subvariables => subvar_values,
                                 @invokelatest f(args...))
+
+                    # Python objects are never sent on, so postprocessors and
+                    # downstream variables only see Julia values.
+                    out = @invokelatest convert_python(out)
+                    for (subvar_name, subvar_value) in subvar_values
+                        subvar_values[subvar_name] = @invokelatest convert_python(subvar_value)
+                    end
                 catch ex
                     @error "Execution of variable '$(name)' failed" exception=(ex, catch_backtrace())
                     emit(empty_result)
@@ -947,15 +979,25 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                 # pause_pipeline() (e.g. from change_parameter) can't mutate
                 # postprocessor state between or during the two.
                 if !isempty(postprocessors)
-                    raw_out = out isa VariableData ? out.data : out
                     for (pp_name, pp) in postprocessors
+                        # The source is the output name's parent: the variable or one of its subvariables
+                        source = pp_name[1:findlast('.', pp_name) - 1]
+                        if source == name
+                            pp_input = out
+                        elseif haskey(subvar_values, source)
+                            pp_input = subvar_values[source]
+                        else
+                            continue
+                        end
+                        raw_input = pp_input isa VariableData ? pp_input.data : pp_input
+
                         try
                             subvar_values[pp_name] = @with(Meta.tid => tid,
                                                            Meta.name => pp_name,
                                                            Meta.group_name => group_name,
                                                            Meta.scratch => scratch,
                                                            Meta.subvariables => subvar_values,
-                                                           pp(raw_out))
+                                                           pp(raw_input))
                         catch ex
                             @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
                         end
@@ -996,7 +1038,22 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
             close(channel)
         end
 
+        # Unblock pumps stuck in put! on a full input_data
+        close(input_data)
         wait(input_task)
+
+        # Drop the unprocessed backlog so its train data can be freed
+        for arg in values(upstream)
+            if arg isa AbstractChannel
+                while isready(arg)
+                    take!(arg)
+                end
+            end
+        end
+
+        while isready(input_data)
+            take!(input_data)
+        end
     end
 end
 
@@ -1141,6 +1198,8 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
                                   "no input: $(join(unrouted, ", "))"))
     end
 
+    update_input_sources(ctx)
+
     # Start the input functions to feed the DAG
     for (name, deps) in ctx.inputs
         group = nothing
@@ -1155,7 +1214,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
 
         ctx.input_channels[name] = Channel(1)
-        ctx.input_tasks[name] = Threads.@spawn input_wrapper(name, group, ctx.input_channels[name])
+        ctx.input_tasks[name] = Threads.@spawn @with Meta.name => name input_wrapper(name, group, ctx.input_channels[name])
         errormonitor(ctx.input_tasks[name])
     end
 
@@ -1188,7 +1247,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.input_variable_channels[name] = downstream_neighbours
 
-        ctx.input_variables_tasks[name] = Threads.@spawn :samepool stream_input(ctx, name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates, get(monitors, name, []))
+        ctx.input_variables_tasks[name] = Threads.@spawn :samepool @with Meta.name => name stream_input(ctx, name, ctx.input_channels[name], downstream_neighbours, ctx.input_rates, get(monitors, name, []))
         errormonitor(ctx.input_variables_tasks[name])
     end
 
@@ -1206,12 +1265,9 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         end
         ctx.external_dependency_channels[dep_name] = downstream_neighbours
 
-        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
+        ctx.external_dependency_tasks[dep_name] = Threads.@spawn :samepool @with Meta.name => dep_name stream_external_dependency(dep_name, input_neighbour, downstream_neighbours)
         errormonitor(ctx.external_dependency_tasks[dep_name])
     end
-
-    # Update the inputs
-    update_input_sources(ctx)
 
     # Offline drops nothing: keep partial trains indefinitely (see Trainmatcher).
     max_train_latency = offline ? -1 : 20
@@ -1264,11 +1320,12 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
             continue
         end
 
-        var_pps = Dict{String, AbstractPostprocessor}(
+        # Kept in declaration order so a postprocessor can consume an earlier one's output
+        var_pps = OrderedDict{String, AbstractPostprocessor}(
             pp_name => ctx.postprocessors[pp_name]
             for pp_name in get(ctx.variable_postprocessors, name, String[])
         )
-        ctx.variable_tasks[name] = Threads.@spawn stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
+        ctx.variable_tasks[name] = Threads.@spawn @with Meta.name => name stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
         errormonitor(ctx.variable_tasks[name])
     end
 
@@ -1291,11 +1348,11 @@ function stop_pipeline(ctx::ContextState; timeout=5)
     ctx.is_running[] = false
 
     # Close every channel up front, before waiting on any task. Each stage loops
-    # `while isopen(ch) || isready(ch)`, so leaving downstream channels open
-    # would make the stages drain (process) their whole buffered backlog before
-    # exiting. With everything closed, a stage's `putall!(downstream)` throws
-    # InvalidStateException after at most one more item, so the pipeline stops
-    # promptly and any buffered items are discarded.
+    # `while isopen(ch) || isready(ch)`, so leaving channels open would make the
+    # stages process their whole buffered backlog before exiting. Closing
+    # `stream_output` stops variables without downstream consumers too since
+    # they check it before each train and their next emit throws.
+    close(ctx.stream_output)
     for ch in values(ctx.input_channels)
         close(ch)
     end
@@ -1442,8 +1499,11 @@ function _is_context_method(m::Method)
         return false      # not a concrete singleton (e.g. the default method)
     end
 
-    mod_names = string.(fullname(parentmodule(owner)))
-    return any(startswith.(mod_names, "UserContext"))
+    # The precompile workload's context is loaded into _InternalPrecompileModule,
+    # and its methods survive into the package image.
+    mod = parentmodule(owner)
+    mod_names = string.(fullname(mod))
+    return mod === _InternalPrecompileModule || any(startswith.(mod_names, "UserContext"))
 end
 
 function _cleanup_context_methods()
@@ -1463,7 +1523,7 @@ function eval_context(ctx_module::Module, ctx_str::AbstractString, prelude::Vect
         using XfaContext.DimensionalData
 
         using XfaContext
-        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta, @pysafe
+        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta
     end
     @eval ctx_module $init_expr
 
@@ -1725,11 +1785,15 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; @nospecialize
 
             for (pp_name, processor) in pps
                 pp_name = replace(pp_name::String, func_base => name; count=1)
+                source = pp_name[1:findlast('.', pp_name) - 1]
+                if source != name && source ∉ ctx_subvariables[name]
+                    throw(XfaContextException("Postprocessor '$(pp_name)' has unknown source subvariable '$(source)'"))
+                end
                 ctx_postprocessors[pp_name] = processor
                 push!(ctx_variable_postprocessors[name], pp_name)
 
                 # Add subvariable names that weren't known at macro time
-                # (one-arg @add_postprocessor form using default_name)
+                # (postprocessors named by default_name)
                 if pp_name ∉ ctx_subvariables[name]
                     push!(ctx_subvariables[name], pp_name)
                 end
@@ -1942,6 +2006,11 @@ module _InternalPrecompileModule end
     @compile_workload begin
         exprs = eval_context(_InternalPrecompileModule, ctx_str, Expr[])
         @invokelatest load_from_module(_InternalPrecompileModule, exprs; dep_router=(topic, source) -> nothing)
+
+        # For Correlation.fit
+        sol = solve(CurveFitProblem([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]), LinearCurveFitAlgorithm())
+        successful_retcode(sol.retcode)
+        rss(sol)
     end
 
     global current_ctx = nothing
