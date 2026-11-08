@@ -613,7 +613,7 @@ end
         image = XFA.VariableStore(; data=zeros(2, 3), fixed_aspect=false)
         spec = XFA.default_spec("image", image)
         layer = only(spec.layers)
-        @test (layer.mark, layer.x.field, layer.y.field, layer.color.scheme) == (XFA.Mark_Rect, "col", "row", "turbo")
+        @test (layer.mark, layer.x.field, layer.y.field, layer.color.scheme) == (XFA.Mark_Rect, "col", "row", "viridis")
         @test !spec.fixed_aspect
         @test (XFA.field_dim(image.data, "row"), XFA.field_dim(image.data, "col")) == (1, 2)
         image.x_axis = [10, 20, 30]

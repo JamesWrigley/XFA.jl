@@ -197,7 +197,7 @@ end
 @kwdef mutable struct ImageState
     const fixed_aspect::Ref{Bool} = Ref(true)
     const log_scale::Ref{Bool} = Ref(false)
-    colormap::Cint = turbo_colormap()
+    colormap::Cint = Cint(ImPlot.ImPlotColormap_Viridis)
     const colorbar::ColorbarState = ColorbarState()
     gpu_heatmap::Union{Nothing, GPUHeatmap} = nothing
 end

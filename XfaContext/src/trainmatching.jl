@@ -193,7 +193,7 @@ function LayerSpec(; data::AbstractString="", mark::Symbol=:line,
             throw(ArgumentError("an image takes a dim for x and y, and no color"))
         end
         LayerSpec(String(data), Mark_Rect, 1.0, axis(something(x, "col")), axis(something(y, "row")),
-                  colored("value", FieldType_Quantitative, "turbo"), ())
+                  colored("value", FieldType_Quantitative, "viridis"), ())
     else
         if !isnothing(y)
             throw(ArgumentError("y is only supported for images"))

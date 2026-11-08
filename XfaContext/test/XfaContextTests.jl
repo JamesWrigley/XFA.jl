@@ -189,7 +189,7 @@ end
 
     image = LayerSpec(; data="detector", mark=:image)
     @test (image.mark, image.x.field, image.y.field, image.color.field) == (Context.Mark_Rect, "col", "row", "value")
-    @test image.color.scheme == "turbo"
+    @test image.color.scheme == "viridis"
 
     # A model fit drawn over the spec's layers
     fit = Context.ModelOverlay(:gaussian; params="spectrum.fit")

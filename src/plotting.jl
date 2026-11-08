@@ -1462,7 +1462,7 @@ function default_spec(name, store)
     dim_field(dim, plain) = data isa DimArray ? string(DD.name(DD.dims(data, dim))) : plain
 
     layer = if data isa AbstractMatrix
-        color = ChannelDef("value", FieldType_Quantitative, "value", false, "turbo", false)
+        color = ChannelDef("value", FieldType_Quantitative, "value", false, "viridis", false)
         LayerSpec(String(name), Mark_Rect, 1.0, axis_channel(dim_field(2, "col"), store.xlabel),
                   axis_channel(dim_field(1, "row"), store.ylabel), color, ())
     else
