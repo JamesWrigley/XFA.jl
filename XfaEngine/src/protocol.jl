@@ -69,6 +69,12 @@ struct InvokeCallback <: AbstractMessage
     name::String
 end
 
+# Fetch the record `key` of `output`, listed in its `VariableData.records`
+struct GetRecord <: AbstractMessage
+    output::String
+    key::String
+end
+
 struct GetRoutingRules <: AbstractMessage end
 
 struct GetRemapRules <: AbstractMessage end
@@ -173,6 +179,12 @@ struct TrainData <: AbstractMessage
     variables::Vector{VariableData}
 end
 
+struct Record <: AbstractMessage
+    output::String
+    key::String
+    data::Any
+end
+
 # Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
 # snapshots keyed by (producer, consumer); producer is either an external
 # dependency name (e.g. "motor.pos") or a variable name, consumer is always
@@ -222,6 +234,13 @@ const _client_counter = Threads.Atomic{Int}(1)
 const _server_counter = Threads.Atomic{Int}(-1)
 next_client_id() = Threads.atomic_add!(_client_counter, 1)
 next_server_id() = Threads.atomic_add!(_server_counter, -1)
+
+# Serialize a message from the server, to send it later with `WebSockets.send`
+function server_encode(msg::AbstractMessage; reply_to::Union{MessageId, Nothing}=nothing)
+    buffer = IOBuffer()
+    serialize(buffer, Envelope(next_server_id(), reply_to, msg))
+    return take!(buffer)
+end
 
 function _send(ws::WebSockets.WebSocket, id::MessageId, msg::AbstractMessage;
                reply_to::Union{MessageId, Nothing}=nothing)

@@ -779,6 +779,35 @@ end
     @test ctx.groups["counter"].count == 1
 end
 
+@testset "Records" begin
+    ctx = Context.load_from_string(raw"""
+    @Group mutable struct Recorder
+        source::Parameter{Dependency} = Parameter{Dependency}()
+        seen::Vector{Int} = Int[]
+    end
+    Context.get_record(r::Recorder, key) = r.seen[parse(Int, key)]
+
+    @Variable function record(r::Recorder, x -> Recorder.source)
+        push!(r.seen, x)
+        return Context.VariableData(x; records=string.(eachindex(r.seen)))
+    end
+    r = Recorder(; source=karabo"foo.bar")
+
+    @Input function input(::Context.MockInput, output)
+        for tid in 1:2
+            put!(output, (tid, Dict("foo" => Dict("bar" => 10tid))))
+        end
+    end
+    i = Context.MockInput()
+    """)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test last(collect(ctx.stream_output)).records == ["1", "2"]
+    @test Context.with_record(identity, ctx, "r.record", "2") == 20
+    @test_throws XfaContextException Context.with_record(identity, ctx, "unknown", "1")
+end
+
 @testset "Parameter" begin
     # Smoke tests for constructors
     @test Parameter(0) isa Parameter

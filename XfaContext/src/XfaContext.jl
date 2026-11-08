@@ -109,6 +109,10 @@ device_classes(::Any) = Dict{Symbol, Any}()
 # order: `pp(output, extras...)`.
 postprocessor_dependencies(::Any) = Dependency[]
 
+# The value to display for the record `key` of a group or postprocessor, whose
+# outputs list the keys in `VariableData.records`.
+get_record(owner, key) = throw(XfaContextException("$(typeof(owner)) doesn't hold records"))
+
 # The DAG key of the `i`th dependency of postprocessor `pp`, which lives in its
 # variable's DAG entry alongside the argument names.
 struct PostprocessorDep
@@ -126,7 +130,7 @@ variable_origin(f) = f
 # callers.
 for f in (variable_subvariables, variable_postprocessors, variable_displays, input_topic, input_device,
           get_sources, monitored_properties, on_properties_changed, device_classes,
-          postprocessor_dependencies, variable_origin)
+          postprocessor_dependencies, get_record, variable_origin)
     typeof(f).name.concrete_only = true
 end
 
@@ -691,6 +695,23 @@ function invoke_callback(ctx::ContextState, name::String)
     group = ctx.groups[group_prefix(name)]
     pause_pipeline() do
         @invokelatest callback.f(group)
+    end
+end
+
+# Call `f` with the record `key` of `output` (see `get_record`) under the
+# pipeline pause, so `f` can read it before its owner changes it again. The
+# owner is the postprocessor making `output`, or the group of a group variable.
+function with_record(f, ctx::ContextState, output::String, key::String)
+    owner = if haskey(ctx.postprocessors, output)
+        ctx.postprocessors[output]
+    elseif haskey(ctx.groups, group_prefix(output))
+        ctx.groups[group_prefix(output)]
+    else
+        throw(XfaContextException("Output '$(output)' has no group or postprocessor to hold records"))
+    end
+
+    pause_pipeline() do
+        f(@invokelatest get_record(owner, key))
     end
 end
 

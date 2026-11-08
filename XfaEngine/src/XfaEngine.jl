@@ -649,6 +649,18 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             @error "Callback '$(msg.name)' failed" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
         end
+    elseif msg isa Protocol.GetRecord
+        try
+            # Serialized under the pause, the owner may change the record afterwards
+            reply = Context.with_record(state.ctx, msg.output, msg.key) do data
+                Protocol.server_encode(Protocol.Record(msg.output, msg.key, data); reply_to)
+            end
+            WebSockets.send(ws, reply)
+        catch ex
+            @error "Fetching record '$(msg.key)' of '$(msg.output)' failed" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Protocol.Record(msg.output, msg.key, Protocol.ExceptionMessage(ex, catch_backtrace()));
+                                 reply_to)
+        end
     elseif msg isa Start
         @info "Starting pipeline..."
         try

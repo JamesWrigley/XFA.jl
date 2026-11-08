@@ -271,6 +271,8 @@ end
     plot_specs::Vector{PlotSpec} = PlotSpec[]
     update_rate::Float64 = 0.0
     compress::Bool = true
+    # Keys of the records the output's owner holds, see `get_record`
+    records::Vector{String} = String[]
 end
 
 VariableData(data; kwargs...) = VariableData(; data, kwargs...)
