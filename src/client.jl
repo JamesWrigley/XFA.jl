@@ -1609,8 +1609,9 @@ end
 
 function load_context(state)
     client = state.client
-    send(client, LoadContext(client.context_path))
+    # Set before sending, since a fast reply could otherwise be overwritten
     client.context.pipeline_status = PipelineStatus_LoadingContext
+    send(client, LoadContext(client.context_path))
 end
 
 function revise_engine(state)
@@ -1660,13 +1661,13 @@ function start(state)
         store.update_rate = 0
     end
 
-    send(state.client, Start())
     state.client.context.pipeline_status = PipelineStatus_Starting
+    send(state.client, Start())
 end
 
 function stop(state)
-    send(state.client, Stop())
     state.client.context.pipeline_status = PipelineStatus_Stopping
+    send(state.client, Stop())
 end
 
 function set_routing_rules(client, rules::AbstractVector{RoutingRule})
