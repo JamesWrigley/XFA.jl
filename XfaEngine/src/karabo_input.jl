@@ -213,9 +213,7 @@ function stream_bridge(bridge::KaraboInput, output)
             # Notify clients of the new address
             engine_state = current_engine_state
             if !isnothing(engine_state)
-                for client in values(engine_state.clients)
-                    Protocol.server_send(client.websocket, ParameterChanged(bridge.address))
-                end
+                broadcast_message(engine_state, ParameterChanged(bridge.address))
             end
         end
 

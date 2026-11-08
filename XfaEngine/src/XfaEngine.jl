@@ -37,7 +37,7 @@ using Accessors: @set, setproperties
 # on the engine's webproxy/device discovery and the ZMQ KaraboBridge transport.
 include("karabo_input.jl")
 
-using Base.CoreLogging: AbstractLogger, LogLevel, Info, global_logger
+using Base.CoreLogging: AbstractLogger, LogLevel, Debug, Info, Warn, @logmsg, global_logger
 using Base.ScopedValues: ScopedValue, @with
 using DataStructures: CircularBuffer
 using FileWatching: watch_file
@@ -224,19 +224,25 @@ function forward_output(state::EngineState, data::VariableData, cache)
     end
 end
 
+# Send `msg` to every connected client, serializing it only once. Failures are
+# logged at `level`.
+function broadcast_message(state::EngineState, msg::Protocol.AbstractMessage, level::LogLevel=Warn)
+    bytes = Protocol.server_encode(msg)
+    for (id, client) in state.clients
+        try
+            WebSockets.send(client.websocket, bytes)
+        catch ex
+            @logmsg level "Failed to broadcast $(nameof(typeof(msg))) to client '$(id)'" exception=ex
+        end
+    end
+end
+
 # Installed as the context's on_parameter_changed hook: broadcast an
 # engine-initiated parameter change to every connected client so their GUIs
 # stay in sync. Runs on proc 1 (where set_parameter calls the hook).
 function broadcast_parameter_changed(state::EngineState, name, value)
     param = state.ctx.parameters[name]
-    msg = Protocol.ParameterChanged(typeof(param)(; name, value))
-    for (id, client) in state.clients
-        try
-            Protocol.server_send(client.websocket, msg)
-        catch ex
-            @warn "Failed to broadcast set_parameter to client '$(id)'" exception=ex
-        end
-    end
+    broadcast_message(state, Protocol.ParameterChanged(typeof(param)(; name, value)))
 end
 
 function save_parameter(ctx::ContextState, name, value)
@@ -247,28 +253,12 @@ function save_parameter(ctx::ContextState, name, value)
     end
 end
 
-function broadcast_displayable_changed(state::EngineState, displayable::Displayable)
-    msg = Protocol.DisplayableChanged(displayable)
-    for (id, client) in state.clients
-        try
-            Protocol.server_send(client.websocket, msg)
-        catch ex
-            @warn "Failed to broadcast DisplayableChanged to client '$(id)'" exception=ex
-        end
-    end
-end
+broadcast_displayable_changed(state::EngineState, displayable::Displayable) =
+    broadcast_message(state, Protocol.DisplayableChanged(displayable))
 
 # Resend the context to every client, e.g. after a rewire changed its edges.
-function broadcast_context_info(state::EngineState)
-    msg = ContextInfo(state.ctx, read(state.ctx.path, String))
-    for (id, client) in state.clients
-        try
-            Protocol.server_send(client.websocket, msg)
-        catch ex
-            @warn "Failed to broadcast ContextInfo to client '$(id)'" exception=ex
-        end
-    end
-end
+broadcast_context_info(state::EngineState) =
+    broadcast_message(state, ContextInfo(state.ctx, read(state.ctx.path, String)))
 
 # Broadcast the loaded context file whenever it changes, e.g. when a client
 # writes a parameter change to it. The timeout lets us notice a newly loaded
@@ -285,14 +275,7 @@ function watch_context_file(state::EngineState)
                 # A single write can fire several events
                 if source != last_source
                     last_source = source
-                    msg = Protocol.ContextSource(source)
-                    for (id, client) in state.clients
-                        try
-                            Protocol.server_send(client.websocket, msg)
-                        catch ex
-                            @warn "Failed to broadcast ContextSource to client '$(id)'" exception=ex
-                        end
-                    end
+                    broadcast_message(state, Protocol.ContextSource(source))
                 end
             end
         catch ex
@@ -323,13 +306,7 @@ function start_pipeline(state::EngineState)
         # A requested stop is acknowledged by its own handler; only a pipeline
         # that ended on its own (e.g. an offline run finishing) is unannounced.
         if !state.stop_requested
-            for (id, client) in state.clients
-                try
-                    Protocol.server_send(client.websocket, Stopped())
-                catch ex
-                    @warn "Failed to broadcast Stopped to client '$(id)'" exception=ex
-                end
-            end
+            broadcast_message(state, Stopped())
         end
     end
     errormonitor(state.pipeline_task)
@@ -407,14 +384,7 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
             continue
         end
 
-        msg = Protocol.PipelineStats(stats, copy(ctx.input_rates))
-        for client in values(state.clients)
-            try
-                Protocol.server_send(client.websocket, msg)
-            catch ex
-                @debug "Failed to send PipelineStats to client" exception=(ex, catch_backtrace())
-            end
-        end
+        broadcast_message(state, Protocol.PipelineStats(stats, copy(ctx.input_rates)), Debug)
     end
 end
 
@@ -628,14 +598,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
 
             # Broadcast the new value to all clients so they stay in sync and
             # the originating client can confirm the engine accepted the value.
-            broadcast = ParameterChanged(param)
-            for (other_id, other) in state.clients
-                try
-                    Protocol.server_send(other.websocket, broadcast)
-                catch ex
-                    @warn "Failed to broadcast ParameterChanged to client '$(other_id)'" exception=ex
-                end
-            end
+            broadcast_message(state, ParameterChanged(param))
         catch ex
             @error "Failed to change parameter '$(param.name)'" exception=(ex, catch_backtrace())
             Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)

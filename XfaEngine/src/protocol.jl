@@ -235,20 +235,20 @@ const _server_counter = Threads.Atomic{Int}(-1)
 next_client_id() = Threads.atomic_add!(_client_counter, 1)
 next_server_id() = Threads.atomic_add!(_server_counter, -1)
 
-# Serialize a message from the server, to send it later with `WebSockets.send`
-function server_encode(msg::AbstractMessage; reply_to::Union{MessageId, Nothing}=nothing)
+function encode(id::MessageId, msg::AbstractMessage; reply_to::Union{MessageId, Nothing}=nothing)
     buffer = IOBuffer()
-    serialize(buffer, Envelope(next_server_id(), reply_to, msg))
+    serialize(buffer, Envelope(id, reply_to, msg))
     return take!(buffer)
 end
 
+# Serialize a message from the server, to send it later with `WebSockets.send`
+server_encode(msg::AbstractMessage; reply_to::Union{MessageId, Nothing}=nothing) =
+    encode(next_server_id(), msg; reply_to)
+
 function _send(ws::WebSockets.WebSocket, id::MessageId, msg::AbstractMessage;
                reply_to::Union{MessageId, Nothing}=nothing)
-    envelope = Envelope(id, reply_to, msg)
-    buffer = IOBuffer()
-    serialize(buffer, envelope)
-    WebSockets.send(ws, take!(buffer))
-    return envelope.id
+    WebSockets.send(ws, encode(id, msg; reply_to))
+    return id
 end
 
 function client_send(ws::WebSockets.WebSocket, msg::AbstractMessage;
