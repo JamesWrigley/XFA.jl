@@ -440,7 +440,7 @@ function upload_data!(h::GPUHeatmap, data::AbstractMatrix)
     end
 end
 
-# Approximate (p1, p99) of `data` with no sorting. Samples every 10th element
+# Approximate (p1, p99) of `data`, or (p1, p99.9) in log mode, with no sorting. Samples every 10th element
 # (the whole array for small inputs) and estimates the percentiles with a
 # two-pass histogram: pass 1 gets the value range, pass 2 bins the sample, then
 # we walk the cumulative counts to the target rank with linear in-bin
@@ -513,8 +513,8 @@ function sampled_pctile!(buf::Vector{Int32}, data::AbstractArray, log::Bool=fals
 
     binwidth = (hi - lo) / PCTILE_NBINS
     p1 = quantile_at(buf, 0.01 * total, lo, hi, binwidth)
-    p99 = quantile_at(buf, 0.99 * total, lo, hi, binwidth)
-    return (p1, p99)
+    phigh = quantile_at(buf, (log ? 0.999 : 0.99) * total, lo, hi, binwidth)
+    return (p1, phigh)
 end
 
 # Walk the histogram's cumulative counts to the target rank, interpolating
@@ -1022,6 +1022,17 @@ function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     if store.received_bytes > 0
         ig.TextDisabled(@sprintf("%.1f MB/s @ 10Hz", store.received_bytes * 10 / 1e6))
     end
+end
+
+# Wide enough for the tick labels plus a visible bar. Ticks are estimated from
+# the axis limits, which carry the most digits.
+function colorbar_width(img::ImageState)
+    cb = img.colorbar
+    label(v) = img.log_scale[] ? @sprintf("1e%g", v) : @sprintf("%g", v)
+    label_w = max(ig.CalcTextSize(label(cb.display_min[])).x, ig.CalcTextSize(label(cb.display_max[])).x)
+    style = ImPlot.GetStyle()
+    padding = 2 * unsafe_load(style.PlotPadding.x) + unsafe_load(style.LabelPadding.x)
+    return max(100f0, 30f0 + label_w + padding)
 end
 
 # Interactive colorbar, drawn as a narrow plot whose Y axis is the display
@@ -2198,7 +2209,7 @@ function prepare!(view::SpecView, plot::Plot, updated_variables)
     end
 end
 
-# Clip the colorbar to the (p1, p99) of `data`. The visible range follows unless
+# Clip the colorbar to the (p1, p99) of `data`, p99.9 in log mode. The visible range follows unless
 # the user zoomed it, or on a `reset`.
 function fit_colorbar!(cb::ColorbarState, hist_buf, data, log, reset)
     dmin, dmax = sampled_pctile!(hist_buf, data, log)
@@ -2453,7 +2464,6 @@ end
 
 function draw_plot_contents(plot::Plot, updated_variables)
     side_panel_width = 320f0
-    colorbar_width = 100f0
     view = plot.view
 
     top_controls(view.source, view.id)
@@ -2478,7 +2488,8 @@ function draw_plot_contents(plot::Plot, updated_variables)
         tab_w = 14.0f0
         spacing = unsafe_load(ig.GetStyle().ItemSpacing.x)
         img = image_state(view)
-        reserved = tab_w + spacing + (isnothing(img) ? 0f0 : colorbar_width + spacing)
+        cb_width = isnothing(img) ? 0f0 : colorbar_width(img)
+        reserved = tab_w + spacing + (isnothing(img) ? 0f0 : cb_width + spacing)
         plot_width = max(plot_size.x - reserved, 100f0)
         plot_flags = (!isnothing(img) && img.fixed_aspect[]) ?
                      ImPlot.ImPlotFlags_Equal : ImPlot.ImPlotFlags_None
@@ -2506,7 +2517,7 @@ function draw_plot_contents(plot::Plot, updated_variables)
 
         if !isnothing(img)
             ig.SameLine()
-            if interactive_colorbar(img, view.id, ImVec2(colorbar_width, plot_size.y)) &&
+            if interactive_colorbar(img, view.id, ImVec2(cb_width, plot_size.y)) &&
                !isnothing(img.gpu_heatmap)
                 cb = img.colorbar
                 update_colormap!(get_heatmap_context(), img.colormap)

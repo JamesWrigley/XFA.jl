@@ -246,19 +246,20 @@ end
     @test p1 ≈ e1 atol = 1.0
     @test p99 ≈ e99 atol = 1.0
 
-    # Log mode: percentiles of the log10 of the positive samples.
+    # Log mode: 1st/99.9th percentiles of the log10 of the positive samples.
+    log_pct(v) = (XFA.nanpctile(v, 1), XFA.nanpctile(v, 99.9))
     small_pos = reshape(10.0 .^ collect(0.0:0.01:0.99), 10, 10)
-    e1, e99 = pct(log10.(vec(small_pos)))
-    p1, p99 = XFA.sampled_pctile!(buf, small_pos, true)
+    e1, ehigh = log_pct(log10.(vec(small_pos)))
+    p1, phigh = XFA.sampled_pctile!(buf, small_pos, true)
     @test p1 ≈ e1 atol = 0.05
-    @test p99 ≈ e99 atol = 0.05
+    @test phigh ≈ ehigh atol = 0.05
 
     # Non-positive samples are dropped before log10.
     mixed_log = [-1.0 0.0 NaN; 1.0 10.0 NaN; 100.0 1000.0 NaN]
-    e1, e99 = pct(log10.(filter(x -> isfinite(x) && x > 0, vec(mixed_log))))
-    p1, p99 = XFA.sampled_pctile!(buf, mixed_log, true)
+    e1, ehigh = log_pct(log10.(filter(x -> isfinite(x) && x > 0, vec(mixed_log))))
+    p1, phigh = XFA.sampled_pctile!(buf, mixed_log, true)
     @test p1 ≈ e1 atol = 0.1
-    @test p99 ≈ e99 atol = 0.1
+    @test phigh ≈ ehigh atol = 0.1
 
     # No positive samples → fallback, never NaN/-Inf from log10(≤0).
     @test XFA.sampled_pctile!(buf, [-1.0 0.0; 0.0 -2.0], true) == (0.0, 1.0)
