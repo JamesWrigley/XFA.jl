@@ -2441,6 +2441,10 @@ function setup_sentry(settings)
     end
 end
 
+# Everything outside FontAwesome's Private Use Area (E000-F8FF). Glyphs load
+# lazily so ImGui keeps this pointer.
+const ICON_EXCLUDE_RANGES = ig.ImWchar[0x1, 0xdfff, 0xf900, 0x10ffff, 0]
+
 function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
@@ -2472,6 +2476,11 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     # Load fonts
     font_config = ig.ImFontConfig()
     font_config.MergeMode = true
+    # FontAwesome maps some non-icon codepoints (e.g. Greek) to blank glyphs, which
+    # would shadow the fallback font, so only merge its icon range.
+    icon_config = ig.ImFontConfig()
+    icon_config.MergeMode = true
+    icon_config.GlyphExcludeRanges = pointer(ICON_EXCLUDE_RANGES)
     font_atlas = unsafe_load(ig.GetIO().Fonts)
     font_dir = joinpath(@__DIR__, "fonts")
     fonts=[
@@ -2483,8 +2492,10 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     for (font, font_size) in fonts
         # This ends up as the last font, which must be monospaced for the context editor
         gui_state.mono_font = ig.AddFontFromFileTTF(font_atlas, font, font_size)
-        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, font_config)
-        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, font_config)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-regular-400.otf"), 20, icon_config)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "fa-solid-900.otf"), 20, icon_config)
+        # Fallback for glyphs missing from the base font (e.g. Greek/math symbols in names)
+        ig.AddFontFromFileTTF(font_atlas, joinpath(font_dir, "JuliaMono-Regular.ttf"), font_size, font_config)
     end
 
     # Setup ImPlot context
