@@ -1954,6 +1954,13 @@ end
         @test isequal(m([1.0, NaN]), [1.0, NaN])
         @test m([NaN, 4.0]) == [1.0, 4.0]
         @test m([3.0, Inf]) == [2.0, 4.0]
+
+        # DimArray outputs follow the latest input's lookups
+        m = Context.MovingAvg(; nsamples=3)
+        m(DimArray([1.0, 2.0], (Dim{:energy}([10, 20]),)))
+        out = m(DimArray([3.0, 4.0], (Dim{:energy}([11, 21]),)))
+        @test parent(out) == [2.0, 3.0]
+        @test lookup(out, :energy) == [11, 21]
     end
 
     @testset "center_of_mass" begin

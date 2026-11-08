@@ -507,6 +507,9 @@ function (m::MovingAvg)(data::AbstractArray)
     return update_moving_avg!(m.buffer, data, m.nsamples[])
 end
 
+# The buffer holds plain values, so the output carries the latest input's lookups
+(m::MovingAvg)(data::DD.AbstractDimArray) = DD.rebuild(data, m(parent(data)))
+
 # Scalars go through the same buffer as a zero-dimensional array
 (m::MovingAvg)(data::Number) = m(fill(data))[]
 
