@@ -196,28 +196,6 @@ function draw_online_bridge(name, params, gui_state)
     end
 end
 
-# The scantool is chosen among the Karabacon devices. With one assigned the
-# motor dependency and resolution are derived by the engine (see Scan in
-# context_builtins.jl), so the derived parameters are hidden and the motor's
-# pin is shown but not editable.
-function draw_variable_content(::Val{Symbol("XfaContext.Scan")}, name, var_data, gui_state)
-    var_data["draw_parameters"] = false
-    params = var_data["parameters"]
-    automatic = isassigned(params["scantool"])
-
-    ig.Text("Parameters:")
-    for (param_name, param) in params
-        if !(automatic && param_name in ("resolution", "position_property"))
-            draw_parameter(param_name, param)
-        end
-    end
-
-    for pin in var_data["dependencies"]
-        pin.readonly = automatic && pin.field == "position1"
-    end
-    return nothing
-end
-
 # Resolve the variable name connected to a group's Parameter{Dependency} field.
 function group_dep_variable(var_data, field::AbstractString)
     for pin in var_data["dependencies"]

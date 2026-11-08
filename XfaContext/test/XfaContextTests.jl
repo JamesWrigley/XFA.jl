@@ -1048,62 +1048,47 @@ end
 
 @testset "Scan automatic mode" begin
     ctx = Context.load_from_string(raw"""
-    # The scantool's properties and the trains following them, edited by the test
-    scantool = Ref{Any}(nothing)
-    trains = Ref{Any}([])
+    # A 1-D scan moving MOTOR_X and MOTOR_A together from a shared start point,
+    # the latter in steps of 0.1, which pauses after train 3 and ends at train 6
+    train(tid, state, pos, intensity) =
+        tid => Dict("det" => Dict("intensity" => intensity), "MOTOR_A" => Dict("actualPosition" => pos),
+                    "SCAN" => Dict("state" => state, "scanEnv.scanType" => "ascan",
+                                   "scanEnv.startPoints" => [0.0], "scanEnv.stopPoints" => [5.0, 1.0],
+                                   "scanEnv.steps" => [10], "deviceEnv.activeMotors" => ["x", "a"],
+                                   "deviceEnv.activeMotorDeviceIds" => ["MOTOR_X", "MOTOR_A"]))
     @Input function input(::Context.MockInput, output)
-        put!(output, (1, Dict("SCAN" => scantool[])))
-        for (tid, data) in trains[]
+        for (tid, data) in [train(1, "ON", 0.0, 0.0), train(2, "ACQUIRING", 0.0, 1.0),
+                            train(3, "ACQUIRING", 0.1, 2.0), train(4, "PAUSED", 0.1, 3.0),
+                            train(5, "ACQUIRING", 0.2, 4.0), train(6, "ON", 0.2, 5.0)]
             put!(output, (tid, data))
         end
     end
     x = Context.MockInput()
-    scn = Context.Scan(; value=karabo"det.intensity", scantool=KaraboDevice("", "SCAN"),
-                       motor_priority=["MOTOR_A"])
+
+    @Variable function intensity(x -> karabo"det.intensity")
+        @postprocess Context.Scan(; scantool=KaraboDevice("", "SCAN"), motor_priority=["MOTOR_A"])
+        return x
+    end
     """)
-    scn = ctx.groups["scn"]
-    mod = Context.worker_state.current_ctx_module
-    configure(props...) = mod.scantool[] = Dict(Iterators.flatten(("$(k).value" => v, "$(k).timestamp.tid" => 1)
-                                                                  for (k, v) in props))
-    train(tid, motor, pos, intensity) = tid => Dict("det" => Dict("intensity" => intensity),
-                                                     motor => Dict("actualPosition" => pos))
-    scan_outputs() = [v for v in ctx.stream_output if v.name == "scn.scan" && !isnothing(v.data)]
+    scn = ctx.postprocessors["intensity.scan"]
+    scan_outputs() = [v.subvariables["intensity.scan"] for v in ctx.stream_output if v.name == "intensity"]
 
-    # Nothing is mirrored while the scantool's state is incomplete
-    @test !Context.on_properties_changed(scn, Dict("scanEnv.scanType" => (; value="ascan", tid=1)))
-    @test !isassigned(scn.position1)
-
-    # A 1-D scan moving MOTOR_X and MOTOR_A together from a shared start point,
-    # the latter in steps of 0.1: its first train derives the preferred motor and
-    # restarts the pipeline, which then bins at half that motor's step size.
-    configure("deviceEnv.activeMotorDeviceIds" => ["MOTOR_X", "MOTOR_A"], "deviceEnv.activeMotors" => ["x", "a"],
-              "scanEnv.scanType" => "ascan", "scanEnv.startPoints" => [0.0],
-              "scanEnv.stopPoints" => [5.0, 1.0], "scanEnv.steps" => [10])
-    mod.trains[] = [train(2, "MOTOR_A", 0.0, 1.0), train(3, "MOTOR_A", 0.1, 2.0),
-                    train(4, "MOTOR_A", 0.1, 3.0), train(5, "MOTOR_A", 0.2, 4.0)]
+    # The first train picks the preferred motor and restarts the pipeline to wire
+    # it, after which the scan is binned at half that motor's step size. The
+    # pause doesn't start a new scan.
     @test Context.run_pipeline(ctx)
-    @test scn.position1[] == karabo_dependency("MOTOR_A", "actualPosition")
-    @test scn.resolution[] ≈ [0.05]
+    @test scn.motor[] == karabo_dependency("MOTOR_A", "actualPosition")
     @test !Context.run_pipeline(ctx)
+    @test scn.resolution[] ≈ 0.05
     out = last(scan_outputs())
-    @test Context.DD.lookup(out.data, :position1) ≈ [0.0, 0.1, 0.2]
+    @test Context.DD.lookup(out.data, :position) ≈ [0.0, 0.1, 0.2]
     @test collect(out.data) ≈ [1.0, 2.5, 4.0]
     @test out.xlabel == "a"
-    position = out.subvariables["scn.scan.position1"]
-    @test position.data == 0.2 && position.title == "a" && position.bin_resolution ≈ 0.05
 
-    # A scan of MOTOR_B alone rewires to it and resets the bins
-    configure("deviceEnv.activeMotorDeviceIds" => ["MOTOR_B"], "deviceEnv.activeMotors" => ["b"],
-              "scanEnv.scanType" => "dscan", "scanEnv.startPoints" => [0.0],
-              "scanEnv.stopPoints" => [2.0], "scanEnv.steps" => [4])
-    mod.trains[] = [train(2, "MOTOR_B", 0.0, 5.0)]
-    @test Context.run_pipeline(ctx)
-    @test !Context.run_pipeline(ctx)
-    @test ctx.dag["scn.scan"]["position1"] == karabo_dependency("MOTOR_B", "actualPosition")
-    @test scn.resolution[] ≈ [0.25]
-    out = only(scan_outputs())
-    @test collect(out.data) == [5.0]
-    @test out.xlabel == "b"
+    # The finished scan is kept as a record
+    key = only(out.records)
+    @test endswith(key, "(train 2)")
+    @test Context.get_record(scn, key).data == out.data
 end
 
 @testset "@Input" begin
@@ -2089,70 +2074,43 @@ end
     end
 
     @testset "Scan" begin
-        # The scan body reads Meta.name/subvariables for @add_subvariable, so bind
-        # them and hand back the captured subvariable dict alongside the output.
-        runscan(scn, args...) = begin
-            subvars = Dict{String, Any}()
-            out = Base.ScopedValues.@with(Context.Meta.name => "scan",
-                                          Context.Meta.subvariables => subvars,
-                                          Context.scan(scn, args...))
-            (out, subvars)
-        end
+        # Automatic mode resolves a Karabacon and depends on its properties
+        scn = Context.Scan()
+        @test Context.device_classes(scn) == Dict(:scantool => "Karabacon")
+        scn.scantool[] = KaraboDevice("", "SCAN")
+        @test length(Context.postprocessor_dependencies(scn)) == 7
 
-        # 1-D scalar scan: nearby positions merge, a revisit folds into the
-        # existing bin, and the result is a DimArray over the bin positions with a
-        # `counts` subvariable over the same grid.
-        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"mono.energy")
-        scn.resolution[] = [0.005]
-        local out, subvars
+        # Manual mode bins by the given motor only: nearby positions merge and a
+        # revisit folds into the existing bin.
+        scn = Context.Scan(; automatic=false, motor=karabo"mono.energy", resolution=0.005)
+        @test isempty(Context.device_classes(scn))
+        @test Context.postprocessor_dependencies(scn) == [karabo"mono.energy"]
+        local out
         for (p, v) in [(-0.580, 10.0), (-0.581, 20.0), (-0.570, 100.0), (-0.580, 30.0)]
-            out, subvars = runscan(scn, v, p, nothing)
+            out = scn(v, p)
         end
-        @test out isa VariableData && out.data isa Context.DD.DimArray && !out.compress
-        @test Context.DD.lookup(out.data, :position1) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
+        @test out.data isa Context.DD.DimArray && !out.compress && isempty(out.records)
+        @test Context.DD.lookup(out.data, :position) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
         @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
         @test out.xlabel == "mono.energy"
-        @test collect(subvars["scan.counts"].data) == [3, 1]
-        position = subvars["scan.position1"]
-        @test position.data == -0.580 && position.title == "mono.energy" && position.bin_resolution == 0.005
 
-        # 2-D scalar raster: wiring position2 adds a second axis, giving a clean
-        # grid with one position lookup per motor.
-        scn = Context.Scan(; value=karabo"foo.value",
-                           position1=karabo"a.pos", position2=karabo"b.pos")
-        scn.resolution[] = [0.05, 5.0]
-        xs, ys = [0.0, 0.1, 0.2], [10.0, 20.0]
-        for (j, y) in enumerate(ys), (i, x) in enumerate(xs)
-            out, subvars = runscan(scn, 100.0 * (j - 1) + i, x, y)
+        # A resolution change re-bins the history, merging the two levels
+        scn.resolution[] = 1.0
+        Context.scan_rebin(scn, scn.resolution[])
+        out = scn(5.0, -0.575)
+        @test collect(out.data) ≈ [mean([10.0, 20.0, 100.0, 30.0, 5.0])]
+
+        # Vectors are binned elementwise, keeping their own dimension
+        scn = Context.Scan(; automatic=false, motor=karabo"a.pos", resolution=0.005)
+        for (p, v) in [(0.0, [1.0, 2.0]), (0.0, [3.0, 4.0]), (0.01, [5.0, 6.0])]
+            out = scn(v, p)
         end
-        @test size(out.data) == (length(xs), length(ys))
-        @test Context.DD.lookup(out.data, :position1) ≈ xs
-        @test Context.DD.lookup(out.data, :position2) ≈ ys
-        @test out.ylabel == "b.pos"
+        @test collect(out.data) ≈ [2.0 3.0; 5.0 6.0]
 
-        # A resolution change replays the recompute buffer: coarsening the
-        # resolution re-bins the retained tail, merging the two levels into one.
-        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"a.pos")
-        scn.resolution[] = [0.005]
-        for (p, v) in [(0.0, 1.0), (0.01, 3.0)]
-            runscan(scn, v, p, nothing)
-        end
-        @test length(scn.binner.seq) == 2
-        scn.resolution[] = [1.0]
-        Context.rebin(scn, scn.resolution[])
-        out, _ = runscan(scn, 5.0, 0.02, nothing)
-        @test length(scn.binner.seq) == 1
-        @test collect(out.data) ≈ [mean([1.0, 3.0, 5.0])]
-
-        # A value of a different shape resets the bins and the recompute buffer
-        # instead of failing to fold into the old ones.
-        scn = Context.Scan(; value=karabo"foo.value", position1=karabo"a.pos")
-        scn.resolution[] = [0.005]
-        runscan(scn, [1.0, 2.0, 3.0, 4.0, 5.0], 0.0, nothing)
-        @test_logs (:warn, r"shape changed") runscan(scn, Float64[], 0.01, nothing)
-        out, subvars = @test_logs (:warn, r"shape changed") runscan(scn, [1.0, 2.0], 0.02, nothing)
-        @test size(out.data) == (1, 2) && collect(out.data) == [1.0 2.0]
-        @test collect(subvars["scan.counts"].data) == [1]
+        # A value of a different shape resets the bins instead of failing to fold
+        # into the old ones.
+        out = @test_logs (:warn, r"shape changed") scn([1.0, 2.0, 3.0], 0.02)
+        @test size(out.data) == (1, 3) && collect(out.data) == [1.0 2.0 3.0]
         @test length(scn.binner.history) == 1
     end
 
