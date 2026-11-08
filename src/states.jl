@@ -623,6 +623,7 @@ end
     context_path::String = ""
     source::String = ""
     input_topics::Dict{String, Union{String, Nothing}} = Dict()
+    variable_postprocessors::Dict{String, Vector{String}} = Dict()
     node_positions::Dict{String, Point2d} = Dict()
     pipeline_status::PipelineStatus = PipelineStatus_Stopped
 

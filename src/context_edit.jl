@@ -92,17 +92,6 @@ set_group_param(state, var_name::AbstractString, kwarg_name::AbstractString, new
     apply_source_edit(s -> edit.replace_constructor_kwarg(s, var_name, kwarg_name, new_value), state;
                       reload)
 
-set_parameter_value(state, var_name::String, new_value::String; reload::Bool=true) =
-    apply_source_edit(s -> edit.replace_parameter_value(s, var_name, new_value), state; reload)
-
-replace_postprocess_kwarg(source::String, pp::PostprocessorInfo, kwarg_name::AbstractString,
-                          new_value::AbstractString) =
-    edit.replace_postprocess_kwarg(source, pp.var_name, pp.var_postprocessors, pp.name, kwarg_name, new_value)
-
-set_postprocessor_param(state, pp::PostprocessorInfo, kwarg_name::AbstractString, new_value::AbstractString;
-                        reload::Bool=true) =
-    apply_source_edit(s -> replace_postprocess_kwarg(s, pp, kwarg_name, new_value), state; reload)
-
 # Replace a dependency (Karabo or variable) in the source code and reload.
 rename_dep(state, variable_name::String, arg_name::String, old_dep::Dependency, new_dep::Dependency) =
     apply_source_edit(s -> edit.replace_dep(s, variable_name, arg_name, new_dep), state)

@@ -933,6 +933,54 @@ end
     @test !Context.wait_pipeline(ctx)
 end
 
+@testset "Source resolution" begin
+    devices = [SourceInfo("SPB", "SPB/SCAN/1", "Karabacon"),
+               SourceInfo("SPB", "SPB/MOTOR/1", "Motor"), SourceInfo("MID", "MID/MOTOR/1", "Motor")]
+    @test Context.unique_device(devices, "Karabacon", "x") == KaraboDevice("SPB", "SPB/SCAN/1")
+    @test_throws XfaContextException Context.unique_device(devices, "Motor", "x")
+    @test_throws XfaContextException Context.unique_device(devices, "XGM", "x")
+
+    # A group following the position of the only motor offered by the inputs
+    resolver = raw"""
+    @Group mutable struct Mover
+        motor::Parameter{KaraboDevice} = Parameter{KaraboDevice}()
+        position::Parameter{Dependency} = Parameter{Dependency}()
+    end
+    Context.device_classes(::Mover) = Dict(:motor => "Motor", :position => (:motor, "pos"))
+    @Variable function follow(::Mover, x -> Mover.position)
+        return x
+    end
+
+    @Group struct Motors
+        names::Vector{String} = String[]
+    end
+    Context.get_sources(m::Motors) = [SourceInfo("", name, "Motor") for name in m.names]
+    Context.update_sources(::Motors, _) = nothing
+    @Input function input(m::Motors, output)
+        put!(output, (1, Dict(name => Dict("pos" => 1) for name in m.names)))
+    end
+    """
+
+    ctx = Context.load_from_string("$(resolver)\nmotors = Motors(; names=[\"MOTOR\"])\nm = Mover()")
+    changes = []
+    ctx.on_parameter_changed = (name, value) -> push!(changes, name => value)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test changes == ["m.motor" => KaraboDevice("", "MOTOR"), "m.position" => karabo"MOTOR.pos"]
+    @test ctx.dag["m.follow"]["x"] == karabo"MOTOR.pos"
+
+    # An ambiguous device fails the start, unless it's set explicitly
+    ctx = Context.load_from_string("$(resolver)\nmotors = Motors(; names=[\"A\", \"B\"])\nm = Mover()")
+    @test_throws XfaContextException Context.start_pipeline(ctx)
+
+    ctx = Context.load_from_string("$(resolver)\nmotors = Motors(; names=[\"A\", \"B\"])\nm = Mover(; motor=KaraboDevice(\"\", \"B\"))")
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test ctx.dag["m.follow"]["x"] == karabo"B.pos"
+end
+
 @testset "Scan automatic mode" begin
     ctx = Context.load_from_string(raw"""
     # The scantool's properties and the trains following them, edited by the test
@@ -1246,8 +1294,9 @@ end
     @test ctx.dag["foo_group.foo"]["data"] == karabo"motor1.pos"
     @test ctx.parameters["foo_group.source"].optional
 
-    # A required dependency left unset is an error, not an implicit optional.
-    @test_throws XfaContextException Context.load_from_string(raw"""
+    # A required dependency left unset is an error when the pipeline starts (it
+    # may be resolved until then), not an implicit optional.
+    ctx = Context.load_from_string(raw"""
     @Group mutable struct Foo
         source::Parameter{Dependency} = Parameter{Dependency}()
     end
@@ -1258,6 +1307,7 @@ end
 
     foo_group = Foo()
     """)
+    @test_throws XfaContextException Context.start_pipeline(ctx)
 
     # Test that referencing a non-existent parameter throws
     @test_throws XfaContextException Context.load_from_string(raw"""
@@ -2463,6 +2513,24 @@ end
             r = @test_logs (:warn, r"aren't in the run") match_mode=:any Context.run(ctx, dc; select=["itime", "absent"])
             @test keyset(r) == Set(["itime"])
             @test length(r["itime"]) == 100
+
+            # Sources are resolved before the run is streamed. The example run
+            # has no device classes, so the device is set explicitly.
+            resolved = Context.load_from_string(raw"""
+            @Group mutable struct Timing
+                device::Parameter{KaraboDevice} = Parameter{KaraboDevice}()
+                source::Parameter{Dependency} = Parameter{Dependency}()
+            end
+
+            Context.device_classes(::Timing) = Dict(:source => (:device, "integrationTime"))
+
+            @Variable function itime(::Timing, x -> Timing.source)
+                return x
+            end
+
+            t = Timing(; device=KaraboDevice("", "SPB_IRU_AGIPD1M1/MDL/FPGA_COMP"))
+            """)
+            @test all(==(15), Context.run(resolved, dc)["t.itime"])
 
             devices = Context.data_collection_devices(dc)
             @test ("SPB_IRU_AGIPD1M1/MDL/FPGA_COMP", "") in devices

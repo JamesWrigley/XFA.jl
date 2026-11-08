@@ -1180,6 +1180,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.context_state = build_context_state(state, msg.info)
             client.context.source = msg.source
             client.context.input_topics = msg.info["input_topics"]
+            client.context.variable_postprocessors = msg.info["postprocessors"]
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_logs)
@@ -1272,15 +1273,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
 
         if client.pending_source_edit == param.name
-            new_value = isnothing(owner) ? nothing : edit.format_param_value(param.value)
-            if !isnothing(new_value)
-                if owner.kind == ParameterOwner_Group
-                    set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)
-                elseif owner.kind == ParameterOwner_Global
-                    set_parameter_value(state, owner.var_name, new_value; reload=false)
-                elseif owner.kind == ParameterOwner_Postprocessor
-                    set_postprocessor_param(state, owner.pp, owner.field_name, new_value; reload=false)
-                end
+            apply_source_edit(state; reload=false) do source
+                edit.replace_parameter(source, param.name, param.value, client.context.variable_postprocessors)
             end
             client.pending_source_edit = nothing
         end

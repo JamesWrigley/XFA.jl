@@ -29,6 +29,22 @@ function KaraboDevice(str::AbstractString)
     return KaraboDevice("", String(str))
 end
 
+# The only device of class `class` in `devices`, to fill in the parameter
+# `param_name` (see `device_classes`). Errors if there are none or several, the
+# parameter must then be set explicitly.
+function unique_device(devices::Vector{SourceInfo}, class::AbstractString, param_name::AbstractString)
+    matches = filter(dev -> dev.class_id == class, devices)
+    if length(matches) == 1
+        return KaraboDevice(only(matches).topic, only(matches).name)
+    elseif isempty(matches)
+        throw(Context.XfaContextException("No $(class) device found for '$(param_name)', it must be set explicitly"))
+    else
+        names = join(["$(dev.topic)//$(dev.name)" for dev in matches], ", ")
+        throw(Context.XfaContextException("Found several $(class) devices for '$(param_name)' ($(names)), " *
+                                          "it must be set explicitly"))
+    end
+end
+
 ## Correlation group
 
 @Group mutable struct Correlation

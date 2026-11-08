@@ -391,6 +391,9 @@ end
                     while !(msg isa Protocol.Stopped); msg = Protocol.receive(ws).msg end
                 end
             end
+
+            # The engine saved the group's choice in the context file
+            @test occursin("f = Follower(; source=karabo\"motor.pos\")", read(path, String))
         end
     end
 
@@ -1508,6 +1511,35 @@ end
         @test edit.remove_variable_source("@Variable bar -> karabo\"C/D.prop\"\n", "bar") == ""
 
         @test_throws "Could not find a definition for 'nonexistent'" edit.remove_variable_source(source, "nonexistent")
+    end
+
+    @testset "Replace parameter" begin
+        source = raw"""
+        threshold = Parameter(1.0)
+        m = Mover()
+
+        @Variable function foo(x -> karabo"A/B.c")
+            @postprocess Histogram1D(nbins=5)
+            x
+        end
+        """
+        pps = Dict("foo" => ["foo.histogram"])
+
+        source = edit.replace_parameter(source, "threshold", 2.5, pps)
+        source = edit.replace_parameter(source, "m.motor", karabo"MOTOR.pos", pps)
+        source = edit.replace_parameter(source, "foo.histogram.nbins", 10, pps)
+        @test source == raw"""
+        threshold = Parameter(2.5)
+        m = Mover(; motor=karabo"MOTOR.pos")
+
+        @Variable function foo(x -> karabo"A/B.c")
+            @postprocess Histogram1D(nbins=10)
+            x
+        end
+        """
+
+        # Values with no source representation are left out
+        @test_logs (:warn, r"Cannot write") @test edit.replace_parameter(source, "threshold", Dict("a" => 1), pps) == source
     end
 end
 

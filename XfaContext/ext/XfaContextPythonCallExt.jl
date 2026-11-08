@@ -355,6 +355,12 @@ function XfaContext.run(ctx::ContextState, dc::Py;
     plan = copy(ctx)
     prepare_offline!(plan, select, override)
 
+    # Devices are resolved from the run before picking what to stream, since
+    # that can change the dependencies.
+    devices = [XfaContext.SourceInfo("", name, class_id) for (name, class_id) in XfaContext.data_collection_devices(dc)]
+    XfaContext.resolve_all_sources!(plan, devices)
+    XfaContext.rewire_dag!(plan)
+
     deps = external_dependencies(plan)
     monitored = intersect(deps, monitored_dependencies(plan))
     stream = XfaContext.open_stream(dc, deps, monitored; trains_per_chunk, buffer_slots)

@@ -95,6 +95,15 @@ monitored_properties(::Any) = Dependency[]
 # restart forever.
 on_properties_changed(::Any, changed) = false
 
+# The parameters of a group or postprocessor that are filled in from the
+# inputs' devices when left unset, as a Dict from field name to either:
+# - a class, for a `Parameter{KaraboDevice}`: the unique device of that class;
+# - `(class, property)`, for a `Parameter{Dependency}`: that property of the
+#   unique device of that class;
+# - `(field, property)`, for a `Parameter{Dependency}`: that property of the
+#   device held by the `Parameter{KaraboDevice}` `field`.
+device_classes(::Any) = Dict{Symbol, Any}()
+
 # For variable references (@Variable name -> MyLib.func), returns the
 # original function. Used to exclude origin functions from the context
 # when they are already represented by a reference wrapper.
@@ -104,7 +113,7 @@ variable_origin(f) = f
 # concrete_only set, otherwise the first few new methods would invalidate
 # callers.
 for f in (variable_subvariables, variable_postprocessors, variable_displays, input_topic, input_device,
-          get_sources, monitored_properties, on_properties_changed, variable_origin)
+          get_sources, monitored_properties, on_properties_changed, device_classes, variable_origin)
     typeof(f).name.concrete_only = true
 end
 
@@ -1161,6 +1170,17 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
         take!(ctx.pipeline_events)
     end
 
+    # Groups and postprocessors may pick their devices from those the inputs
+    # offer, which can change their dependencies.
+    devices = SourceInfo[]
+    for name in keys(ctx.inputs)
+        group = get_input_group(ctx, name)
+        if !isnothing(group)
+            append!(devices, @invokelatest get_sources(group))
+        end
+    end
+    resolve_all_sources!(ctx, devices)
+
     # Group Dependency parameters may have changed since the last run, either
     # edited while stopped or by a group asking for a rewire.
     rewire!(ctx)
@@ -1422,12 +1442,56 @@ function run_pipeline(ctx::ContextState; kwargs...)
     return wait_pipeline(ctx)
 end
 
+# Fill in the unset parameters that groups and postprocessors declare in
+# `device_classes` from `devices`. Fields following a device field go last, so
+# they see it resolved. The values set are reported through
+# `on_parameter_changed`, like any other change made by the pipeline.
+function resolve_all_sources!(ctx::ContextState, devices::Vector{SourceInfo})
+    for owner in Iterators.flatten((values(ctx.groups), values(ctx.postprocessors)))
+        specs = sort!(collect(@invokelatest device_classes(owner)); by=kv -> kv.second isa Tuple{Symbol, String})
+        for (field, spec) in specs
+            param = getproperty(owner, field)::Parameter
+            device, property = if isassigned(param)
+                nothing, nothing
+            elseif spec isa AbstractString
+                unique_device(devices, spec, param.name), nothing
+            elseif first(spec) isa Symbol
+                device_param = getproperty(owner, first(spec))
+                (isassigned(device_param) ? device_param[] : nothing), last(spec)
+            else
+                unique_device(devices, first(spec), param.name), last(spec)
+            end
+
+            # Set parameters are left alone, and a field following an unset
+            # device stays unset.
+            if !isnothing(device)
+                value = if isnothing(property)
+                    device
+                else
+                    karabo_dependency(isempty(device.topic) ? nothing : device.topic, device.name, property)
+                end
+                tryset(param, value)
+                @info "Resolved parameter '$(param.name)' to $(value)"
+                ctx.on_parameter_changed(param.name, value)
+            end
+        end
+    end
+end
+
 # Re-resolve the GroupParameter dependencies of every group variable from the
 # groups' current Parameter values and re-route the result. Called on a
 # stopped pipeline by `start_pipeline`: everything else (parameters, groups,
 # postprocessors, the worker state) is untouched, so no runtime state is lost
 # across a restart.
 function rewire!(ctx::ContextState)
+    rewire_dag!(ctx)
+    ctx.dep_to_input = build_dep_routing(ctx, ctx.dep_router)
+    return nothing
+end
+
+# The DAG half of `rewire!`, without the routing. Offline runs use it directly
+# since they route everything to their own input.
+function rewire_dag!(ctx::ContextState)
     for (name, deps) in ctx.dag
         dot_idx = findfirst('.', name)
         # Offline overrides have their dependencies cut on purpose
@@ -1442,6 +1506,9 @@ function rewire!(ctx::ContextState)
         for (arg_name, dep) in @invokelatest variable_dependencies(ctx.functions[name])
             if dep isa Dependency && dep.kind == DepKind_GroupParameter
                 resolved = resolve_group_parameter(dep, group_name, object, group_type, group_vars)
+                if resolved isa Parameter && !resolved.optional
+                    throw(XfaContextException("Parameter '$(dep.parameter)' of group '$(group_name)' is required but wasn't set"))
+                end
                 # A `Dependency("other.var")` value resolves to a subvariable
                 # reference, which load_from_module promotes to the group
                 # variable once all groups are known; here they already are.
@@ -1453,9 +1520,6 @@ function rewire!(ctx::ContextState)
             end
         end
     end
-
-    ctx.dep_to_input = build_dep_routing(ctx, ctx.dep_router)
-    return nothing
 end
 
 function run(f::Function, ctx::ContextState; timeout=10, kwargs...)
@@ -1881,13 +1945,11 @@ function resolve_group_parameter(dep::Dependency, group_name, object, group_type
         end
         param = getproperty(object, head_sym)
         if !isassigned(param)
-            if !param.optional
-                throw(XfaContextException("Parameter '$head' of group '$(group_name)' is required but wasn't set"))
-            end
-            # Unset optional dependency: kept in the DAG so the variable's
-            # positional args still line up, but the scheduler ignores it (no
-            # channel, no trainmatching) and stream_variable passes `nothing`
-            # for this arg.
+            # Unset dependency: kept in the DAG so the variable's positional
+            # args still line up, but the scheduler ignores it (no channel, no
+            # trainmatching) and stream_variable passes `nothing` for this arg.
+            # A required one may still be filled in from `device_classes`, so
+            # `rewire_dag!` checks it at pipeline start.
             return param
         elseif !(param.value isa Dependency)
             throw(XfaContextException("Parameter '$head' of group '$(group_name)' must hold a Dependency value"))

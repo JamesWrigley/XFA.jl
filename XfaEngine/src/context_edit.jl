@@ -1,6 +1,6 @@
 # Source transformations of a context file, shared by the GUI (which writes
 # user edits) and the engine (which writes parameters chosen by
-# `resolve_sources!`). Every function takes and returns the source as a string.
+# `device_classes`). Every function takes and returns the source as a string.
 module ContextEdit
 
 using Base.JuliaSyntax: @K_str, parseall, SyntaxNode, children, is_leaf, kind, byte_range
@@ -386,6 +386,7 @@ format_param_value(v::Vector{<:Union{Integer, AbstractFloat}}) = repr(v)
 format_param_value(t::Tuple{Vararg{Union{Integer, AbstractFloat}}}) = repr(t)
 format_param_value(d::ctx.OptionalDims) = format_param_value(d.dims)
 format_param_value(sel::ctx.IndexSelection) = "IndexSelection(\"$(sel)\")"
+format_param_value(dep::ctx.Dependency) = parameter_dep_to_source(dep)
 format_param_value(_) = nothing
 
 # Replace the first positional argument of a `name = Parameter(...)` assignment.
@@ -416,6 +417,31 @@ function replace_parameter_value(source::String, var_name::String, new_value::St
 
     br = byte_range(arg_node)
     return source[1:first(br)-1] * new_value * source[last(br)+1:end]
+end
+
+# Write a parameter's new value into the source, picking the edit from its name:
+# a top-level `Parameter`, a postprocessor kwarg (`variable_postprocessors` maps
+# each variable to its postprocessors) or a group constructor kwarg.
+function replace_parameter(source::String, name::String, value,
+                           variable_postprocessors::Dict{String, Vector{String}})
+    new_value = format_param_value(value)
+    dot_idx = findlast('.', name)
+    if isnothing(new_value)
+        @warn "Cannot write parameter '$(name)' (a $(typeof(value))) to the context file"
+        return source
+    elseif isnothing(dot_idx)
+        return replace_parameter_value(source, name, new_value)
+    else
+        owner_name = name[1:dot_idx-1]
+        field = name[dot_idx+1:end]
+        var_name = findfirst(pps -> owner_name in pps, variable_postprocessors)
+        if isnothing(var_name)
+            return replace_constructor_kwarg(source, owner_name, field, new_value)
+        else
+            return replace_postprocess_kwarg(source, var_name, variable_postprocessors[var_name],
+                                             owner_name, field, new_value)
+        end
+    end
 end
 
 # Replace a dependency inside a group constructor's keyword argument.

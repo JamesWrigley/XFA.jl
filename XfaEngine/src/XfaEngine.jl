@@ -239,6 +239,14 @@ function broadcast_parameter_changed(state::EngineState, name, value)
     end
 end
 
+function save_parameter(ctx::ContextState, name, value)
+    source = read(ctx.path, String)
+    new_source = ContextEdit.replace_parameter(source, name, value, ctx.variable_postprocessors)
+    if new_source != source
+        write(ctx.path, new_source)
+    end
+end
+
 function broadcast_displayable_changed(state::EngineState, displayable::Displayable)
     msg = Protocol.DisplayableChanged(displayable)
     for (id, client) in state.clients
@@ -573,7 +581,10 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
             end
 
             ctx.on_train_processed = tid -> foreach(group -> release_train(group, tid), karabo_inputs)
-            ctx.on_parameter_changed = (name, value) -> broadcast_parameter_changed(state, name, value)
+            ctx.on_parameter_changed = function (name, value)
+                broadcast_parameter_changed(state, name, value)
+                save_parameter(ctx, name, value)
+            end
             ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
             ctx
         catch ex
