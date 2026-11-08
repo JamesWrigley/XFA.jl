@@ -11,7 +11,7 @@ function set_input_param(name, param, value)
     param.value = value
     change_parameter(Parameter(param.name, value))
     @guiasync set_group_param(state[], name, chopprefix(param.name, "$(name)."),
-                              format_param_value(value); reload=false)
+                              edit.format_param_value(value); reload=false)
 end
 
 function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var_data, gui_state)

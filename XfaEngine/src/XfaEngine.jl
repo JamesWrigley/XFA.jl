@@ -16,6 +16,7 @@ include("protocol.jl")
 
 using .KaraboBridge: KaraboBridgeClient, BufferPool, BridgePattern_REP, parse_bridge_pattern
 include("webproxy.jl")
+include("context_edit.jl")
 
 import TOML
 import Sockets

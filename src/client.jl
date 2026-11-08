@@ -1272,7 +1272,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         end
 
         if client.pending_source_edit == param.name
-            new_value = isnothing(owner) ? nothing : format_param_value(param.value)
+            new_value = isnothing(owner) ? nothing : edit.format_param_value(param.value)
             if !isnothing(new_value)
                 if owner.kind == ParameterOwner_Group
                     set_group_param(state, owner.var_name, owner.field_name, new_value; reload=false)

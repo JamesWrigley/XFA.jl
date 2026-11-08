@@ -18,7 +18,7 @@ using DataStructures: CircularBuffer, OrderedDict
 using Accessors: @set
 using XfaEngine.ZfpWorkspaces: ZfpWorkspace, CompressedArray, decompress_array,
     decompress_array!, allocate_array, restore_dims
-using XfaEngine: XfaEngine, Protocol
+using XfaEngine: XfaEngine, Protocol, ContextEdit as edit
 using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency, karabo_dependency,
     ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, IndexSelection, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
@@ -418,7 +418,7 @@ function draw_parameter_widget(name, param::Parameter{Dependency})
 end
 
 function draw_parameter_widget(name, param::Parameter{<:AbstractROI})
-    text = format_param_value(param.value)
+    text = edit.format_param_value(param.value)
     buf = Vector{UInt8}(undef, length(text) + 1)
     Util.strcpy!(buf, text)
     ig.InputText("##$(name)", buf, length(buf), ig.ImGuiInputTextFlags_ReadOnly)
@@ -698,9 +698,9 @@ function commit_pending_node(state, pending)
 
     apply_source_edit(state) do source
         if !isnothing(topic)
-            source = add_karabo_topics(source, topic)
+            source = edit.add_karabo_topics(source, topic)
         end
-        add_variable_source(source, pending.spec, pending.name, pending.dep_values, pending.param_values)
+        edit.add_variable_source(source, pending.spec, pending.name, pending.dep_values, pending.param_values)
     end
 end
 
