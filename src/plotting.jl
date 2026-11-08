@@ -846,6 +846,15 @@ function spec_plot(variable::AbstractString, name::AbstractString, counter::Inte
     Plot(; id, view = SpecView(; source = AdvertisedSpec(String(variable), String(name)), id))
 end
 
+# A static plot of the record `key` of `output`, fetched from the engine. It's
+# never cached, so each plot fetches it again.
+function record_plot(output::AbstractString, key::AbstractString, counter::Integer)
+    source = RecordSpec(; output = String(output), key = String(key))
+    request_record(state[].client, source)
+    id = "$(source.name)##plot-$(counter)"
+    Plot(; id, view = SpecView(; source, id))
+end
+
 Base.close(plot::Plot) = close(plot.view)
 
 function Base.close(image::ImageState)
@@ -1803,9 +1812,13 @@ function view_store(view::SpecView, name)
     if haskey(view.snapshots, name)
         view.snapshots[name]
     else
-        get(state[].client.variable_data, name, nothing)
+        source_store(view.source, name)
     end
 end
+
+source_store(::SpecSource, name) = get(state[].client.variable_data, name, nothing)
+# A record view only draws its record
+source_store(source::RecordSpec, name) = name == source.name ? source.store : nothing
 
 # Append what to draw for one layer to `frames`. Throws a SpecError if the spec
 # doesn't fit the data. The view's fit follows its first layer.
@@ -1847,9 +1860,13 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
             if layer === view.layers[1] && fit_wanted(view.fit, haskey(updated_variables, name))
                 compute_fit!(view.fit, ys, xs)
             end
+            uncertainty = store.uncertainty
             if spec.mark == Mark_Bar
                 bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
                 push!(frames, Bars(xs, ys, store.title, bar_size))
+            elseif spec.mark == Mark_Line && !isnothing(uncertainty) && length(uncertainty) == length(ys)
+                u = parent(uncertainty)
+                push!(frames, Band(xs, ys .- u, ys .+ u, ys, store.title))
             else
                 # A lone point would be an invisible line
                 style = spec.mark == Mark_Point || length(ys) == 1 ? :scatter : :line
@@ -1957,7 +1974,8 @@ end
 # still applies (the image, the paired history), so they survive e.g. a title
 # change.
 function set_spec!(view::SpecView, plot::Plot, spec::PlotSpec)
-    wanted = datasets(spec)
+    # A record's data is static, it isn't streamed
+    wanted = view.source isa RecordSpec ? Set{String}() : datasets(spec)
     for name in setdiff(wanted, view.subscribed)
         # Lossy compression would mangle the fine detail of a matrix drawn as lines
         as_lines = any(layer -> layer.data == name && layer.mark != Mark_Rect && !isnothing(layer.color),
@@ -2025,11 +2043,11 @@ end
 
 # The label the data gives a channel whose title the spec leaves open: what the
 # variable's default plot shows along it, or the title of a paired variable.
-function data_label(layer::LayerSpec, channel::ChannelDef)
+function data_label(view::SpecView, layer::LayerSpec, channel::ChannelDef)
     paired = !isempty(layer.lookups)
     i = findfirst(lookup -> lookup.as == channel.field, layer.lookups)
     name = isnothing(i) ? layer.data : layer.lookups[i].dataset
-    store = get(state[].client.variable_data, name, nothing)
+    store = source_store(view.source, name)
     if isnothing(store) || store.data isa ArrayMetadata
         ""
     elseif paired
@@ -2047,10 +2065,11 @@ end
 
 # The label of an axis (:x or :y): the spec's, else the data's for the first
 # layer that leaves it open.
-function axis_label(spec::PlotSpec, label, axis::Symbol)
+function axis_label(view::SpecView, label, axis::Symbol)
+    spec = view.spec
     if isnothing(label)
         i = findfirst(layer -> isnothing(getfield(layer, axis).title), spec.layers)
-        isnothing(i) ? "" : data_label(spec.layers[i], getfield(spec.layers[i], axis))
+        isnothing(i) ? "" : data_label(view, spec.layers[i], getfield(spec.layers[i], axis))
     else
         label
     end
@@ -2131,6 +2150,23 @@ function refresh_spec!(view::SpecView, plot::Plot, source::AdvertisedSpec)
         end
     end
     isnothing(view.spec) ? "Waiting for plot spec: $(source.name)" : nothing
+end
+
+# A record is drawn like the default plot of its output, once it's arrived
+function refresh_spec!(view::SpecView, plot::Plot, source::RecordSpec)
+    store = source.store
+    if !isnothing(source.error)
+        "$(source.name): $(source.error)"
+    elseif isnothing(store)
+        "Fetching record: $(source.name)"
+    elseif ndims(store.data) > 2
+        "$(source.name): unsupported data shape $(typeof(store.data))"
+    else
+        if isnothing(view.spec)
+            set_spec!(view, plot, default_spec(source.name, store))
+        end
+        nothing
+    end
 end
 
 # Called once per frame before BeginPlot: brings the spec up to date and returns
@@ -2449,8 +2485,8 @@ function draw_plot_contents(plot::Plot, updated_variables)
 
         if ImPlot.BeginPlot(plot.id, ImVec2(plot_width, plot_size.y), plot_flags)
             try
-                ImPlot.SetupAxis(ImPlot.ImAxis_X1, axis_label(view.spec, view.spec.xlabel, :x))
-                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view.spec, view.spec.ylabel, :y))
+                ImPlot.SetupAxis(ImPlot.ImAxis_X1, axis_label(view, view.spec.xlabel, :x))
+                ImPlot.SetupAxis(ImPlot.ImAxis_Y1, axis_label(view, view.spec.ylabel, :y))
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_X1, "%.9g")
                 ImPlot.SetupAxisFormat(ImPlot.ImAxis_Y1, "%.9g")
                 if !has_image

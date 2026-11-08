@@ -170,6 +170,10 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
 
     view = if new_data === variable.data
         variable
+    elseif k == METADATA_K
+        # Unsubscribed outputs only carry their shape
+        stripped = @set variable.uncertainty = nothing
+        @set stripped.data = new_data
     else
         @set variable.data = new_data
     end

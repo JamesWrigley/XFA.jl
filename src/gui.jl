@@ -485,6 +485,52 @@ function plot_button(label, name; button=ig.Button)
     return clicked
 end
 
+# On the same line, a button listing the records `output` holds, if it holds
+# any. The list is a popup drawn after the nodes, see draw_records_popup.
+function records_button(output)
+    client = state[].client
+    records = client.variable_data[output].records
+    if !isempty(records)
+        ig.SameLine()
+        if ig.SmallButton("\uf1da $(length(records))###records-$(output)")
+            client.records_popup = output
+            client.records_popup_trigger = true
+        end
+        if ig.IsItemHovered()
+            node_tooltip("Records")
+        end
+    end
+end
+
+# The records of `client.records_popup`, picking one opens it in a plot
+function draw_records_popup(client)
+    output = client.records_popup
+    if !isnothing(output)
+        popup_id = "records-popup-$(output)"
+        if client.records_popup_trigger
+            ig.OpenPopup(popup_id)
+            client.records_popup_trigger = false
+        end
+        if ig.BeginPopup(popup_id)
+            # The output may have gone away with a context reload
+            records = haskey(client.variable_data, output) ? client.variable_data[output].records : String[]
+            if isempty(records)
+                ig.TextDisabled("No records")
+            end
+            # Newest first
+            for key in Iterators.reverse(records)
+                if ig.Selectable(key)
+                    push!(client.plots, record_plot(output, key, client.plot_counter))
+                    client.plot_counter += 1
+                end
+            end
+            ig.EndPopup()
+        else
+            client.records_popup = nothing
+        end
+    end
+end
+
 function clear_variable_data(store)
     # Only scalar histories accumulate; array data is replaced wholesale and
     # may not even be resizable (e.g. a view into a decompression buffer).
@@ -901,6 +947,7 @@ function draw_variable(name, var_data)
                     push!(client.plots, variable_plot(output_name, client.plot_counter))
                     client.plot_counter += 1
                 end
+                records_button(output_name)
             else
                 ig.Text(label)
             end
@@ -986,6 +1033,7 @@ function draw_variable(name, var_data)
                         client.plot_counter += 1
                     end
                 end
+                records_button(pp.name)
             end
 
             if expanded
@@ -1514,6 +1562,8 @@ function draw_dag()
             end
         end
 
+        draw_records_popup(client)
+
         popup = client.combo_popup
         if !isnothing(popup.label)
             popup_id = "combo-popup-$(popup.label)"
@@ -1992,9 +2042,13 @@ function draw_context_editor(client::ClientState)
     # Follow changes to the context source unless there are local changes
     source = client.context.source
     if source != context_editor.synced_source
-        context_editor.disk_changed = cte.GetText(context_editor.editor) != context_editor.synced_source
-        if !context_editor.disk_changed
+        text = cte.GetText(context_editor.editor)
+        if text == context_editor.synced_source
             set_editor_text(context_editor.editor, source)
+            context_editor.disk_changed = false
+        else
+            # Local edits, unless the new source is them (e.g. they were just saved)
+            context_editor.disk_changed = text != source
         end
         context_editor.synced_source = source
     end
@@ -2004,6 +2058,7 @@ function draw_context_editor(client::ClientState)
         if !isnothing(text)
             set_editor_text(context_editor.editor, text)
             context_editor.pending_text = nothing
+            context_editor.disk_changed = false
         end
 
         ig.SetNextWindowSize((800, 600), ig.ImGuiCond_FirstUseEver)

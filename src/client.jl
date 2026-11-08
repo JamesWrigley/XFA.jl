@@ -966,6 +966,7 @@ function store_variable_data!(client, variable::VariableData)
         store.received_bytes = received_bytes
         store.compress = variable.compress
         store.plot_specs = variable.plot_specs
+        store.records = variable.records
         return
     end
 
@@ -992,6 +993,7 @@ function store_variable_data!(client, variable::VariableData)
     store.compression_ratio = compression_ratio
     store.received_bytes = received_bytes
     store.compress = variable.compress
+    store.records = variable.records
 end
 
 function apply_metadata!(store, variable::VariableData)
@@ -1017,6 +1019,7 @@ function apply_metadata!(store, variable::VariableData)
     store.fixed_aspect = variable.fixed_aspect
     store.plot_type = variable.plot_type
     store.plot_specs = variable.plot_specs
+    store.uncertainty = variable.uncertainty
 
     # Use explicit labels if provided, otherwise derive from DimArray or data type.
     # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).
@@ -1278,6 +1281,9 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             end
             client.pending_source_edit = nothing
         end
+    elseif msg isa Protocol.Record
+        # Handled by the callback of request_record
+        nothing
     elseif msg isa PipelineStats
         client.context.channel_stats = msg.channel_stats
         client.context.input_rates = msg.input_rates
@@ -1623,6 +1629,30 @@ end
 function invoke_callback(name::String)
     client = state[].client
     client.callback_requests[name] = send(client, InvokeCallback(name))
+end
+
+# Fetch the record of a RecordSpec, filling it in when the reply arrives
+function request_record(client, source::RecordSpec)
+    send_with_callback(client, Protocol.GetRecord(source.output, source.key),
+                       msg -> fill_record!(source, msg.data))
+end
+
+# Fill in a RecordSpec's store from the record's `data`, or its error. A record
+# that isn't a VariableData is shown as its data.
+function fill_record!(source::RecordSpec, data)
+    if data isa ExceptionMessage
+        # The engine logs the backtrace, the first line says what went wrong
+        source.error = String(first(eachsplit(data.text, '\n')))
+    else
+        variable = data isa VariableData ? data : VariableData(; data)
+        if !(variable.data isa AbstractArray)
+            source.error = "Unsupported record type $(typeof(variable.data)), only arrays can be shown"
+        else
+            store = VariableStore(; data=variable.data)
+            apply_metadata!(store, @set variable.name = source.output)
+            source.store = store
+        end
+    end
 end
 
 function start(state)

@@ -675,7 +675,7 @@ function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor
 
         state = String(state)
         if state == "ACQUIRING" && s.state ∉ ("ACQUIRING", "PAUSED")
-            s.scan_label = "$(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) (train $(Meta.tid[]))"
+            s.scan_label = "$(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ($(join(aliases, ", ")))"
             s.binner = nothing
             # Half a step snaps positions onto the nearest level. Start/stop
             # points are per motor (a single one applies to every motor), the
@@ -707,14 +707,30 @@ function scan_bins(s::Scan)
     if isnothing(s.binner) || isnothing(s.binner.seq)
         return nothing
     else
-        xlabel = if !isempty(s.motor_alias)
+        motor = Symbol(if !isempty(s.motor_alias)
             s.motor_alias
         elseif isassigned(s.motor)
             s.motor[].name
         else
-            nothing
+            "position"
+        end)
+        # The axes are labelled by the dims: the position after the motor, the
+        # values and an anonymous value dim after the binned output. They're
+        # rebuilt since DD.set can't handle the binner's plain vector lookups.
+        source = Symbol(first(rsplit(Meta.name[], '.'; limit=2)))
+        seq = s.binner.seq
+        dims = map(DD.dims(seq.mean)) do dim
+            if DD.name(dim) == :position
+                DD.Dim{motor}(DD.val(dim))
+            elseif DD.name(dim) == :dim_1
+                DD.Dim{source}(DD.val(dim))
+            else
+                dim
+            end
         end
-        return VariableData(; data=DD.rebuild(s.binner.seq.mean; name=:scan), xlabel,
-                            compress=false, fixed_aspect=false)
+        data = DD.rebuild(seq.mean; dims, name=source)
+        # The std is pooled over a vector's elements, so only scalar scans get one
+        uncertainty = ndims(seq.mean) == 1 ? DD.rebuild(seq.std; dims) : nothing
+        return VariableData(; data, uncertainty, compress=false, fixed_aspect=false)
     end
 end

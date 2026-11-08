@@ -273,6 +273,10 @@ end
     compress::Bool = true
     # Keys of the records the output's owner holds, see `get_record`
     records::Vector{String} = String[]
+    # Uncertainty of each element of a vector `data`, drawn as a band around it.
+    # TODO: replace with an `uncertainty` lookup on `data`'s dimension once
+    # DimensionalData supports multiple lookups per dimension.
+    uncertainty::Union{AbstractVector, Nothing} = nothing
 end
 
 VariableData(data; kwargs...) = VariableData(; data, kwargs...)

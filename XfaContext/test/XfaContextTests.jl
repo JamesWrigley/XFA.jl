@@ -17,7 +17,7 @@ ENV["JULIA_CONDAPKG_VERBOSITY"] = -1
 ENV["JULIA_PYTHONCALL_EXE"] = joinpath(Base.DEPOT_PATH[1], "conda_environments", "xfacontext-tests", "bin", "python")
 ENV["JULIA_CONDAPKG_BACKEND"] = "Null"
 
-using Statistics: mean
+using Statistics: mean, std
 using Test: with_logger, TestLogger
 using ReTest: @testset, @test, @test_throws, @test_logs
 
@@ -1081,13 +1081,14 @@ end
     @test !Context.run_pipeline(ctx)
     @test scn.resolution[] ≈ 0.05
     out = last(scan_outputs())
-    @test Context.DD.lookup(out.data, :position) ≈ [0.0, 0.1, 0.2]
+    # The bins are named after the binned variable, along the motor's alias
+    @test Context.DD.lookup(out.data, :a) ≈ [0.0, 0.1, 0.2]
     @test collect(out.data) ≈ [1.0, 2.5, 4.0]
-    @test out.xlabel == "a"
+    @test Context.DD.name(out.data) == :intensity
 
     # The finished scan is kept as a record
     key = only(out.records)
-    @test endswith(key, "(train 2)")
+    @test endswith(key, "(x, a)")
     @test Context.get_record(scn, key).data == out.data
 end
 
@@ -2085,31 +2086,36 @@ end
         scn = Context.Scan(; automatic=false, motor=karabo"mono.energy", resolution=0.005)
         @test isempty(Context.device_classes(scn))
         @test Context.postprocessor_dependencies(scn) == [karabo"mono.energy"]
+        # Outside a pipeline the postprocessor's name has to be given
+        bin(scn, args...) = Base.ScopedValues.@with Context.Meta.name => "spectrum.scan" scn(args...)
         local out
         for (p, v) in [(-0.580, 10.0), (-0.581, 20.0), (-0.570, 100.0), (-0.580, 30.0)]
-            out = scn(v, p)
+            out = bin(scn, v, p)
         end
         @test out.data isa Context.DD.DimArray && !out.compress && isempty(out.records)
-        @test Context.DD.lookup(out.data, :position) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
+        @test Context.DD.lookup(out.data, Symbol("mono.energy")) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
         @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
-        @test out.xlabel == "mono.energy"
+        @test out.uncertainty ≈ [std([10.0, 20.0, 30.0]; corrected=false), 0.0]
+        @test Context.DD.name(out.data) == :spectrum
 
         # A resolution change re-bins the history, merging the two levels
         scn.resolution[] = 1.0
         Context.scan_rebin(scn, scn.resolution[])
-        out = scn(5.0, -0.575)
+        out = bin(scn, 5.0, -0.575)
         @test collect(out.data) ≈ [mean([10.0, 20.0, 100.0, 30.0, 5.0])]
 
         # Vectors are binned elementwise, keeping their own dimension
         scn = Context.Scan(; automatic=false, motor=karabo"a.pos", resolution=0.005)
         for (p, v) in [(0.0, [1.0, 2.0]), (0.0, [3.0, 4.0]), (0.01, [5.0, 6.0])]
-            out = scn(v, p)
+            out = bin(scn, v, p)
         end
         @test collect(out.data) ≈ [2.0 3.0; 5.0 6.0]
+        @test Context.DD.name(Context.DD.dims(out.data)) == (Symbol("a.pos"), :spectrum)
+        @test isnothing(out.uncertainty)
 
         # A value of a different shape resets the bins instead of failing to fold
         # into the old ones.
-        out = @test_logs (:warn, r"shape changed") scn([1.0, 2.0, 3.0], 0.02)
+        out = @test_logs (:warn, r"shape changed") bin(scn, [1.0, 2.0, 3.0], 0.02)
         @test size(out.data) == (1, 3) && collect(out.data) == [1.0 2.0 3.0]
         @test length(scn.binner.history) == 1
     end

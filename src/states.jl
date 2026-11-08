@@ -306,6 +306,19 @@ end
     plot_type::Symbol = :series
     compress::Bool = true
     plot_specs::Vector{PlotSpec} = PlotSpec[]
+    uncertainty::Maybe{AbstractVector} = nothing
+    # Keys of the records the output's owner holds, see request_record
+    records::Vector{String} = String[]
+end
+
+# A record of `output`, fetched once from the engine by request_record. The
+# reply's callback fills in `store`, or `error` if fetching it failed.
+@kwdef mutable struct RecordSpec <: SpecSource
+    const output::String
+    const key::String
+    const name::String = "$(output) [$(key)]"
+    store::Maybe{VariableStore} = nothing
+    error::Maybe{String} = nothing
 end
 
 # Renders a PlotSpec from its source. Synthesised specs are rebuilt whenever
@@ -819,6 +832,9 @@ end
     dep_text_states::Dict{UInt, DepTextState} = Dict{UInt, DepTextState}()
     dep_kind_popup::Maybe{Tuple{String, DepTextState}} = nothing
     dep_kind_popup_trigger::Bool = false
+    # The output whose records popup is open, deferred out of the node canvas like dep_kind_popup
+    records_popup::Maybe{String} = nothing
+    records_popup_trigger::Bool = false
     # The KaraboDepText editor window currently open, or nothing. Drawn once at
     # the top level of the frame; the inline widgets set this to request it.
     karabo_editor::Maybe{KaraboDepTextState} = nothing

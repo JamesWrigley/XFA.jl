@@ -655,8 +655,9 @@ end
         gui = XFA.GuiState(Dict{String, Any}())
         gui.client.variable_data["spectra"] = spectra
         XFA.@with XFA.state => gui begin
-            lines = XFA.PlotSpec("lines", [by_name])
-            @test (XFA.axis_label(lines, lines.xlabel, :x), XFA.axis_label(lines, lines.ylabel, :y)) == ("energy", "Spectra")
+            lines = XFA.SpecView(; source=XFA.DefaultSpec("spectra", XFA.ModelOverlay[]), id="lines",
+                                 spec=XFA.PlotSpec("lines", [by_name]))
+            @test (XFA.axis_label(lines, nothing, :x), XFA.axis_label(lines, nothing, :y)) == ("energy", "Spectra")
             @test XFA.axis_label(lines, "given", :x) == "given"
         end
     end
@@ -689,6 +690,28 @@ end
         wait(store.decode_task)
         XFA.draw_plots()
         @test (store.trainId, store.title, store.x_axis) == (4, "fourth", [4])
+    end
+end
+
+@testset "Records" begin
+    gui = XFA.GuiState(Dict{String, Any}())
+    XFA.@with XFA.state => gui begin
+        XFA.store_variable_data!(gui.client, XFA.VariableData(; name="a.scan", data=[1.0], records=["first"]))
+        @test gui.client.variable_data["a.scan"].records == ["first"]
+
+        # A record is drawn from its own store, with nothing subscribed, and
+        # its uncertainty as a band
+        source = XFA.RecordSpec(; output="a.scan", key="first")
+        plot = XFA.Plot(; id="record", view=XFA.SpecView(; source, id="record"))
+        bins = XFA.DimArray([4.0, 5.0], (XFA.DD.Dim{:position}([0.1, 0.2]),); name=:scan)
+        XFA.fill_record!(source, XFA.VariableData(; data=bins, xlabel="motor", uncertainty=[0.5, 1.0]))
+        band = only(XFA.prepare!(plot.view, plot, Dict{String, Set{Int}}()))
+        @test (band.xs, band.lower, band.upper, plot.view.spec.xlabel) == ([0.1, 0.2], [3.5, 4.0], [4.5, 6.0], "motor")
+        @test isempty(gui.client.subscriptions)
+
+        # A failure keeps the first line of the error
+        XFA.fill_record!(source, XFA.ExceptionMessage("KeyError: x\nStacktrace:"))
+        @test source.error == "KeyError: x"
     end
 end
 
