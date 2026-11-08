@@ -104,6 +104,18 @@ on_properties_changed(::Any, changed) = false
 #   device held by the `Parameter{KaraboDevice}` `field`.
 device_classes(::Any) = Dict{Symbol, Any}()
 
+# Karabo dependencies a postprocessor needs besides its source's output, from
+# its current parameters. Their data is passed to it after the output, in
+# order: `pp(output, extras...)`.
+postprocessor_dependencies(::Any) = Dependency[]
+
+# The DAG key of the `i`th dependency of postprocessor `pp`, which lives in its
+# variable's DAG entry alongside the argument names.
+struct PostprocessorDep
+    pp::String
+    i::Int
+end
+
 # For variable references (@Variable name -> MyLib.func), returns the
 # original function. Used to exclude origin functions from the context
 # when they are already represented by a reference wrapper.
@@ -113,7 +125,8 @@ variable_origin(f) = f
 # concrete_only set, otherwise the first few new methods would invalidate
 # callers.
 for f in (variable_subvariables, variable_postprocessors, variable_displays, input_topic, input_device,
-          get_sources, monitored_properties, on_properties_changed, device_classes, variable_origin)
+          get_sources, monitored_properties, on_properties_changed, device_classes,
+          postprocessor_dependencies, variable_origin)
     typeof(f).name.concrete_only = true
 end
 
@@ -458,11 +471,12 @@ function to_dict(ctx::ContextState)
     for (name, deps) in ctx.dag
         # Unassigned optional dependencies aren't real edges, so they're left out
         # of the DAG. The client still learns about the parameter itself via the
-        # `parameters` entry below, so it can be drawn in the GUI.
+        # `parameters` entry below, so it can be drawn in the GUI. Postprocessor
+        # dependencies aren't drawn either.
         dag[name] = OrderedDict{Any, Any}(k => v isa Dependency && !isnothing(v.group_type) ?
                                           (@set v.group_type = nothing) : v
                                           for (k, v) in deps
-                                          if !(v isa Parameter && !isassigned(v)))
+                                          if !(v isa Parameter && !isassigned(v)) && !(k isa PostprocessorDep))
     end
 
     # For group variables, recover the original arg_name => group field mapping
@@ -878,6 +892,12 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     matcher = Trainmatcher((k for (k, v) in upstream if v isa Union{RemoteChannel, Channel}), max_train_latency)
     matched_trains = Dict{Int, Any}()
     dropped_trains = Int[]
+
+    # Postprocessor dependencies aren't arguments of the variable, they're
+    # passed on to their postprocessor.
+    pp_deps = Dict(pp_name => Dependency[dep for (key, dep) in deps if key isa PostprocessorDep && key.pp == pp_name]
+                   for pp_name in keys(postprocessors))
+    deps = [(key, dep) for (key, dep) in deps if !(key isa PostprocessorDep)]
     args = Vector{Any}(undef, length(deps))
 
     function emit(vd)
@@ -999,6 +1019,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                             continue
                         end
                         raw_input = pp_input isa VariableData ? pp_input.data : pp_input
+                        extras = [matched_data[dep.name].data for dep in pp_deps[pp_name]]
 
                         try
                             subvar_values[pp_name] = @with(Meta.tid => tid,
@@ -1006,7 +1027,7 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                                                            Meta.group_name => group_name,
                                                            Meta.scratch => scratch,
                                                            Meta.subvariables => subvar_values,
-                                                           pp(raw_input))
+                                                           pp(raw_input, extras...))
                         catch ex
                             @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
                         end
@@ -1519,6 +1540,22 @@ function rewire_dag!(ctx::ContextState)
                 deps[arg_name] = resolved
             end
         end
+    end
+
+    # Postprocessor dependencies follow their postprocessor's current parameters.
+    # Overridden variables have no postprocessors left.
+    for (name, pp_names) in ctx.variable_postprocessors
+        deps = filter(kv -> !(kv.first isa PostprocessorDep), ctx.dag[name])
+        for pp_name in pp_names
+            pp_deps = @invokelatest postprocessor_dependencies(ctx.postprocessors[pp_name])
+            for (i, dep) in enumerate(pp_deps)
+                if !(dep isa Dependency && dep.kind == DepKind_Karabo)
+                    throw(XfaContextException("Postprocessor '$(pp_name)' can only depend on Karabo properties, got: $(dep)"))
+                end
+                deps[PostprocessorDep(pp_name, i)] = dep
+            end
+        end
+        ctx.dag[name] = deps
     end
 end
 

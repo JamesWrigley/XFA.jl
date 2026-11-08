@@ -63,6 +63,14 @@ end
     TestWindow(; size=10) = TestWindow(Parameter(size))
     Context.default_name(::TestWindow) = "window"
     (w::TestWindow)(data) = data[1:min(end, w.size[])]
+
+    mutable struct TestOffset <: AbstractPostprocessor
+        offset::Parameter{Context.Dependency}
+    end
+    TestOffset(; offset) = TestOffset(Parameter(offset))
+    Context.default_name(::TestOffset) = "offset"
+    Context.postprocessor_dependencies(o::TestOffset) = [o.offset[]]
+    (::TestOffset)(data, offset) = data + offset
 end
 
 # A registered @Input group for the available_variables test.
@@ -530,6 +538,34 @@ end
         r2 = take!(ctx.stream_output)
         @test r2.subvariables["foo.window"].data == 1:5
     end
+
+    # Postprocessor dependencies are passed after the output and follow the
+    # postprocessor's parameters, but aren't arguments or GUI edges.
+    ctx = Context.load_from_string("""
+    using Main.PostprocessorLibrary: TestOffset
+
+    @Input function input(::Context.MockInput, output)
+        put!(output, (0, Dict("foo" => Dict("bar" => 1), "motor" => Dict("pos" => 10, "other" => 20))))
+    end
+    i = Context.MockInput()
+
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess TestOffset(; offset=karabo"motor.pos")
+        return data
+    end
+    """)
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test take!(ctx.stream_output).subvariables["foo.offset"].data == 11
+    @test ctx.dag["foo"][Context.PostprocessorDep("foo.offset", 1)] == karabo"motor.pos"
+    @test keyset(Context.to_dict(ctx)["dag"]["foo"]) == Set(["data"])
+
+    Context.tryset(ctx.parameters["foo.offset.offset"], karabo"motor.other")
+    Context.run(ctx) do
+        @test timedwait(() -> !isopen(ctx.stream_output), 5) == :ok
+    end
+    @test take!(ctx.stream_output).subvariables["foo.offset"].data == 21
 end
 
 @testset "@display" begin
