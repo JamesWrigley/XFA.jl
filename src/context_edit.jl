@@ -42,10 +42,16 @@ function write_context_file(client, text::String)
     if client.embedded_engine
         write(path, text)
     else
+        # We write to a temporary file and rename it over the original so that a
+        # failed write can't truncate the context file.
+        tmp_path = "$(path).$(randstring(8)).tmp"
         with_sftp(client) do sftp
-            open(path, sftp; write=true) do f
+            permissions = stat(path, sftp).permissions & 0o7777
+            open(tmp_path, sftp; write=true) do f
                 write(f, text)
             end
+            chmod(tmp_path, sftp, permissions)
+            mv(tmp_path, path, sftp)
         end
     end
 end

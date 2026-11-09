@@ -36,6 +36,7 @@ include("plotting.jl")
 
 using TOML: TOML
 using Sockets: Sockets
+using Random: randstring
 using CRC32c: crc32c
 using LibGit2: LibGit2
 using Sentry: Sentry
