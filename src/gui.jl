@@ -1677,7 +1677,7 @@ function draw_jump_hops_editor()
         push!(hops, "")
     end
     ig.SameLine()
-    if ig.Button("Reset")
+    if ig.Button("Reset to defaults")
         gui.jump_hops = nothing
     end
 end
