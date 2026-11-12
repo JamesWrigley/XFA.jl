@@ -2500,10 +2500,34 @@ end
         @Variable itime_proxied -> karabo"SPB_IRU_AGIPD1M1/MDL/FPGA_COMP.integrationTime@proxy:output"
 
         @Variable absent -> karabo"NOT/A/DEVICE.foo"
+
+        @Variable state -> karabo"SPB_IRU/MDL/SCANTOOL.state"
+
+        @Variable function motors(x -> karabo"SPB_IRU/MDL/SCANTOOL.motorIds")
+            x isa AbstractVector{String} ? join(x, ",") : "not strings"
+        end
         """)
 
         mktempdir() do dir
             pyimport("extra_data.tests.make_examples").make_agipd1m_run(dir)
+
+            # A scantool with string properties, which the mock writer leaves empty
+            pyexec("""
+            import h5py
+            from extra_data.tests.mockdata import write_file
+            from extra_data.tests.mockdata.base import DeviceBase
+
+            class Scantool(DeviceBase):
+                control_keys = [('state', h5py.string_dtype(), ()),
+                                ('motorIds', h5py.string_dtype(), (2,))]
+
+            path = '$(dir)/RAW-R9015-DA01-S00000.h5'
+            write_file(path, [Scantool('SPB_IRU/MDL/SCANTOOL')], ntrains=100, chunksize=1, format_version='1.0')
+            with h5py.File(path, 'r+') as f:
+                f['CONTROL/SPB_IRU/MDL/SCANTOOL/state/value'][:] = 'ON'
+                f['CONTROL/SPB_IRU/MDL/SCANTOOL/motorIds/value'][:] = ['m1', 'm2']
+            """, @__MODULE__)
+
             dc = pyimport("extra_data").RunDirectory(dir)
 
             # The type check rejects a Py object that isn't a DataCollection
@@ -2539,6 +2563,11 @@ end
             @test parent(viewed) isa SubArray{<:Any, 1, <:Vector} && viewed == arr[1:3]
             strided = PyArray(pyimport("numpy").arange(10)[pyslice(0, 10, 2)])
             @test_throws ArgumentError Context.unwrap_python(strided)
+
+            # String properties are converted to Julia strings as they are online
+            r = Context.run(ctx, dc; select=["state", "motors"])
+            @test all(==("ON"), r["state"])
+            @test all(==("m1,m2"), r["motors"])
 
             # Test that proxied dependencies are ignored
             r = Context.run(ctx, dc; select=["itime_proxied"])

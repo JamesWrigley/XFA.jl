@@ -192,6 +192,10 @@ end
 # scalar (slow) property arrives as a 0-dimensional array, unwrapped here.
 function train_value(array)
     value = pyconvert(DimArray, array; copy=false)
+    # Object arrays (e.g. strings) are converted to Julia values as they are online
+    if eltype(value) == Py
+        value = map(x -> pyconvert(Any, x), value)
+    end
     return ndims(value) == 0 ? value[] : value
 end
 
