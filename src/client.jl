@@ -1590,6 +1590,7 @@ function initialize_context_file(client)
         else
             mkpath(dirname(path))
             write(path, code)
+            chmod(path, 0o666)
         end
     else
         with_sftp(client) do sftp
@@ -1600,6 +1601,7 @@ function initialize_context_file(client)
                 open(path, sftp; write=true) do f
                     write(f, code)
                 end
+                chmod(path, sftp, 0o666)
             end
         end
     end
