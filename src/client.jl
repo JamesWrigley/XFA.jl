@@ -1200,9 +1200,21 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
         # Keep the source in sync with the file since edits are applied to it
         client.context.source = msg.source
     elseif msg isa Protocol.LogMessages
+        context_state = client.context.context_state
         for record in msg.records
             is_new_error = record.level >= CoreLogging.Error && !msg.replay
-            if isempty(record.variable)
+
+            # Group members log under their group's node, and anything without a node goes to the engine logs
+            group = first(split(record.variable, '.'))
+            node = if haskey(context_state, record.variable)
+                record.variable
+            elseif haskey(context_state, group)
+                group
+            else
+                ""
+            end
+
+            if isempty(node)
                 push_log!(client.engine_logs, record)
 
                 # Errors from before we connected aren't new, so we don't switch tabs for them
@@ -1211,10 +1223,10 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
                     state.select_tab = MainTab_EngineLogs
                 end
             else
-                if !haskey(client.variable_logs, record.variable)
-                    client.variable_logs[record.variable] = VariableLogs()
+                if !haskey(client.variable_logs, node)
+                    client.variable_logs[node] = VariableLogs()
                 end
-                logs = client.variable_logs[record.variable]
+                logs = client.variable_logs[node]
                 push_log!(logs.records, record)
                 if is_new_error && !logs.window_open
                     logs.unseen_errors += record.count
