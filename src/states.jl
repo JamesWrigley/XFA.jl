@@ -189,6 +189,7 @@ end
     const display_min::Ref{Cdouble} = Ref(0.0)
     const display_max::Ref{Cdouble} = Ref(1.0)
     display_zoomed::Bool = false
+    tick_label_width::Float32 = 40f0
 end
 
 # Matrix-rendering state: GPU heatmap resources, colormap log toggle, colorbar

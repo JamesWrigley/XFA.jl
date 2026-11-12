@@ -1024,15 +1024,12 @@ function draw_compression_settings(id, name, k::Ref{Cfloat}, store)
     end
 end
 
-# Wide enough for the tick labels plus a visible bar. Ticks are estimated from
-# the axis limits, which carry the most digits.
+# Pane width that keeps the bar a constant width, growing with the tick labels
+# ImPlot drew last frame.
 function colorbar_width(img::ImageState)
-    cb = img.colorbar
-    label(v) = img.log_scale[] ? @sprintf("1e%g", v) : @sprintf("%g", v)
-    label_w = max(ig.CalcTextSize(label(cb.display_min[])).x, ig.CalcTextSize(label(cb.display_max[])).x)
     style = ImPlot.GetStyle()
     padding = 2 * unsafe_load(style.PlotPadding.x) + unsafe_load(style.LabelPadding.x)
-    return max(100f0, 30f0 + label_w + padding)
+    return 30f0 + img.colorbar.tick_label_width + padding
 end
 
 # Interactive colorbar, drawn as a narrow plot whose Y axis is the display
@@ -1080,11 +1077,12 @@ function interactive_colorbar(img::ImageState, id, size::ImVec2)
             fill_band(clip_max, limits.Y.Max)
             ImPlot.PopPlotClipRect()
 
-            text = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Text))
-            handle_color = ImVec4(text.x, text.y, text.z, 0.5f0)
-            # NoFit leaves double-click with nothing to fit, so it doesn't move the display range
-            min_moved = ImPlot.DragLineY(0, cb.clip_min, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
-            max_moved = ImPlot.DragLineY(1, cb.clip_max, handle_color, 3, ImPlot.ImPlotDragToolFlags_NoFit)
+            # ImPlot's grab zone is only as tall as the drawn line, so wide transparent
+            # lines take the input and the visible handles are drawn without inputs.
+            # NoFit leaves double-click with nothing to fit, so it doesn't move the display range.
+            grab_color = ImVec4(0, 0, 0, 0)
+            min_moved = ImPlot.DragLineY(0, cb.clip_min, grab_color, 24, ImPlot.ImPlotDragToolFlags_NoFit)
+            max_moved = ImPlot.DragLineY(1, cb.clip_max, grab_color, 24, ImPlot.ImPlotDragToolFlags_NoFit)
             if min_moved || max_moved
                 eps = 1e-9 * max(abs(span), 1.0)
                 if min_moved
@@ -1095,10 +1093,20 @@ function interactive_colorbar(img::ImageState, id, size::ImVec2)
                 cb.autoscale[] = false
                 changed = true
             end
+
+            text = unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_Text))
+            handle_color = ImVec4(text.x, text.y, text.z, 0.5f0)
+            draw_flags = ImPlot.ImPlotDragToolFlags_NoFit | ImPlot.ImPlotDragToolFlags_NoInputs
+            ImPlot.DragLineY(2, cb.clip_min, handle_color, 3, draw_flags)
+            ImPlot.DragLineY(3, cb.clip_max, handle_color, 3, draw_flags)
             if ImPlot.IsPlotHovered() && ig.IsMouseDoubleClicked(ig.ImGuiMouseButton_Left)
                 cb.autoscale[] = true
                 cb.display_zoomed = false
             end
+
+            # Widest Y tick label, for sizing next frame's pane
+            y_axis = unsafe_load(ImPlot.YAxis(ImPlot.GetCurrentPlot(), 0))
+            cb.tick_label_width = y_axis.Ticker.MaxSize.x
         finally
             ImPlot.EndPlot()
         end
