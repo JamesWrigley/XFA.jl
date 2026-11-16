@@ -425,32 +425,46 @@ end
 
 ## MovingAvg postprocessor
 
-# Postprocessor that maintains an exponentially weighted moving average of the
-# input array. The buffer is reallocated when the input's size or eltype
-# changes; `nsamples` controls the EWMA window via alpha = 2/(nsamples+1).
+# Postprocessor for the mean of the last `nsamples` inputs, kept as a rolling
+# sum over a ring buffer of samples. Non-finite values are skipped.
 mutable struct MovingAvg <: AbstractPostprocessor
     nsamples::Parameter{Int}
-    buffer::AbstractArray
+    samples::AbstractArray
+    sum::AbstractArray
+    counts::Array{Int}
+    avg::AbstractArray
+    nfilled::Int
+    slot::Int
     buffer_key::UInt
 end
 
-MovingAvg(; nsamples::Integer=10) = MovingAvg(Parameter(Int(nsamples)), Float64[], UInt(0))
+MovingAvg(; nsamples::Integer=10) = MovingAvg(Parameter(Int(nsamples)), Float64[], Float64[], Int[], Float64[],
+                                              0, 1, UInt(0))
 
 default_name(::MovingAvg) = "moving_avg"
 
-function update_moving_avg!(buffer::AbstractArray{T}, data, nsamples) where {T}
-    alpha = T(2 / (nsamples + 1))
-    for i in eachindex(buffer, data)
-        x = data[i]
-        if !isfinite(x)
-            continue
-        elseif isfinite(buffer[i])
-            buffer[i] = alpha * x + (1 - alpha) * buffer[i]
-        else
-            buffer[i] = x
-        end
+# Replaces the oldest sample in `old` with `data` and updates the average.
+function update_moving_avg!(avg, sum, counts, old, full, data)
+    T = eltype(sum)
+    @inbounds @simd for i in eachindex(avg, sum, counts, old, data)
+        # The evicted sample only counts if the window was full
+        o = old[i]
+        ofin = full & isfinite(o)
+
+        x = T(data[i])
+        xfin = isfinite(x)
+        old[i] = x
+
+        # Remove the evicted sample and add the new one, skipping non-finites
+        c = counts[i] - ofin + xfin
+        s = sum[i] - ifelse(ofin, o, zero(T)) + ifelse(xfin, x, zero(T))
+        counts[i] = c
+
+        # With no finite samples left, clear rounding residue and output NaN
+        sum[i] = ifelse(c == 0, zero(T), s)
+        avg[i] = ifelse(c == 0, T(NaN), s / c)
     end
-    return buffer
+    return avg
 end
 
 # Center of mass of an array, weighting each entry by its value. For 1D
@@ -497,17 +511,31 @@ function center_of_mass(data::AbstractMatrix)
 end
 
 function (m::MovingAvg)(data::AbstractArray)
-    key = hash((size(data), eltype(data)))
+    n = m.nsamples[]
+    key = hash((size(data), eltype(data), n))
     if key != m.buffer_key
-        m.buffer = map(float(eltype(data)), data)
+        T = float(eltype(data))
+        m.samples = Array{T}(undef, size(data)..., n)
+        m.sum = zeros(T, size(data))
+        m.counts = zeros(Int, size(data))
+        m.avg = similar(m.sum)
+        m.nfilled = 0
+        m.slot = 1
         m.buffer_key = key
-        return m.buffer
     end
 
-    return update_moving_avg!(m.buffer, data, m.nsamples[])
+    full = m.nfilled == n
+    old = selectdim(m.samples, ndims(m.samples), m.slot)
+    update_moving_avg!(m.avg, m.sum, m.counts, old, full, data)
+    if !full
+        m.nfilled += 1
+    end
+    m.slot = mod1(m.slot + 1, n)
+
+    return m.avg
 end
 
-# The buffer holds plain values, so the output carries the latest input's lookups
+# The buffers hold plain values, so the output carries the latest input's lookups
 (m::MovingAvg)(data::DD.AbstractDimArray) = DD.rebuild(data, m(parent(data)))
 
 # Scalars go through the same buffer as a zero-dimensional array

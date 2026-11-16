@@ -1924,36 +1924,38 @@ end
 
     @testset "MovingAvg" begin
         m = Context.MovingAvg(; nsamples=3)
-        # First call seeds the buffer with the input promoted to float
+        # Inputs are promoted to float and averaged over the filled part of the window
         @test m([1, 2, 3]) == [1.0, 2.0, 3.0]
-        @test eltype(m.buffer) === Float64
-        buf = m.buffer
-
-        # Subsequent calls with matching size/eltype reuse the buffer and apply
-        # the EWMA in-place: alpha = 2/(3+1) = 0.5
+        @test eltype(m.avg) === Float64
+        buf = m.avg
         @test m([3, 4, 5]) == [2.0, 3.0, 4.0]
-        @test m.buffer === buf
+        @test m([5, 6, 7]) == [3.0, 4.0, 5.0]
+        @test m.avg === buf
 
-        # Changing size triggers reallocation
+        # Once full, the oldest sample is evicted
+        @test m([7, 8, 9]) == [5.0, 6.0, 7.0]
+
+        # Changing size, eltype, or window resets the buffers
         @test m([1.0, 2.0]) == [1.0, 2.0]
-        @test m.buffer !== buf
-
-        # Changing eltype also triggers reallocation
-        prev = m.buffer
+        @test m.avg !== buf
         @test m(Float32[1, 2]) == Float32[1, 2]
-        @test eltype(m.buffer) === Float32
-        @test m.buffer !== prev
+        @test eltype(m.avg) === Float32
+        m.nsamples[] = 2
+        @test m(Float32[3, 4]) == Float32[3, 4]
 
         # Scalars are averaged the same way
         m = Context.MovingAvg(; nsamples=3)
         @test m(1) === 1.0
         @test m(3) === 2.0
+        @test m(8) === 4.0
+        @test m(10) === 7.0
 
-        # Non-finite samples are skipped, and don't poison an unseeded entry
+        # Non-finite samples are skipped, including when evicted
         m = Context.MovingAvg(; nsamples=3)
         @test isequal(m([1.0, NaN]), [1.0, NaN])
         @test m([NaN, 4.0]) == [1.0, 4.0]
         @test m([3.0, Inf]) == [2.0, 4.0]
+        @test m([5.0, 6.0]) == [4.0, 5.0]
 
         # DimArray outputs follow the latest input's lookups
         m = Context.MovingAvg(; nsamples=3)
