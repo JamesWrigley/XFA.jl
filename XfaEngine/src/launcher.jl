@@ -1,4 +1,3 @@
-import Pkg
 using DistributedNext
 
 include("launcher_utils.jl")
