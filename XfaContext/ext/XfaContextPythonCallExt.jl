@@ -218,7 +218,7 @@ end
 # missing from the run entirely are dropped, so their variables never run. The
 # streamer reads up to `buffer_slots` chunks of `trains_per_chunk` trains ahead.
 function XfaContext.open_stream(dc::Py, deps::Vector{Dependency}, monitored::Vector{Dependency}=Dependency[];
-                                trains_per_chunk=2, buffer_slots=8)
+                                trains_per_chunk=16, buffer_slots=16)
     absent = filter(dep -> !has_key_data(dc, dep), deps)
     if !isempty(absent)
         @warn "Some dependencies aren't in the run, skipping them" deps=[dep.name for dep in absent]
@@ -351,7 +351,7 @@ end
 
 function XfaContext.run(ctx::ContextState, dc::Py;
                         select=String[], override=Dict{String, Any}(),
-                        trains_per_chunk=2, buffer_slots=8)
+                        trains_per_chunk=16, buffer_slots=16)
     if !is_data_collection(dc)
         throw(ArgumentError("Expected an extra_data DataCollection, got a $(pytype(dc))"))
     end
