@@ -226,7 +226,7 @@ end
     return VariableData(; data,
                         x_axis=collect(xe), y_axis=collect(ye),
                         xlabel=corr.x.value.name, ylabel=corr.y.value.name,
-                        fixed_aspect=false, compress=false, plot_specs)
+                        fixed_aspect=false, compress=false, plot_specs, save_mode=SaveMode_Last)
 end
 
 ## Histogram1D
@@ -352,10 +352,10 @@ end
 
 Base.push!(h::Histogram1D, x::Number) = append!(h, (x,))
 
-# Postprocessor entry point: bin the variable's output and return self so
-# `wrap_result` can package the current histogram state into a VariableData.
-(h::Histogram1D)(data::Number) = (push!(h, data); h)
-(h::Histogram1D)(data) = (append!(h, data); h)
+# Postprocessor entry point: bin the source's output and return the current
+# histogram state.
+(h::Histogram1D)(data::Number) = VariableData(push!(h, data))
+(h::Histogram1D)(data) = VariableData(append!(h, data))
 
 # Lets user variables return a Histogram1D directly; the engine wraps it
 # into a VariableData with bincounts as data, bincenters as x_axis, and the
@@ -369,7 +369,7 @@ function VariableData(h::Histogram1D; kwargs...)
         end
     end
     return VariableData(; data=counts, x_axis=collect(bincenters(h)),
-                        plot_type=:histogram, kwargs...)
+                        plot_type=:histogram, save_mode=SaveMode_Last, kwargs...)
 end
 
 ## Reducer postprocessor
@@ -510,7 +510,9 @@ function center_of_mass(data::AbstractMatrix)
     return (com_x, com_y)
 end
 
-function (m::MovingAvg)(data::AbstractArray)
+(m::MovingAvg)(data) = VariableData(average!(m, data); save_mode=SaveMode_Last)
+
+function average!(m::MovingAvg, data::AbstractArray)
     n = m.nsamples[]
     key = hash((size(data), eltype(data), n))
     if key != m.buffer_key
@@ -536,10 +538,10 @@ function (m::MovingAvg)(data::AbstractArray)
 end
 
 # The buffers hold plain values, so the output carries the latest input's lookups
-(m::MovingAvg)(data::DD.AbstractDimArray) = DD.rebuild(data, m(parent(data)))
+average!(m::MovingAvg, data::DD.AbstractDimArray) = DD.rebuild(data, average!(m, parent(data)))
 
 # Scalars go through the same buffer as a zero-dimensional array
-(m::MovingAvg)(data::Number) = m(fill(data))[]
+average!(m::MovingAvg, data::Number) = average!(m, fill(data))[]
 
 ## Scan postprocessor
 
@@ -663,7 +665,7 @@ end
 function scan_output(s::Scan)
     bins = scan_bins(s)
     records = collect(keys(s.records))
-    return isnothing(bins) ? VariableData(; data=nothing, records) : (@set bins.records = records)
+    return isnothing(bins) ? VariableData(; data=nothing, records, save_mode=SaveMode_Last) : (@set bins.records = records)
 end
 
 # Follow the scantool's configuration and scans. The 1-D scan types move all
@@ -762,6 +764,6 @@ function scan_bins(s::Scan)
         data = DD.rebuild(seq.mean; dims, name=source)
         # The std is pooled over a vector's elements, so only scalar scans get one
         uncertainty = ndims(seq.mean) == 1 ? DD.rebuild(seq.std; dims) : nothing
-        return VariableData(; data, uncertainty, compress=false, fixed_aspect=false)
+        return VariableData(; data, uncertainty, compress=false, fixed_aspect=false, save_mode=SaveMode_Last)
     end
 end

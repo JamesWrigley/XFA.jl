@@ -254,6 +254,10 @@ function ImageAsLines(name::AbstractString; x::Union{Symbol, Integer}, gradient:
     PlotSpec(name, [LayerSpec(; data, x, color, gradient)]; kwargs...)
 end
 
+# How an output is saved over a run: every train, or only the last one for
+# outputs that already accumulate (e.g. a moving average or histogram).
+@enum SaveMode SaveMode_PerTrain SaveMode_Last
+
 @kwdef struct VariableData{T}
     tid::Int = 0
     name::Union{String, Nothing} = nothing
@@ -277,6 +281,7 @@ end
     # TODO: replace with an `uncertainty` lookup on `data`'s dimension once
     # DimensionalData supports multiple lookups per dimension.
     uncertainty::Union{AbstractVector, Nothing} = nothing
+    save_mode::SaveMode = SaveMode_PerTrain
 end
 
 VariableData(data; kwargs...) = VariableData(; data, kwargs...)

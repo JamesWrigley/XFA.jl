@@ -469,11 +469,14 @@ end
         @postprocess(TestMean(); name="avg")
         @postprocess "double" TestMean()
         @postprocess "window" TestMean() name="wmean"
+        @postprocess Context.MovingAvg()
+        @postprocess "moving_avg" TestMean()
         @add_subvariable("double", data .* 2)
         return data
     end
     """)
-    pp_names = ["foo.window", "foo.avg", "foo.double.mean", "foo.window.wmean"]
+    pp_names = ["foo.window", "foo.avg", "foo.double.mean", "foo.window.wmean", "foo.moving_avg",
+                "foo.moving_avg.mean"]
     @test issetequal(ctx.subvariables["foo"], ["foo.double"; pp_names])
     @test ctx.parameters["foo.window.size"][] == 2
     @test issetequal(pp_names, keys(ctx.postprocessors))
@@ -487,6 +490,9 @@ end
     @test result.subvariables["foo.avg"] == VariableData(0, "foo.avg", 2.0)
     @test result.subvariables["foo.double.mean"] == VariableData(0, "foo.double.mean", 4.0)
     @test result.subvariables["foo.window.wmean"] == VariableData(0, "foo.window.wmean", 1.5)
+    # Raw outputs inherit the input's save mode
+    @test result.subvariables["foo.moving_avg.mean"] == VariableData(; tid=0, name="foo.moving_avg.mean", data=2.0,
+                                                                     save_mode=Context.SaveMode_Last)
 
     # Sources must be known subvariables, and only a `name` keyword is supported
     @test_throws "unknown source subvariable" Context.load_from_string("""
@@ -1923,44 +1929,52 @@ end
     end
 
     @testset "MovingAvg" begin
+        avg(x) = Context.average!(m, x)
+
+        # The output only makes sense as the run's final value
         m = Context.MovingAvg(; nsamples=3)
+        out = m([1, 2, 3])
+        @test out.data == [1.0, 2.0, 3.0]
+        @test out.save_mode == Context.SaveMode_Last
+
         # Inputs are promoted to float and averaged over the filled part of the window
-        @test m([1, 2, 3]) == [1.0, 2.0, 3.0]
+        m = Context.MovingAvg(; nsamples=3)
+        @test avg([1, 2, 3]) == [1.0, 2.0, 3.0]
         @test eltype(m.avg) === Float64
         buf = m.avg
-        @test m([3, 4, 5]) == [2.0, 3.0, 4.0]
-        @test m([5, 6, 7]) == [3.0, 4.0, 5.0]
+        @test avg([3, 4, 5]) == [2.0, 3.0, 4.0]
+        @test avg([5, 6, 7]) == [3.0, 4.0, 5.0]
         @test m.avg === buf
 
         # Once full, the oldest sample is evicted
-        @test m([7, 8, 9]) == [5.0, 6.0, 7.0]
+        @test avg([7, 8, 9]) == [5.0, 6.0, 7.0]
 
         # Changing size, eltype, or window resets the buffers
-        @test m([1.0, 2.0]) == [1.0, 2.0]
+        @test avg([1.0, 2.0]) == [1.0, 2.0]
         @test m.avg !== buf
-        @test m(Float32[1, 2]) == Float32[1, 2]
+        @test avg(Float32[1, 2]) == Float32[1, 2]
         @test eltype(m.avg) === Float32
         m.nsamples[] = 2
-        @test m(Float32[3, 4]) == Float32[3, 4]
+        @test avg(Float32[3, 4]) == Float32[3, 4]
 
         # Scalars are averaged the same way
         m = Context.MovingAvg(; nsamples=3)
-        @test m(1) === 1.0
-        @test m(3) === 2.0
-        @test m(8) === 4.0
-        @test m(10) === 7.0
+        @test avg(1) === 1.0
+        @test avg(3) === 2.0
+        @test avg(8) === 4.0
+        @test avg(10) === 7.0
 
         # Non-finite samples are skipped, including when evicted
         m = Context.MovingAvg(; nsamples=3)
-        @test isequal(m([1.0, NaN]), [1.0, NaN])
-        @test m([NaN, 4.0]) == [1.0, 4.0]
-        @test m([3.0, Inf]) == [2.0, 4.0]
-        @test m([5.0, 6.0]) == [4.0, 5.0]
+        @test isequal(avg([1.0, NaN]), [1.0, NaN])
+        @test avg([NaN, 4.0]) == [1.0, 4.0]
+        @test avg([3.0, Inf]) == [2.0, 4.0]
+        @test avg([5.0, 6.0]) == [4.0, 5.0]
 
         # DimArray outputs follow the latest input's lookups
         m = Context.MovingAvg(; nsamples=3)
-        m(DimArray([1.0, 2.0], (Dim{:energy}([10, 20]),)))
-        out = m(DimArray([3.0, 4.0], (Dim{:energy}([11, 21]),)))
+        avg(DimArray([1.0, 2.0], (Dim{:energy}([10, 20]),)))
+        out = avg(DimArray([3.0, 4.0], (Dim{:energy}([11, 21]),)))
         @test parent(out) == [2.0, 3.0]
         @test lookup(out, :energy) == [11, 21]
     end
@@ -2102,6 +2116,7 @@ end
             out = bin(scn, v, p)
         end
         @test out.data isa Context.DD.DimArray && !out.compress && isempty(out.records)
+        @test out.save_mode == Context.SaveMode_Last
         @test Context.DD.lookup(out.data, Symbol("mono.energy")) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
         @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
         @test out.uncertainty ≈ [std([10.0, 20.0, 30.0]; corrected=false), 0.0]
@@ -2296,6 +2311,12 @@ end
         @test vd.plot_type === :histogram
         @test vd.name == "hist"
         @test vd.xlabel == "energy"
+        @test vd.save_mode == Context.SaveMode_Last
+
+        # As a postprocessor it bins the input and returns the histogram state
+        out = h(5.0)
+        @test sum(out.data) == 5
+        @test out.save_mode == Context.SaveMode_Last
 
         # Windowed mode: buffer_size is in trains, so the sample buffer is
         # sized to length(xs) * buffer_size on each append. Older trains drop

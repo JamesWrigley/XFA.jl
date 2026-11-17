@@ -1039,16 +1039,25 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                         else
                             continue
                         end
-                        raw_input = pp_input isa VariableData ? pp_input.data : pp_input
+                        raw_input, save_mode = if pp_input isa VariableData
+                            pp_input.data, pp_input.save_mode
+                        else
+                            pp_input, SaveMode_PerTrain
+                        end
                         extras = [matched_data[dep.name].data for dep in pp_deps[pp_name]]
 
                         try
-                            subvar_values[pp_name] = @with(Meta.tid => tid,
-                                                           Meta.name => pp_name,
-                                                           Meta.group_name => group_name,
-                                                           Meta.scratch => scratch,
-                                                           Meta.subvariables => subvar_values,
-                                                           pp(raw_input, extras...))
+                            pp_out = @with(Meta.tid => tid,
+                                           Meta.name => pp_name,
+                                           Meta.group_name => group_name,
+                                           Meta.scratch => scratch,
+                                           Meta.subvariables => subvar_values,
+                                           pp(raw_input, extras...))
+                            # Raw outputs keep the input's save mode
+                            if !(pp_out isa VariableData)
+                                pp_out = VariableData(; data=pp_out, save_mode)
+                            end
+                            subvar_values[pp_name] = pp_out
                         catch ex
                             @error "Postprocessor '$(pp_name)' for variable '$(name)' failed" exception=(ex, catch_backtrace())
                         end
