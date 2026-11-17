@@ -27,11 +27,33 @@ using FHist: bincounts, bincenters, binedges
 using DimensionalData: DimArray, Dim, lookup, hasdim
 
 using PythonCall
+@py begin
+    import json
+    import os: environ
+    import nafka.runner: broker_test_context
+    import damnit: Damnit
+    import damnit.backend.db: DamnitDB
+    import damnit.backend.combine: FileSubmissionProcessor
+end
 
 using XfaContext
 using XfaContext: VariableData, XfaContextException, CircularChannel, drop_count, PlotSpec, LayerSpec
 
 keyset(dict) = Set(keys(dict))
+
+# An offline feeder of `camera.data` values that records the trains released
+struct RecordingFeeder
+    trains::Vector{Tuple{Int, Int}}
+    released::Vector{Int}
+end
+
+function (feeder::RecordingFeeder)(channel)
+    for (tid, x) in feeder.trains
+        put!(channel, (tid, Dict("camera" => Dict("data" => x))))
+    end
+end
+
+Context.release!(feeder::RecordingFeeder, tid) = push!(feeder.released, tid)
 
 # Helper module that defines variables for reference tests, defined in
 # Main so that load_from_string's context modules can access it.
@@ -574,6 +596,232 @@ end
     @test take!(ctx.stream_output).subvariables["foo.offset"].data == 21
 end
 
+@testset "DAMNIT integration" begin
+    load(damnit_variables) = Context.load_from_string("""
+    @Variable function foo(data -> karabo"foo.bar")
+        @postprocess Context.MovingAvg()
+        @add_subvariable("fit", data)
+        return data
+    end
+
+    @Variable function bar(data -> karabo"foo.bar")
+        return data
+    end
+
+    const DAMNIT_VARIABLES = $(repr(damnit_variables))
+    """)
+
+    @test isempty(Context.load_from_string("x = 1").saved_outputs)
+
+    # Wildcards match variables and subvariables, and a plain entry doesn't
+    # clear an override from another.
+    ctx = load(["foo*", "foo.moving_avg" => :per_train, "bar" => :last])
+    @test ctx.damnit_entries == [Context.DamnitEntry("foo*", nothing),
+                                 Context.DamnitEntry("foo.moving_avg", Context.SaveMode_PerTrain),
+                                 Context.DamnitEntry("bar", Context.SaveMode_Last)]
+    @test ctx.saved_outputs == Dict("foo" => nothing, "foo.fit" => nothing,
+                                    "foo.moving_avg" => Context.SaveMode_PerTrain,
+                                    "bar" => Context.SaveMode_Last)
+
+    @test_throws "matches no variables" load(["baz"])
+    @test_throws "Unknown save mode" load(["foo" => :first])
+    @test_throws "Invalid DAMNIT_VARIABLES entry" load([:foo])
+    @test_throws "conflicting save modes" load(["foo*" => :last, "foo" => :per_train])
+
+    # Periods become underscores in DAMNIT, so the names mustn't collide
+    @test Context.damnit_name("foo.moving_avg") == "foo_moving_avg"
+    @test_throws "would both be saved to DAMNIT as 'foo_fit'" Context.load_from_string("""
+    @Variable function foo(data -> karabo"foo.bar")
+        @add_subvariable("fit", data)
+        return data
+    end
+    @Variable foo_fit -> karabo"foo.bar"
+
+    const DAMNIT_VARIABLES = ["foo*"]
+    """)
+
+    @testset "Changing DAMNIT_VARIABLES" begin
+        ctx = load(["foo", "bar"])
+        Context.begin_run(ctx, 1234, 5, 0)
+        @lock ctx.run_session begin
+            for name in ("foo", "bar")
+                Context.record_output!(ctx.run_session[][], ctx.saved_outputs, VariableData(; tid=1, name, data=1.0))
+            end
+        end
+
+        # Unsaved outputs are dropped, and newly saved ones are a run event
+        entries = [Context.DamnitEntry("bar", nothing), Context.DamnitEntry("foo.fit", Context.SaveMode_Last)]
+        @test_logs (:warn, r"1 saved output") Context.set_damnit_entries!(ctx, entries)
+        session = @lock ctx.run_session ctx.run_session[][]
+        @test ctx.damnit_entries == entries
+        @test ctx.saved_outputs == Dict("bar" => nothing, "foo.fit" => Context.SaveMode_Last)
+        @test collect(keys(session.buffers)) == ["bar"]
+        @test only(session.events).outputs == ["foo.fit"]
+
+        # An invalid list leaves the old one in place
+        @test_throws "matches no variables" Context.set_damnit_entries!(ctx, [Context.DamnitEntry("baz", nothing)])
+        @test ctx.damnit_entries == entries
+    end
+
+    @testset "Run recording" begin
+        ctx = Context.load_from_string("x = Parameter(1)")
+        ctx.saved_outputs = Dict("foo" => nothing, "foo.avg" => nothing, "bar" => Context.SaveMode_PerTrain)
+        record(vd) = @lock ctx.run_session Context.record_output!(ctx.run_session[][], ctx.saved_outputs, vd)
+        current_session() = @lock ctx.run_session ctx.run_session[][]
+
+        # Only trains within the run are recorded. The input buffer is re-used
+        # between trains, so the recorder has to copy it.
+        data = zeros(2)
+        function record_train(tid)
+            data .= (tid, 2tid)
+            avg = VariableData(; tid, name="foo.avg", data=[tid, tid], save_mode=Context.SaveMode_Last)
+            record(VariableData(; tid, name="foo", data, x_axis=[1.0, 2.0], xlabel="energy",
+                                subvariables=Dict{String, Any}("foo.avg" => avg)))
+            record(VariableData(; tid, name="bar", data=tid / 2, save_mode=Context.SaveMode_Last))
+        end
+        Context.begin_run(ctx, 1234, 5, 10)
+        @test ctx.run_bounds[] == Context.RunBounds(1234, 5, 10, nothing)
+        foreach(record_train, 9:12)
+        Context.end_run(ctx, 1234, 5, 12)
+        @test ctx.run_bounds[] == Context.RunBounds(1234, 5, 10, 12)
+        record_train(13)
+
+        # Saving is disabled, so finishing only clears the session
+        session = current_session()
+        Context.finish_run!(ctx)
+        @test isnothing(current_session())
+        @test isnothing(ctx.run_bounds[])
+
+        # Per-train samples are stacked along trainId, with the output's labelled axis
+        foo = Context.saved_value("foo", session.buffers["foo"])
+        @test lookup(foo, :trainId) == [10, 11, 12]
+        @test lookup(foo, :energy) == [1.0, 2.0]
+        @test foo == [10 11 12; 20 22 24]
+        # A plain array saved last stays plain
+        @test Context.saved_value("foo.avg", session.buffers["foo.avg"]) == [12, 12]
+        # The override wins over the output's mode
+        @test Context.saved_value("bar", session.buffers["bar"]) == [5.0, 5.5, 6.0]
+
+        # A shape change restarts the buffer and is kept as an event
+        Context.begin_run(ctx, 1234, 6, 0)
+        record(VariableData(; tid=1, name="foo", data=[1, 2]))
+        @test_logs (:warn, r"changed shape") record(VariableData(; tid=2, name="foo", data=[1, 2, 3]))
+        @test current_session().buffers["foo"].tids == [2]
+        @test only(current_session().events).outputs == ["foo"]
+
+        # So is a parameter change, from the newest train recorded
+        @test_logs (:warn, r"Parameter 'x' changed") Context.change_parameter(ctx, Parameter("x", 2))
+        @test current_session().events[end].tid == 2
+
+        # A run that hasn't ended isn't finalised, and starting another discards it
+        Context.finish_run!(ctx)
+        @test !isnothing(current_session())
+        @test_logs (:warn, r"Discarding unfinished run 6") match_mode=:any Context.begin_run(ctx, 1234, 7, 0)
+        @test isempty(current_session().buffers)
+    end
+
+    @testset "Run metadata" begin
+        ctx = Context.load_from_string("""
+        @Input function input(::Context.MockInput, output)
+            for tid in 9:10
+                put!(output, (tid, Dict("foo" => Dict("bar" => 1))))
+            end
+        end
+        i = Context.MockInput()
+
+        @Variable function meta(data -> karabo"foo.bar")
+            return (Context.Meta.proposal[], Context.Meta.run_number[])
+        end
+
+        const DAMNIT_VARIABLES = ["meta"]
+        """)
+        outputs = []
+        ctx.on_output = vd -> push!(outputs, vd.data)
+        ctx.damnit_enabled[] = true
+
+        # Only trains in the run see its proposal and number
+        Context.begin_run(ctx, 1234, 5, 10)
+        Context.run(ctx) do
+            @test timedwait(() -> length(outputs) == 2, 5) == :ok
+        end
+        @test outputs == [(-1, -1), (1234, 5)]
+
+        # The progress counts the run's trains and the size of what's recorded
+        @test Context.run_status(ctx) == Context.RunStatus(1234, 5, 1, sizeof((1234, 5)))
+    end
+
+    @testset "Grace window" begin
+        # The run ends at train 10 while the stream stays open, so only the
+        # first train past the grace window can finalise it
+        ctx = Context.load_from_string("""
+        @Input function input(::Context.MockInput, output)
+            Context.begin_run(Context.current_ctx, 1234, 5, 1)
+            for tid in 1:31
+                put!(output, (tid, Dict("foo" => Dict("bar" => 1))))
+                if tid == 10
+                    Context.end_run(Context.current_ctx, 1234, 5, 10)
+                end
+            end
+            while isopen(output)
+                sleep(0.01)
+            end
+        end
+        i = Context.MockInput()
+
+        @Variable foo -> karabo"foo.bar"
+        """)
+        bounds = []
+        ctx.on_output = vd -> push!(bounds, ctx.run_bounds[])
+
+        Context.run(ctx) do
+            @test timedwait(() -> length(bounds) == 31 && isnothing(ctx.run_bounds[]), 5) == :ok
+        end
+        @test bounds[1 + ctx.run_grace + 10] == Context.RunBounds(1234, 5, 1, 10)
+    end
+
+    @testset "submit_damnit" begin
+        mktempdir() do dir
+            pywith(broker_test_context(joinpath(dir, "kafka.sqlite"))) do broker
+                # Python doesn't see changes to ENV after it starts
+                environ["AMORE_BROKER"] = broker.address
+                db = DamnitDB.from_dir(dir; create=true)
+                try
+                    db.metameta["proposal"] = 1234
+                    # The API only lists runs with a start time
+                    db.ensure_run(1234, 5; start_time=time())
+
+                    foo = DimArray([1 2 3; 4 5 6], (Dim{:energy}([1.0, 2.0]), Dim{:trainId}([10, 11, 12])); name=:foo)
+                    values = Dict("foo" => foo, "avg" => zeros(2, 3), "bar" => 6.0)
+                    Context.submit_damnit(1234, 5, values, Dict("baz" => ErrorException("oops"));
+                                          provenance="xfa-offline", damnit_dir=dir)
+
+                    combiner = FileSubmissionProcessor(; consumer_config=pydict(; auto_offset_reset="earliest"))
+                    try
+                        combiner.handle_one_message()
+                    finally
+                        combiner.shutdown()
+                    end
+
+                    run = Damnit(dir)[5]
+                    foo_read = pyconvert(DimArray, run["foo"].read())
+                    @test foo_read == foo
+                    @test lookup(foo_read, :energy) == lookup(foo, :energy)
+                    @test lookup(foo_read, :trainId) == lookup(foo, :trainId)
+                    # Plain arrays are transposed like DimArrays
+                    @test pyconvert(Tuple{Int, Int}, run["avg"].read().shape) == (3, 2)
+                    @test pyconvert(Float64, run["bar"].read()) == values["bar"]
+
+                    attrs = db.conn.execute("SELECT attributes FROM run_variables WHERE name='baz'").fetchone()[0]
+                    @test pyconvert(String, json.loads(attrs)["error"]) == "oops"
+                finally
+                    db.close()
+                    environ.pop("AMORE_BROKER")
+                end
+            end
+        end
+    end
+end
+
 @testset "@display" begin
     # Global parameter reference
     ctx = Context.load_from_string(raw"""
@@ -1010,6 +1258,8 @@ end
     @test Context.unique_device(devices, "Karabacon", "x") == KaraboDevice("SPB", "SPB/SCAN/1")
     @test_throws XfaContextException Context.unique_device(devices, "Motor", "x")
     @test_throws XfaContextException Context.unique_device(devices, "XGM", "x")
+    @test Context.first_device(devices, "Motor") == KaraboDevice("MID", "MID/MOTOR/1")
+    @test isnothing(Context.first_device(devices, "XGM"))
 
     # A group following the position of the only motor offered by the inputs
     resolver = raw"""
@@ -2481,9 +2731,9 @@ end
     # Nothing carrying a trainId dimension would be an infinite stream
     @test_throws ArgumentError Context.run(ctx, Dict("camera.data" => 5); select=["bar"])
 
-    # Each train is signalled as processed exactly once, in the order fed (even
-    # out of train ID order), after every variable has emitted for it, whether
-    # or not it produced a result.
+    # Each train is released exactly once, in the order fed (even out of train
+    # ID order), after every variable has emitted for it, whether or not it
+    # produced a result.
     ctx = Context.load_from_string(raw"""
     @Variable foo -> karabo"camera.data"
     @Variable function odd(x -> foo)
@@ -2493,15 +2743,9 @@ end
         return x + 1
     end
     """)
-    processed = Int[]
-    ctx.on_train_processed = tid -> push!(processed, tid)
-    feeder = function (channel)
-        for (tid, x) in [(12, 3), (10, 1), (13, 4), (11, 2)]
-            put!(channel, (tid, Dict("camera" => Dict("data" => x))))
-        end
-    end
+    feeder = RecordingFeeder([(12, 3), (10, 1), (13, 4), (11, 2)], Int[])
     r = Context.run_offline_plan(ctx, [10, 11, 12, 13], feeder)
-    @test processed == [12, 10, 13, 11]
+    @test feeder.released == [12, 10, 13, 11]
     @test r["bar"] == [2, 4]
     @test lookup(r["bar"], :trainId) == [10, 12]
 

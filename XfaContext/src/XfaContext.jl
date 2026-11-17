@@ -10,6 +10,8 @@ export @karabo_str, @Variable, @Input, @Group, @add_subvariable, @display, @get_
 # to, and it doubles as a back-compat alias for the engine.
 const Context = @__MODULE__
 
+const Maybe{T} = Union{T, Nothing}
+
 # Capacity of the per-train variable channels (see variable_channel). Also used
 # as the depth of the engine's Karabo recv buffer pool, so a recycled buffer has
 # had a full window of trains to drain through every consumer.
@@ -82,6 +84,10 @@ input_device(::Any) = nothing
 # Returns the sources available from an input group, as SourceInfo's
 get_sources(::Any) = SourceInfo[]
 
+# Called with an input group (or the offline feeder) once every variable has
+# emitted for a train, after which the input may free the train's data.
+release!(::Any, tid) = nothing
+
 # Karabo slow properties a group wants change notifications for, as full
 # Dependency's. They're routed and subscribed like the DAG's Karabo deps.
 monitored_properties(::Any) = Dependency[]
@@ -98,6 +104,8 @@ on_properties_changed(::Any, changed) = false
 # The parameters of a group or postprocessor that are filled in from the
 # inputs' devices when left unset, as a Dict from field name to either:
 # - a class, for a `Parameter{KaraboDevice}`: the unique device of that class;
+# - a `FirstDevice(class)`, for a `Parameter{KaraboDevice}`: the first device of
+#   that class sorted by topic and name, or left unset if there's none;
 # - `(class, property)`, for a `Parameter{Dependency}`: that property of the
 #   unique device of that class;
 # - `(field, property)`, for a `Parameter{Dependency}`: that property of the
@@ -148,8 +156,8 @@ module Meta
 import Base.ScopedValues: ScopedValue
 
 const tid = ScopedValue{Int}()
-const run_number = ScopedValue{Int}()
-const proposal = ScopedValue{Int}()
+const run_number = ScopedValue(-1)
+const proposal = ScopedValue(-1)
 const name = ScopedValue{String}()
 const group_name = ScopedValue("")
 
@@ -169,6 +177,7 @@ using SciMLBase: successful_retcode
 using FHist: FHist, Hist1D, Hist2D, bincounts, bincenters, binedges
 using NaNStatistics: NaNStatistics, nanmean, nansum, nanmean!, nansum!, allocate_nanmean, allocate_nansum
 include("context_builtins.jl")
+include("damnit.jl")
 
 @kwdef mutable struct WorkerState
     task_locks = Dict{String, ReentrantLock}()
@@ -220,7 +229,6 @@ end
 
     stream_output::Union{RemoteChannel, Channel, Nothing} = nothing
     on_output::Union{Function, Nothing} = nothing
-    on_train_processed::Union{Function, Nothing} = nothing
     output_forwarder_task::Union{Task, Nothing} = nothing
 
     # Invoked on proc 1 when a parameter changes value via `tryset`, as
@@ -237,13 +245,37 @@ end
 
     path::String = ""
 
+    damnit_entries::Vector{DamnitEntry} = DamnitEntry[]
+    # Outputs to save to DAMNIT, expanded from `damnit_entries`, with their
+    # save mode override (if any).
+    saved_outputs::Dict{String, Maybe{SaveMode}} = Dict{String, Maybe{SaveMode}}()
+    # Whether outputs are recorded at all
+    damnit_enabled::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    # The run being recorded, see `begin_run`
+    run_session::Base.Lockable{Base.RefValue{Maybe{RunSession}}, ReentrantLock} =
+        Base.Lockable(Ref{Maybe{RunSession}}(nothing))
+    # The session's bounds, updated with it. Maybe keeps the value boxed so
+    # reads are a single atomic pointer load rather than a lock.
+    run_bounds::Threads.Atomic{Maybe{RunBounds}} = Threads.Atomic{Maybe{RunBounds}}(nothing)
+    # The session's progress, readable without its lock
+    run_ntrains::Threads.Atomic{Int} = Threads.Atomic{Int}(0)
+    run_nbytes::Threads.Atomic{Int} = Threads.Atomic{Int}(0)
+    # Trains past a run's end to wait for before finalising it, since slow
+    # devices deliver late trains
+    run_grace::Int = 20
+    # Overrides the proposal's DAMNIT directory, for tests
+    damnit_dir::Maybe{String} = nothing
+    # Whether the running pipeline is replaying recorded data
+    offline::Bool = false
+
     # Offline-replay plan, populated on a copy of a loaded context by `run`. The
-    # feeder replaces all of the context's inputs (it pushes `(tid, data)` like a
-    # real @Input). `variable_overrides` maps a variable name to a value emitted
-    # per train in place of computing it; an overridden variable has its
-    # dependencies cut (so its upstream is pruned unless separately requested)
-    # and is driven as a root by `matched_tids`, the run's train list.
-    input_feeder::Union{Function, Nothing} = nothing
+    # feeder replaces all of the context's inputs: it's called with the input
+    # channel like an @Input, and `release!`d like an input group.
+    # `variable_overrides` maps a variable name to a value emitted per train in
+    # place of computing it; an overridden variable has its dependencies cut (so
+    # its upstream is pruned unless separately requested) and is driven as a
+    # root by `matched_tids`, the run's train list.
+    input_feeder::Any = nothing
     variable_overrides::Dict{String, Any} = Dict{String, Any}()
     matched_tids::Vector{Int} = Int[]
 
@@ -537,6 +569,8 @@ function to_dict(ctx::ContextState)
                 "origins" => origins,
                 "dep_to_input" => ctx.dep_to_input,
                 "group_parameter_args" => group_parameter_args,
+                "damnit_entries" => ctx.damnit_entries,
+                "saved_outputs" => sort(keys(ctx.saved_outputs)),
                 "path" => ctx.path)
 end
 
@@ -686,6 +720,18 @@ function change_parameter(ctx::ContextState, new_param::Parameter)
             else
                 ctx_param.update_handler(new_param.value)
             end
+        end
+    end
+
+    # The run being recorded no longer has consistent data. The change takes
+    # effect from about the newest train recorded.
+    @lock ctx.run_session begin
+        session = ctx.run_session[][]
+        if !isnothing(session)
+            message = "Parameter '$(new_param.name)' changed during the run"
+            tid = latest_tid(session)
+            @warn message tid
+            push!(session.events, RunEvent(tid, String[], message))
         end
     end
 end
@@ -904,7 +950,7 @@ function stream_external_dependency(name, input_neighbour, downstream_neighbours
     end
 end
 
-function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors;
+function stream_variable(name, stream_output, upstream, downstream, deps, postprocessors, run_bounds;
                          max_train_latency::Integer=20)
     # Initialize the scratch space
     scratch = Dict{String, Any}()
@@ -974,6 +1020,12 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
 
             f = worker_state.dag_functions[name]
             subvar_values = Dict{String, Any}()
+            bounds = run_bounds[]
+            proposal, run_number = if !isnothing(bounds) && in_run(bounds, tid)
+                bounds.proposal, bounds.run
+            else
+                -1, -1
+            end
             empty_result = VariableData(tid, name, nothing)
             @debug "Executing variable '$(name)'..."
             @lock worker_state.task_locks[name] begin
@@ -1006,6 +1058,8 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                     out = @with(Meta.tid => tid,
                                 Meta.name => name,
                                 Meta.group_name => group_name,
+                                Meta.proposal => proposal,
+                                Meta.run_number => run_number,
                                 Meta.scratch => scratch,
                                 Meta.subvariables => subvar_values,
                                 @invokelatest f(args...))
@@ -1050,6 +1104,8 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
                             pp_out = @with(Meta.tid => tid,
                                            Meta.name => pp_name,
                                            Meta.group_name => group_name,
+                                           Meta.proposal => proposal,
+                                           Meta.run_number => run_number,
                                            Meta.scratch => scratch,
                                            Meta.subvariables => subvar_values,
                                            pp(raw_input, extras...))
@@ -1117,23 +1173,47 @@ function stream_variable(name, stream_output, upstream, downstream, deps, postpr
     end
 end
 
-# Post-pipeline stage: passes each output to `ctx.on_output` and calls
-# `ctx.on_train_processed` once all `n_variables` variables have emitted for a train.
+# Post-pipeline stage: records the saved outputs of the run being recorded,
+# passes each output to `ctx.on_output` and releases a train from the inputs
+# once all `n_variables` variables have emitted for it. A run that has ended is
+# finalised once the stream closes.
 function run_post_pipeline(ctx::ContextState, n_variables::Int)
     stream = ctx.stream_output
     pending = Dict{Int, Int}()
+    inputs = Any[get_input_group(ctx, name) for name in keys(ctx.inputs)]
+    push!(inputs, ctx.input_feeder)
+    filter!(!isnothing, inputs)
+    release(tid) = foreach(input -> @invokelatest(release!(input, tid)), inputs)
     try
         while isopen(stream) || isready(stream)
             vd = take!(stream)
+            remaining = get(pending, vd.tid, n_variables) - 1
+            if ctx.damnit_enabled[]
+                @lock ctx.run_session begin
+                    session = ctx.run_session[][]
+                    if !isnothing(session)
+                        record_output!(session, ctx.saved_outputs, vd)
+                        if remaining == 0 && in_run(session, vd.tid)
+                            Threads.atomic_add!(ctx.run_ntrains, 1)
+                            ctx.run_nbytes[] = sum(buffer -> sizeof(buffer.data), values(session.buffers); init=0)
+                        end
+                    end
+                end
+            end
+
             if !isnothing(ctx.on_output)
                 ctx.on_output(vd)
             end
 
-            remaining = get(pending, vd.tid, n_variables) - 1
             if remaining == 0
                 delete!(pending, vd.tid)
-                if !isnothing(ctx.on_train_processed)
-                    ctx.on_train_processed(vd.tid)
+                release(vd.tid)
+
+                # An ended run is finalised once a train `run_grace` trains
+                # past its end has cleared.
+                bounds = ctx.run_bounds[]
+                if !isnothing(bounds) && !isnothing(bounds.last_tid) && vd.tid > bounds.last_tid + ctx.run_grace
+                    finish_run!(ctx)
                 end
             else
                 pending[vd.tid] = remaining
@@ -1147,12 +1227,10 @@ function run_post_pipeline(ctx::ContextState, n_variables::Int)
 
     if !isempty(pending)
         @warn "$(length(pending)) train(s) did not clear the pipeline"
-        if !isnothing(ctx.on_train_processed)
-            for tid in sort!(collect(keys(pending)))
-                ctx.on_train_processed(tid)
-            end
-        end
+        foreach(release, keys(pending))
     end
+
+    finish_run!(ctx)
 end
 
 # Simple function that will asynchronously watch the DAG and close the
@@ -1236,6 +1314,7 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
     # edited while stopped or by a group asking for a rewire.
     rewire!(ctx)
 
+    ctx.offline = offline
     ctx.stream_output = variable_channel(offline)
     ctx.events_channel = RemoteChannel(() -> Channel(100))
 
@@ -1396,12 +1475,12 @@ function start_pipeline(ctx::ContextState; offline::Bool=false, input_buffer_siz
             pp_name => ctx.postprocessors[pp_name]
             for pp_name in get(ctx.variable_postprocessors, name, String[])
         )
-        ctx.variable_tasks[name] = Threads.@spawn @with Meta.name => name stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps; max_train_latency)
+        ctx.variable_tasks[name] = Threads.@spawn @with Meta.name => name stream_variable(name, ctx.stream_output, args, downstream, ctx.dag[name], var_pps, ctx.run_bounds; max_train_latency)
         errormonitor(ctx.variable_tasks[name])
     end
 
     # Without a consumer the outputs stay in `stream_output` for the owner to read.
-    if !isnothing(ctx.on_output) || !isnothing(ctx.on_train_processed)
+    if !isnothing(ctx.on_output) || !isempty(ctx.saved_outputs)
         ctx.output_forwarder_task = Threads.@spawn :samepool run_post_pipeline(ctx, length(ctx.variable_tasks))
         errormonitor(ctx.output_forwarder_task)
     end
@@ -1506,6 +1585,8 @@ function resolve_all_sources!(ctx::ContextState, devices::Vector{SourceInfo})
                 nothing, nothing
             elseif spec isa AbstractString
                 unique_device(devices, spec, param.name), nothing
+            elseif spec isa FirstDevice
+                first_device(devices, spec.class), nothing
             elseif first(spec) isa Symbol
                 device_param = getproperty(owner, first(spec))
                 (isassigned(device_param) ? device_param[] : nothing), last(spec)
@@ -1982,6 +2063,10 @@ function load_from_module(ctx_module::Module, exprs::Vector{Expr}; @nospecialize
                      displays=ctx_displays,
                      parameters, displayables, callbacks, exprs, inputs, prelude, dep_router)
     ctx.dep_to_input = build_dep_routing(ctx, dep_router)
+    if isdefined(ctx_module, :DAMNIT_VARIABLES)
+        ctx.damnit_entries = DamnitEntry[parse_damnit_entry(entry) for entry in ctx_module.DAMNIT_VARIABLES]
+        ctx.saved_outputs = expand_saved_outputs(ctx, ctx.damnit_entries)
+    end
     global current_ctx = ctx
     return ctx
 end

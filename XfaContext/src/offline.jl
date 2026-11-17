@@ -37,9 +37,9 @@ end
 function open_data_collection end
 function data_collection_devices end
 function data_collection_schema end
+function data_collection_run end
 function open_stream end
 function feed! end
-function release! end
 
 # Replace Python-backed arrays with Julia views over the same memory, the
 # caller must `GC.@preserve` the original.
@@ -65,7 +65,6 @@ function Base.copy(ctx::ContextState)
                  dep_to_input=copy(ctx.dep_to_input),
                  path=ctx.path,
                  on_output=ctx.on_output,
-                 on_train_processed=ctx.on_train_processed,
                  on_parameter_changed=ctx.on_parameter_changed,
                  on_displayable_changed=ctx.on_displayable_changed)
 end
@@ -96,7 +95,8 @@ function upstream_closure(dag, roots)
             end
         end
     end
-    return kept
+
+    kept
 end
 
 # Apply `override` and `select` to an offline plan (a copy of a loaded context).
@@ -195,64 +195,23 @@ function offline_emitter(name, stream_output, downstream, value, tids)
     end
 end
 
-# Offline `on_output`: records each variable's and subvariable's per-train data
-# into `raw`.
-function record_train!(raw::Dict{String, Vector{Pair{Int, Any}}}, vd::VariableData)
-    record_sample!(raw, vd.name, vd.tid, vd.data)
-    for (sub_name, sub_vd) in vd.subvariables
-        record_sample!(raw, sub_name, vd.tid, sub_vd.data)
-    end
-end
-
-# Arrays are copied because a variable's data is only valid until its train has
-# cleared the pipeline (an input may be a view into a buffer the feeder re-uses).
-function record_sample!(raw, name, tid, data)
-    if isnothing(name) || isnothing(data)
-        return
-    end
-    sample = data isa AbstractArray ? copy(data) : data
-    push!(get!(raw, name, Pair{Int, Any}[]), tid => sample)
-end
-
-# Assemble the final per-variable result from accumulated samples, sorted by
-# train ID along a `trainId` dimension. Scalar samples become a plain DimVector;
-# array samples are stacked into one dense array with `trainId` as the trailing
-# dimension (this copies each train's data into a contiguous buffer).
-function to_dimarrays(raw::Dict{String, Vector{Pair{Int, Any}}})
-    results = Dict{String, DD.AbstractDimArray}()
-    for (name, samples) in raw
-        sorted = sort(samples; by=first)
-        tids = first.(sorted)
-        values = [s.second for s in sorted]
-        traindim = DD.Dim{:trainId}(tids)
-        sample = first(values)
-        if sample isa DD.AbstractDimArray
-            stacked = stack(DD.parent(v) for v in values)
-            results[name] = DD.DimArray(stacked, (DD.dims(sample)..., traindim); name=Symbol(name))
-        elseif sample isa AbstractArray
-            stacked = stack(values)
-            inner = ntuple(i -> DD.Dim{Symbol(:dim_, i)}(), ndims(sample))
-            results[name] = DD.DimArray(stacked, (inner..., traindim); name=Symbol(name))
-        else
-            results[name] = DD.DimArray(values, (traindim,); name=Symbol(name))
-        end
-    end
-    return results
-end
-
 # Shared driver for both `run` methods. Given a prepared `plan`, the matched
-# train ids and an `input_feeder` closure (pushes `(tid, data)` per train), wire
-# the single "offline" input, run the streaming pipeline to completion and
-# collect the per-train results. The plan's `on_train_processed` is left to the
-# caller (the PythonCall path uses it to return trains to the streamer).
+# train ids and an `input_feeder` (called with a channel to push `(tid, data)`
+# per train, and `release!`d once a train is done), wire the single "offline"
+# input, run the streaming pipeline to completion and collect the per-train
+# results.
 function run_offline_plan(plan::ContextState, matched_tids, input_feeder)
     plan.matched_tids = matched_tids
     plan.input_feeder = input_feeder
     plan.inputs = Dict{String, Any}("offline" => OrderedDict{Any, Any}())
     plan.dep_to_input = build_dep_routing(plan)
 
-    raw = Dict{String, Vector{Pair{Int, Any}}}()
-    plan.on_output = Base.Fix1(record_train!, raw)
+    # Every output is recorded per train, in a run without boundaries that's
+    # never finalised.
+    plan.saved_outputs = Dict{String, Maybe{SaveMode}}(name => SaveMode_PerTrain for name in output_names(plan))
+    plan.damnit_enabled[] = true
+    session = RunSession(; proposal=0, run=0, first_tid=-1)
+    plan.run_session = Base.Lockable(Ref{Maybe{RunSession}}(session))
 
     start_pipeline(plan; offline=true)
     try
@@ -262,7 +221,7 @@ function run_offline_plan(plan::ContextState, matched_tids, input_feeder)
         stop_pipeline(plan)
     end
 
-    return to_dimarrays(raw)
+    return Dict{String, DD.AbstractDimArray}(name => saved_value(name, buffer) for (name, buffer) in session.buffers)
 end
 
 # Offline replay entry point. `values` maps each external (Karabo) dependency

@@ -1123,6 +1123,8 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
 
     elseif msg isa Stopped
         client.context.pipeline_status = PipelineStatus_Stopped
+        # Stats aren't sent while stopped, so the last status would go stale
+        client.context.run_status = nothing
 
     elseif msg isa InputSources
         if !(msg.input_sources isa ExceptionMessage)
@@ -1169,6 +1171,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa RemapRules
         client.remap_rules = msg.rules
 
+    elseif msg isa DamnitEnabled
+        client.damnit_enabled[] = msg.enabled
+
+    elseif msg isa DamnitVariables
+        set_damnit_variables!(client.context, msg.entries, msg.saved_outputs)
+
     elseif msg isa DeviceSchema
         if !(msg.schema isa ExceptionMessage)
             client.source_properties[(msg.topic, msg.name)] = schema_property_names(msg.schema)
@@ -1184,6 +1192,12 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.source = msg.source
             client.context.input_topics = msg.info["input_topics"]
             client.context.variable_postprocessors = msg.info["postprocessors"]
+            saveable_outputs = Set{String}(keys(msg.info["dag"]))
+            for subvariables in values(msg.info["subvariables"])
+                union!(saveable_outputs, subvariables)
+            end
+            client.context.saveable_outputs = saveable_outputs
+            set_damnit_variables!(client.context, msg.info["damnit_entries"], msg.info["saved_outputs"])
             client.context_path = msg.info["path"]
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_logs)
@@ -1299,6 +1313,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
     elseif msg isa PipelineStats
         client.context.channel_stats = msg.channel_stats
         client.context.input_rates = msg.input_rates
+        client.context.run_status = msg.run_status
     elseif msg isa Ack
         if !isnothing(replied_to) && replied_to.msg_type == Start
             if isnothing(msg.error)
@@ -1350,6 +1365,7 @@ function handle_server(state)
                 get_devices(client)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
+                send(client, GetDamnitEnabled())
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)
@@ -1686,6 +1702,31 @@ end
 
 function set_routing_rules(client, rules::AbstractVector{RoutingRule})
     client.routing_rules_set_request = send(client, SetRoutingRules(collect(rules)))
+end
+
+function set_damnit_enabled(client)
+    client.damnit_enabled_request = send(client, SetDamnitEnabled(client.damnit_enabled[]))
+end
+
+# Store the DAMNIT_VARIABLES entries with the patterns saving each output, so
+# the GUI doesn't match them every frame
+function set_damnit_variables!(context, entries, saved_outputs)
+    regexes = [XfaContext.pattern_regex(entry.pattern) for entry in entries]
+    context.damnit_entries = entries
+    context.saved_outputs = Dict{String, Vector{String}}(
+        name => [entry.pattern for (entry, re) in zip(entries, regexes) if occursin(re, name)]
+        for name in saved_outputs)
+end
+
+# Replace the context's DAMNIT_VARIABLES, writing them to the context file once
+# the engine has accepted them
+function request_damnit_variables(state, entries::Vector{DamnitEntry})
+    client = state.client
+    client.damnit_variables_request = send_with_callback(client, SetDamnitVariables(entries), function (msg)
+        if isnothing(msg.error)
+            apply_source_edit(source -> edit.set_damnit_entries(source, entries), state; reload=false)
+        end
+    end)
 end
 
 function set_debug_mode(state)

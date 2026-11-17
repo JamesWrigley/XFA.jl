@@ -132,6 +132,15 @@ function temp_engine(f::Function; log=Logging.global_logger())
     end
 end
 
+# Receive messages until one of type `T`, skipping any others (e.g. logs)
+function receive_message(ws, ::Type{T}) where {T}
+    msg = Protocol.receive(ws).msg
+    while !(msg isa T)
+        msg = Protocol.receive(ws).msg
+    end
+    return msg
+end
+
 @testset "Engine" begin
     # Smoke test
     event = Base.Event()
@@ -254,8 +263,7 @@ end
                             @Variable x -> karabo"foo.bar"
                             """)
                 Protocol.client_send(ws, Protocol.LoadContext(path))
-                msg = nothing
-                while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                msg = receive_message(ws, Protocol.ContextInfo)
                 @test msg.info isa Dict
             end
             Protocol.client_send(ws, Protocol.ChangeParameter(Parameter("p", 2)))
@@ -263,6 +271,14 @@ end
             @test ack isa Protocol.Ack
             @test !isnothing(ack.error)
             @test occursin("boom", ack.error.text)
+
+            # Test SetDamnitVariables against the loaded context
+            entries = [Context.DamnitEntry("x", nothing)]
+            Protocol.client_send(ws, Protocol.SetDamnitVariables(entries))
+            @test isnothing(receive_message(ws, Protocol.Ack).error)
+            @test receive_message(ws, Protocol.DamnitVariables).saved_outputs == ["x"]
+            Protocol.client_send(ws, Protocol.SetDamnitVariables([Context.DamnitEntry("y", nothing)]))
+            @test contains(receive_message(ws, Protocol.Ack).error.text, "matches no variables")
 
             # Test ReviseCode
             Protocol.client_send(ws, Protocol.ReviseCode())
@@ -309,11 +325,11 @@ end
                     end
                     """)
                     Protocol.client_send(ws, Protocol.LoadContext(path))
-                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                    receive_message(ws, Protocol.ContextInfo)
                 end
 
                 Protocol.client_send(ws, Protocol.Start())
-                while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                receive_message(ws, Protocol.Ack)
 
                 # Collect messages until we get a PipelineStats with a non-zero
                 # drop count on the (motor.pos, slow) channel, or time out.
@@ -371,24 +387,21 @@ end
                     WebSockets.receive(ws) # client id
 
                     Protocol.client_send(ws, Protocol.LoadContext(path))
-                    msg = Protocol.receive(ws).msg
-                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    msg = receive_message(ws, Protocol.ContextInfo)
                     # Unassigned optional dependencies aren't edges
                     @test !haskey(msg.info["dag"]["f.follow"], "data")
 
                     Protocol.client_send(ws, Protocol.Start())
-                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                    receive_message(ws, Protocol.Ack)
 
                     # The restart resends the context with the derived edge
-                    msg = Protocol.receive(ws).msg
-                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    msg = receive_message(ws, Protocol.ContextInfo)
                     @test msg.is_running
                     @test msg.info["dag"]["f.follow"]["data"] == karabo_dependency("motor", "pos")
                     @test msg.info["dep_to_input"]["motor.pos"] == "x.input"
 
                     Protocol.client_send(ws, Protocol.Stop())
-                    msg = Protocol.receive(ws).msg
-                    while !(msg isa Protocol.Stopped); msg = Protocol.receive(ws).msg end
+                    msg = receive_message(ws, Protocol.Stopped)
                 end
             end
 
@@ -416,9 +429,9 @@ end
                     WebSockets.receive(ws) # client id
 
                     Protocol.client_send(ws, Protocol.LoadContext(path))
-                    while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                    receive_message(ws, Protocol.ContextInfo)
                     Protocol.client_send(ws, Protocol.Start())
-                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                    receive_message(ws, Protocol.Ack)
 
                     # Reloading restarts the pipeline, which fails here
                     write(path, raw"""
@@ -428,16 +441,39 @@ end
                     r = Rejecting()
                     """)
                     Protocol.client_send(ws, Protocol.LoadContext(path))
-                    msg = Protocol.receive(ws).msg
-                    while !(msg isa Protocol.ContextInfo); msg = Protocol.receive(ws).msg end
+                    msg = receive_message(ws, Protocol.ContextInfo)
                     @test msg.info isa Dict
                     @test !msg.is_running
 
-                    msg = Protocol.receive(ws).msg
-                    while !(msg isa Protocol.Ack); msg = Protocol.receive(ws).msg end
+                    msg = receive_message(ws, Protocol.Ack)
                     @test contains(msg.error.text, "Sources rejected")
                 end
             end
+        end
+    end
+end
+
+@testset "Settings" begin
+    # Without routing rules the engine would seed them from the webproxies
+    rm(engine.engine_settings_path(); force=true)
+    engine.write_settings(; routing_rules=RoutingRule[])
+
+    # Test that the DAMNIT setting is persistent
+    temp_engine() do address, stop_event, info_path
+        WebSockets.open(address) do ws
+            WebSockets.receive(ws) # client id
+            Protocol.client_send(ws, Protocol.GetDamnitEnabled())
+            @test !receive_message(ws, Protocol.DamnitEnabled).enabled
+            Protocol.client_send(ws, Protocol.SetDamnitEnabled(true))
+            @test receive_message(ws, Protocol.DamnitEnabled).enabled
+        end
+    end
+
+    temp_engine() do address, stop_event, info_path
+        WebSockets.open(address) do ws
+            WebSockets.receive(ws) # client id
+            Protocol.client_send(ws, Protocol.GetDamnitEnabled())
+            @test receive_message(ws, Protocol.DamnitEnabled).enabled
         end
     end
 end
@@ -700,6 +736,29 @@ end
     @test haskey(ctx.inputs, "bridge.stream")
     @test ctx.functions["bridge.stream"] === XfaEngine.stream
 
+    @testset "Tracking the DAQ" begin
+        ctx = Context.load_from_string("""
+        bridge = KaraboInput(; trainmatcher=KaraboDevice("MATCHER"))
+        bridge._mock_sources = [SourceInfo("SPB", "SPB/DAQ", "RunManager"), SourceInfo("MID", "MID/DAQ", "RunManager")]
+        """; prelude=KARABO_PRELUDE)
+        bridge = ctx.groups["bridge"]
+
+        # The first RunManager is tracked by default
+        Context.resolve_all_sources!(ctx, Context.get_sources(bridge))
+        @test bridge.track_daq[] == KaraboDevice("MID", "MID/DAQ")
+
+        # The RunManager goes through CHANGING between states, and pausing keeps the run
+        change(tid; props...) = Context.on_properties_changed(bridge, Dict(string(k) => (; value, tid) for (k, value) in props))
+        change(1; state="ACQUIRING", proposalNumber=1234, runNumber=5)
+        for (tid, state) in [(2, "CHANGING"), (3, "PAUSED"), (4, "CHANGING"), (5, "ACQUIRING"), (6, "CHANGING")]
+            change(tid; state)
+        end
+        @test ctx.run_bounds[] == Context.RunBounds(1234, 5, 1, nothing)
+        change(7; state="MONITORING")
+        @test ctx.run_bounds[] == Context.RunBounds(1234, 5, 1, 6)
+        @test bridge.daq_status[] == (1234, 5, "MONITORING")
+    end
+
     @testset "Source leases ($(pattern))" for pattern in (KaraboBridge.BridgePattern_REP,
                                                          KaraboBridge.BridgePattern_PUB)
         # In automatic configuration mode the bridge should lease its
@@ -793,11 +852,6 @@ end
 
         outputs = Dict{String, Vector{Any}}()
         ctx.on_output = vd -> push!(get!(outputs, vd.name, []), vd.data)
-        released = Int[]
-        ctx.on_train_processed = function (tid)
-            push!(released, tid)
-            XfaEngine.release_train(bridge, tid)
-        end
 
         Context.run(ctx; offline=true, timeout=60) do
             @test timedwait(() -> isready(ctx.pipeline_events), 30) == :ok
@@ -807,7 +861,8 @@ end
         @test length(outputs["flux"]) == 400
         @test all(==(0), outputs["flux"])
         @test all(==(0), outputs["intensity"])
-        @test sort(released) == 10000:10399
+        # Every train was released back to the input
+        @test bridge.progress[] == (400, 400)
         @test isnothing(bridge.stream)
 
         # The monitored property never changes, so it's reported once
@@ -840,13 +895,13 @@ end
                         end
                         """)
                         Protocol.client_send(ws, Protocol.LoadContext(path))
-                        while !(Protocol.receive(ws).msg isa Protocol.ContextInfo) end
+                        receive_message(ws, Protocol.ContextInfo)
                     end
 
                     Protocol.client_send(ws, Protocol.SetVariableSubscriptions(Dict("itd" => 0.0, "itd_view" => 0.0)))
-                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                    receive_message(ws, Protocol.Ack)
                     Protocol.client_send(ws, Protocol.Start())
-                    while !(Protocol.receive(ws).msg isa Protocol.Ack) end
+                    receive_message(ws, Protocol.Ack)
 
                     received = Dict{String, Vector{VariableData}}()
                     progress = Tuple{Int, Int}[]
@@ -872,6 +927,32 @@ end
                     @test all(vd -> length(vd.data) == 10 && iszero(vd.data), received["itd_view"])
                 end
             end
+        end
+    end
+
+    @testset "Run boundaries" begin
+        mktempdir() do dir
+            path = joinpath(dir, "RAW-R0450-DA01-S00000.h5")
+            run(`$(ENV["JULIA_PYTHONCALL_EXE"]) -c "from extra_data.tests.make_examples import make_fxe_da_file; make_fxe_da_file('$(path)', format_version='1.0')"`)
+
+            ctx = Context.load_from_string("""
+            bridge = KaraboInput(; offline=true, run_directory="$(dir)", rate=1e6)
+            @Variable function run_id(x -> karabo"SA1_XTD2_XGM/DOOCS/MAIN.pulseEnergy.photonFlux")
+                (Meta.proposal[], Meta.run_number[])
+            end
+            """; prelude=KARABO_PRELUDE)
+            run_ids = []
+            ctx.on_output = vd -> push!(run_ids, vd.data)
+
+            Context.run(ctx; offline=true, timeout=60) do
+                @test timedwait(() -> isready(ctx.pipeline_events), 30) == :ok
+                @test take!(ctx.pipeline_events) == :finished
+            end
+
+            # Every train is in the run, which is finalised once they've cleared the pipeline
+            @test length(run_ids) == 400
+            @test all(==((700000, 450)), run_ids)
+            @test isnothing(@lock ctx.run_session ctx.run_session[][])
         end
     end
 end
@@ -1541,6 +1622,31 @@ end
         # Values with no source representation are left out
         @test_logs (:warn, r"Cannot write") @test edit.replace_parameter(source, "threshold", Dict("a" => 1), pps) == source
     end
+
+    @testset "Set DAMNIT entries" begin
+        entries = [Context.DamnitEntry("foo", nothing), Context.DamnitEntry("bar.*", Context.SaveMode_Last)]
+
+        # Defined at the end if it isn't already, sorted by pattern
+        @test edit.set_damnit_entries("@Variable foo -> karabo\"A/B.c\"\n", entries) == """
+        @Variable foo -> karabo"A/B.c"
+
+        const DAMNIT_VARIABLES = ["bar.*" => :last, "foo"]
+        """
+
+        # Replaced in place otherwise, even if it isn't a list literal, and
+        # written one entry per line if it doesn't fit on one
+        @test edit.set_damnit_entries("DAMNIT_VARIABLES = names() # comment\n", Context.DamnitEntry[]) ==
+            "DAMNIT_VARIABLES = [] # comment\n"
+        long_entries = [Context.DamnitEntry("a_long_variable_name_$(i)", nothing) for i in 1:4]
+        @test edit.set_damnit_entries("const DAMNIT_VARIABLES = []\n", long_entries) == """
+        const DAMNIT_VARIABLES = [
+            "a_long_variable_name_1",
+            "a_long_variable_name_2",
+            "a_long_variable_name_3",
+            "a_long_variable_name_4",
+        ]
+        """
+    end
 end
 
 @testset "Context builtins" begin
@@ -1696,6 +1802,8 @@ end
             @display roi
             mean(data)
         end
+
+        const DAMNIT_VARIABLES = ["bar.max*", "foo" => :last]
         """; prelude=KARABO_PRELUDE)
 
     @test Context.to_dict(ctx) == Dict("inputs" => Dict("bridge.stream" => ["bridge"]),
@@ -1722,16 +1830,21 @@ end
                                                             "bar.window.size" => Parameter("bar.window.size", 5),
                                                             "bridge.address" => Parameter("bridge.address", ""),
                                                             "bridge.trainmatcher" => Parameter("bridge.trainmatcher", KaraboDevice("", "")),
+                                                            "bridge.track_daq" => Parameter{KaraboDevice}(; name="bridge.track_daq"),
                                                             "bridge.manual_configuration" => Parameter("bridge.manual_configuration", false),
                                                             "bridge.offline" => Parameter("bridge.offline", false),
                                                             "bridge.proposal" => Parameter("bridge.proposal", 0),
                                                             "bridge.run" => Parameter("bridge.run", 0),
                                                             "bridge.run_directory" => Parameter("bridge.run_directory", ""),
                                                             "bridge.rate" => Parameter("bridge.rate", 10.0)),
-                                       "displayables" => Dict("bridge.progress" => Context.Displayable(; name="bridge.progress", value=(0, 0))),
+                                       "displayables" => Dict("bridge.progress" => Context.Displayable(; name="bridge.progress", value=(0, 0)),
+                                                              "bridge.daq_status" => Context.Displayable(; name="bridge.daq_status", value=(0, 0, ""))),
                                        "callbacks" => OD("resettable.reset" => "Reset"),
                                        "dep_to_input" => Dict("xgm.intensity" => "bridge.stream"),
                                        "group_parameter_args" => Dict(),
+                                       "damnit_entries" => [Context.DamnitEntry("bar.max*", nothing),
+                                                            Context.DamnitEntry("foo", Context.SaveMode_Last)],
+                                       "saved_outputs" => ["bar.max_data", "bar.max_data.avg", "foo"],
                                        "path" => "")
 
     # Group variables that reference a group Parameter field record the

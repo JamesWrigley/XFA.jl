@@ -10,7 +10,8 @@ export AbstractMessage, Ping, Shutdown,
     GetRemapRules, RemapRules,
     SetVariableSubscriptions,
     ChangeParameter, InvokeCallback, Start, Stop,
-    SetDebugMode,
+    SetDebugMode, GetDamnitEnabled, SetDamnitEnabled, DamnitEnabled,
+    SetDamnitVariables, DamnitVariables,
     Pong, AvailableDevices,
     Started, Stopped, InputSources,
     ContextInfo, ParameterChanged, DisplayableChanged, TrainData,
@@ -179,20 +180,44 @@ struct TrainData <: AbstractMessage
     variables::Vector{VariableData}
 end
 
+struct GetDamnitEnabled <: AbstractMessage end
+
+# Turn saving runs to DAMNIT on or off, broadcast as DamnitEnabled
+struct SetDamnitEnabled <: AbstractMessage
+    enabled::Bool
+end
+
+struct DamnitEnabled <: AbstractMessage
+    enabled::Bool
+end
+
+# Replace the loaded context's DAMNIT_VARIABLES, broadcast as DamnitVariables
+struct SetDamnitVariables <: AbstractMessage
+    entries::Vector{XfaContext.DamnitEntry}
+end
+
+# The entries and the names of the outputs they save
+struct DamnitVariables <: AbstractMessage
+    entries::Vector{XfaContext.DamnitEntry}
+    saved_outputs::Vector{String}
+end
+
 struct Record <: AbstractMessage
     output::String
     key::String
     data::Any
 end
 
-# Periodic pipeline metrics broadcast. `channel_stats` holds per-channel
-# snapshots keyed by (producer, consumer); producer is either an external
-# dependency name (e.g. "motor.pos") or a variable name, consumer is always
-# the downstream variable name. `input_rates` is the smoothed Hz at which
-# each input is pushing data, keyed by input name.
+# Periodic pipeline metrics broadcast
 struct PipelineStats <: AbstractMessage
+    # Per-channel snapshots keyed by (producer, consumer). The producer is
+    # either an external dependency name (e.g. "motor.pos") or a variable name,
+    # the consumer is always the downstream variable name.
     channel_stats::Dict{Tuple{String, String}, XfaContext.ChannelStat}
+    # The smoothed Hz at which each input is pushing data, keyed by input name
     input_rates::Dict{String, Float64}
+    # The run being recorded, if any
+    run_status::Union{XfaContext.RunStatus, Nothing}
 end
 
 struct Ack <: AbstractMessage

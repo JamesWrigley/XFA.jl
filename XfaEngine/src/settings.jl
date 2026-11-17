@@ -24,17 +24,6 @@ function load_routing_rules()
     [RoutingRule(r["topic"], r["source"], r["input"]) for r in settings["routing_rules"]]
 end
 
-function write_routing_rules(rules::AbstractVector{RoutingRule})
-    path = engine_settings_path()
-    settings = isfile(path) ? TOML.parsefile(path) : Dict{String, Any}()
-    settings["routing_rules"] = [Dict("topic" => r.topic,
-                                      "source" => r.source,
-                                      "input" => r.input) for r in rules]
-    open(path, "w") do io
-        TOML.print(io, settings; sorted=true)
-    end
-end
-
 # Returns the input (trainmatcher device name) from the first rule whose topic
 # and source globs both match, or nothing if no rule matches.
 function match_rule(rules::AbstractVector{RoutingRule}, topic::AbstractString, source::AbstractString)
@@ -101,13 +90,35 @@ function load_remap_rules()
     vcat(user, BUILTIN_REMAP_RULES)
 end
 
-function write_remap_rules(rules::AbstractVector{RemapRule})
+# Whether finished runs are saved to DAMNIT, off unless engine.toml says otherwise
+function load_damnit_enabled()
+    path = engine_settings_path()
+    if !isfile(path)
+        return false
+    else
+        return get(TOML.parsefile(path), "damnit_enabled", false)
+    end
+end
+
+# Update the given settings in engine.toml, keeping the others
+function write_settings(; routing_rules=nothing, remap_rules=nothing, damnit_enabled=nothing)
     path = engine_settings_path()
     settings = isfile(path) ? TOML.parsefile(path) : Dict{String, Any}()
-    settings["remap_rules"] = [Dict("kind" => Int(r.kind),
-                                    "source" => r.source,
-                                    "device_class" => r.device_class,
-                                    "replacement" => r.replacement) for r in rules]
+    if !isnothing(routing_rules)
+        settings["routing_rules"] = [Dict("topic" => r.topic,
+                                          "source" => r.source,
+                                          "input" => r.input) for r in routing_rules]
+    end
+    if !isnothing(remap_rules)
+        settings["remap_rules"] = [Dict("kind" => Int(r.kind),
+                                        "source" => r.source,
+                                        "device_class" => r.device_class,
+                                        "replacement" => r.replacement) for r in remap_rules]
+    end
+    if !isnothing(damnit_enabled)
+        settings["damnit_enabled"] = damnit_enabled
+    end
+
     open(path, "w") do io
         TOML.print(io, settings; sorted=true)
     end

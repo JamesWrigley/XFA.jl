@@ -45,6 +45,22 @@ function unique_device(devices::Vector{SourceInfo}, class::AbstractString, param
     end
 end
 
+# A `device_classes` spec for the first device of a class, see `first_device`
+struct FirstDevice
+    class::String
+end
+
+# The first device of class `class` in `devices` sorted by topic and name, or
+# nothing if there's none.
+function first_device(devices::Vector{SourceInfo}, class::AbstractString)
+    matches = sort!(filter(dev -> dev.class_id == class, devices); by=dev -> (dev.topic, dev.name))
+    if isempty(matches)
+        nothing
+    else
+        KaraboDevice(first(matches).topic, first(matches).name)
+    end
+end
+
 ## Correlation group
 
 @Group mutable struct Correlation

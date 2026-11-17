@@ -25,7 +25,8 @@ using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
     Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
-    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian, ModelFunction_Linear
+    LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian, ModelFunction_Linear,
+    DamnitEntry, RunStatus
 include("states.jl")
 include("imgui_helpers.jl")
 
@@ -479,7 +480,7 @@ function plot_button(label, name; button=ig.Button)
     if too_many_dims
         ig.EndDisabled()
         if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
-            ig.SetTooltip("Plotting arrays with more than 2 dimensions is not supported")
+            node_tooltip("Plotting arrays with more than 2 dimensions is not supported")
         end
     end
 
@@ -500,6 +501,44 @@ function records_button(output)
         if ig.IsItemHovered()
             node_tooltip("Records")
         end
+    end
+end
+
+# At the start of an output's row, a toggle for saving it to DAMNIT by adding
+# or removing its entry in DAMNIT_VARIABLES. Outputs also saved by another
+# pattern (e.g. a wildcard) can't be toggled off here.
+function damnit_toggle(output; button=ig.Button)
+    client = state[].client
+    context = client.context
+    if output in context.saveable_outputs
+        saved = haskey(context.saved_outputs, output)
+        other_patterns = saved ? filter(!=(output), context.saved_outputs[output]) : String[]
+
+        text_color = saved ? ImVec4(0.3, 0.8, 0.4, 1) : unsafe_load(ig.GetStyleColorVec4(ig.ImGuiCol_TextDisabled))
+        ig.PushStyleColor(ig.ImGuiCol_Text, text_color)
+        @Disabled !graph_editable(client) || is_pending(client, client.damnit_variables_request) || !isempty(other_patterns) begin
+            if button("\uf0c7###damnit-$(output)")
+                entries = if saved
+                    filter(entry -> entry.pattern != output, context.damnit_entries)
+                else
+                    [context.damnit_entries; DamnitEntry(output, nothing)]
+                end
+                request_damnit_variables(state[], entries)
+            end
+        end
+        ig.PopStyleColor()
+
+        if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+            tooltip = if !isempty(other_patterns)
+                "Saved to DAMNIT by $(join(other_patterns, ", ")) in DAMNIT_VARIABLES"
+            elseif saved
+                "Saved to DAMNIT"
+            else
+                "Not saved to DAMNIT"
+            end
+            node_tooltip(tooltip)
+        end
+        ig.SameLine()
     end
 end
 
@@ -803,9 +842,8 @@ function draw_variable(name, var_data)
         logs_w = unseen_errors > 0 ? ig.CalcTextSize(logs_text).x + del_w / 2 : del_w
 
         after_title = ig.GetCursorPos()
-        # The icons only fit in the buttons without the horizontal frame padding,
-        # and 3/4 of the vertical padding centers them vertically
-        ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(0, 0.75 * unsafe_load(ig.GetStyle().FramePadding.y)))
+        # The icons only fit in the buttons without frame padding
+        ig.PushStyleVar(ig.ImGuiStyleVar_FramePadding, ImVec2(0, 0))
 
         ig.SetCursorPos((title_pos.x + node_width - del_w - spacing - logs_w, title_pos.y))
         if unseen_errors > 0
@@ -943,6 +981,7 @@ function draw_variable(name, var_data)
         end
 
         if !isempty(label)
+            damnit_toggle(output_name)
             if haskey(client.variable_data, output_name)
                 if plot_button("$(label)###$(output_name)-plot_button", output_name)
                     push!(client.plots, variable_plot(output_name, client.plot_counter))
@@ -1024,6 +1063,7 @@ function draw_variable(name, var_data)
                             ig.ImGuiOldColumnFlags_NoPreserveWidths | ig.ImGuiOldColumnFlags_NoForceWithinWindow)
             ig.SetColumnWidth(0, node_width - icon_w)
 
+            damnit_toggle(pp.name; button=ig.SmallButton)
             expanded = ig.TreeNode(label)
             if haskey(client.variable_data, pp.name)
                 typestr = get_variable_typeinfo(pp.name)
@@ -1448,6 +1488,23 @@ function draw_dag()
     if context.pipeline_status in changing_states
         ig.SameLine()
         Spinner()
+    end
+
+    ig.SameLine()
+    @Disabled is_pending(client, client.damnit_enabled_request) begin
+        if ig.Checkbox("Save to DAMNIT", client.damnit_enabled)
+            set_damnit_enabled(client)
+        end
+    end
+    if ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+        ig.SetTooltip("Save the outputs in DAMNIT_VARIABLES to DAMNIT when a run finishes")
+    end
+
+    run_status = context.run_status
+    if client.damnit_enabled[] && !isnothing(run_status)
+        ig.SameLine()
+        nbytes = Base.format_bytes(run_status.nbytes; binary=false)
+        ig.TextDisabled("Recording p$(run_status.proposal), r$(run_status.run): $(run_status.ntrains) trains, $(nbytes)")
     end
 
     ig.SameLine()
@@ -2482,6 +2539,9 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     icon_config = ig.ImFontConfig()
     icon_config.MergeMode = true
     icon_config.GlyphExcludeRanges = pointer(ICON_EXCLUDE_RANGES)
+    # Merged glyphs are put on the base font's baseline, which leaves the icons
+    # too high (see ocornut/imgui#4127)
+    icon_config.GlyphOffset = ImVec2(0, 2)
     font_atlas = unsafe_load(ig.GetIO().Fonts)
     font_dir = joinpath(@__DIR__, "fonts")
     fonts=[

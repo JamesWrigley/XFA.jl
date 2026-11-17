@@ -75,6 +75,16 @@ function XfaContext.data_collection_devices(dc::Py)
     return sort!([(name, class_id) for (name, class_id) in devices])
 end
 
+# The proposal and run number from the run's metadata, if it has them
+function XfaContext.data_collection_run(dc::Py)
+    meta = dc.run_metadata()
+    if pyconvert(Bool, pycontains(meta, "proposalNumber"))
+        return pyconvert(Int, meta["proposalNumber"]), pyconvert(Int, meta["runNumber"])
+    else
+        return nothing
+    end
+end
+
 function insert_leaf!(node, key)
     parts = split(key, '.')
     for part in parts[1:end - 1]
@@ -321,6 +331,9 @@ function XfaContext.feed!(stream::TrainStream, channel, rate=Ref(Inf))
     end
 end
 
+# Called as the offline runner's input feeder
+(stream::TrainStream)(channel) = XfaContext.feed!(stream, channel)
+
 function XfaContext.release!(stream::TrainStream, tid::Integer)
     if !isnothing(stream.iterator)
         td = @lock stream.pending pop!(stream.pending[], tid)
@@ -368,13 +381,25 @@ function XfaContext.run(ctx::ContextState, dc::Py;
     deps = external_dependencies(plan)
     monitored = intersect(deps, monitored_dependencies(plan))
     stream = XfaContext.open_stream(dc, deps, monitored; trains_per_chunk, buffer_slots)
-    plan.on_train_processed = tid -> XfaContext.release!(stream, tid)
 
     try
-        return run_offline_plan(plan, stream.train_ids, channel -> XfaContext.feed!(stream, channel))
+        return run_offline_plan(plan, stream.train_ids, stream)
     finally
         close(stream)
     end
+end
+
+# Plain arrays are transposed like DimArrays to keep the fast axis the same
+damnit_value(x::DD.AbstractDimArray) = Py(x; xarray=true)
+damnit_value(x::AbstractArray) = pyimport("numpy").asarray(Py(x)).T
+damnit_value(x) = Py(x)
+
+function XfaContext.submit_damnit(proposal, run, values, errors; provenance, damnit_dir=nothing)
+    # damnit is optional, so it's only imported when needed
+    damnit = pyimport("damnit")
+    py_values = pydict(name => damnit_value(value) for (name, value) in values)
+    py_errors = pydict(name => pybuiltins.Exception(sprint(showerror, ex)) for (name, ex) in errors)
+    damnit.submit(proposal, run, py_values; provenance, errors=py_errors, damnit_dir)
 end
 
 end # module XfaContextPythonCallExt

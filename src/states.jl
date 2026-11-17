@@ -659,6 +659,13 @@ end
     # Latest smoothed Hz at which each input is pushing data, keyed by input
     # name. Updated roughly once per second alongside `channel_stats`.
     input_rates::Dict{String, Float64} = Dict()
+    run_status::Maybe{RunStatus} = nothing
+
+    damnit_entries::Vector{DamnitEntry} = DamnitEntry[]
+    # Saved outputs and the DAMNIT_VARIABLES patterns that save them
+    saved_outputs::Dict{String, Vector{String}} = Dict()
+    # The variables and subvariables, which are the outputs that can be saved
+    saveable_outputs::Set{String} = Set{String}()
 
     lock::ReentrantLock = ReentrantLock()
 end
@@ -750,6 +757,10 @@ end
 
     debug_mode::Ref{Bool} = Ref(false)
     debug_mode_request::Maybe{Int} = nothing
+    # Whether the engine saves finished runs to DAMNIT
+    damnit_enabled::Ref{Bool} = Ref(false)
+    damnit_enabled_request::Maybe{Int} = nothing
+    damnit_variables_request::Maybe{Int} = nothing
     syncing::Bool = false
     status::RemoteStatus = RemoteStatus_Unconnected
     websocket::Maybe{WebSockets.WebSocket} = nothing

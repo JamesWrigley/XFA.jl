@@ -4,6 +4,12 @@
 # depends on the engine's webproxy/device discovery and the ZMQ KaraboBridge
 # transport. Context files name it via the prelude registered in XfaEngine.jl.
 
+# A run of the tracked DAQ being recorded
+struct DaqRun
+    proposal::Int
+    run::Int
+end
+
 @Group mutable struct KaraboInput
     manual_configuration::Parameter{Bool} = Parameter(false)
     trainmatcher::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true, filter_topics=false,
@@ -15,8 +21,13 @@
     run::Parameter{Int} = Parameter{Int}(; value=0, update_handler=run_changed)
     run_directory::Parameter{String} = Parameter{String}(; value="", update_handler=run_changed)
     rate::Parameter{Float64} = Parameter(10.0)
+    track_daq::Parameter{KaraboDevice} = Parameter{KaraboDevice}(; optional=true, filter_topics=false,
+                                                                 filter_device_classes=["RunManager"],
+                                                                 update_handler=daq_changed)
 
     progress::Displayable{Tuple{Int, Int}} = Displayable((0, 0))
+    # The tracked DAQ's proposal, run number and state
+    daq_status::Displayable{Tuple{Int, Int, String}} = Displayable((0, 0, ""))
     processed::Int = 0
     progress_sent::Float64 = 0.0
 
@@ -26,6 +37,9 @@
     dc::Any = nothing
     dc_key::Tuple{Int, Int, String} = (0, 0, "")
     stream::Any = nothing
+
+    daq_properties::Dict{String, Any} = Dict{String, Any}()
+    daq_run::Maybe{DaqRun} = nothing
 
     # Lease TTL (in seconds) reported by the trainmatchers subscribeSources
     # slot. Leases are renewed at half this interval while streaming.
@@ -51,8 +65,72 @@ function run_changed(bridge::KaraboInput, _)
     end
 end
 
+# The new DAQ's properties are only subscribed to after a rewire
+function daq_changed(bridge::KaraboInput, _)
+    empty!(bridge.daq_properties)
+    bridge.daq_status[] = (0, 0, "")
+    if Context.current_ctx.is_running[]
+        Context.request_rewire(Context.current_ctx)
+    end
+end
+
+# Online the first RunManager is tracked unless one is set
+function Context.device_classes(bridge::KaraboInput)
+    if bridge.offline[]
+        Dict{Symbol, Any}()
+    else
+        Dict{Symbol, Any}(:track_daq => Context.FirstDevice("RunManager"))
+    end
+end
+
+function Context.monitored_properties(bridge::KaraboInput)
+    if bridge.offline[] || !isassigned(bridge.track_daq)
+        Context.Dependency[]
+    else
+        dev = bridge.track_daq[]
+        topic = isempty(dev.topic) ? nothing : dev.topic
+        [Context.karabo_dependency(topic, dev.name, property) for property in ("state", "proposalNumber", "runNumber")]
+    end
+end
+
+# Report the tracked DAQ's runs to the core, bounded by the trains its state
+# changed in. The RunManager passes through CHANGING when starting, stopping and
+# pausing, which is ignored, so a pause keeps the run. The properties are sent
+# again after a restart, which mustn't start the run over.
+function Context.on_properties_changed(bridge::KaraboInput, changed)
+    props = bridge.daq_properties
+    for (property, (; value)) in changed
+        props[property] = value
+    end
+    bridge.daq_status[] = (Int(get(props, "proposalNumber", 0)), Int(get(props, "runNumber", 0)),
+                           string(get(props, "state", "")))
+
+    if haskey(changed, "state")
+        ctx = Context.current_ctx
+        (; value, tid) = changed["state"]
+        if value in ("ACQUIRING", "PAUSED")
+            if !haskey(props, "proposalNumber") || !haskey(props, "runNumber")
+                @warn "The DAQ is acquiring but its proposal or run number is unknown, not recording the run"
+            else
+                proposal = Int(props["proposalNumber"])
+                run = Int(props["runNumber"])
+                daq_run = bridge.daq_run
+                if isnothing(daq_run) || (daq_run.proposal, daq_run.run) != (proposal, run)
+                    Context.begin_run(ctx, proposal, run, tid)
+                    bridge.daq_run = DaqRun(proposal, run)
+                end
+            end
+        elseif value != "CHANGING" && !isnothing(bridge.daq_run)
+            Context.end_run(ctx, bridge.daq_run.proposal, bridge.daq_run.run, tid - 1)
+            bridge.daq_run = nothing
+        end
+    end
+
+    return false
+end
+
 function data_collection(bridge::KaraboInput)
-    key = (bridge.proposal[], bridge.run[], bridge.run_directory[])
+    key = (bridge.proposal[], bridge.run[], expanduser(bridge.run_directory[]))
     if key == (0, 0, "")
         return nothing
     elseif isnothing(bridge.dc) || bridge.dc_key != key
@@ -137,7 +215,7 @@ function Context.update_sources(bridge::KaraboInput, deps)
     end
 end
 
-function release_train(bridge::KaraboInput, tid)
+function Context.release!(bridge::KaraboInput, tid)
     stream = bridge.stream
     if !isnothing(stream)
         @invokelatest Context.release!(stream, tid)
@@ -165,8 +243,24 @@ function stream_run(bridge::KaraboInput, output)
     bridge.processed = 0
     bridge.progress_sent = 0.0
     bridge.progress[] = (0, length(bridge.stream.train_ids))
+
+    ctx = Context.current_ctx
+    train_ids = bridge.stream.train_ids
+    run_id = @invokelatest Context.data_collection_run(dc)
+    if isnothing(run_id)
+        @warn "The run doesn't record its proposal and run number, so it can't be saved to DAMNIT"
+    end
+    recording = !isnothing(run_id) && !isempty(train_ids)
+    if recording
+        Context.begin_run(ctx, run_id[1], run_id[2], first(train_ids))
+    end
+
     try
         @invokelatest Context.feed!(bridge.stream, output, bridge.rate)
+        # Stopping the pipeline closes `output`, so a partial replay isn't saved
+        if recording && isopen(output)
+            Context.end_run(ctx, run_id[1], run_id[2], last(train_ids))
+        end
     finally
         stream = bridge.stream
         bridge.stream = nothing

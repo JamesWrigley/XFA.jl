@@ -388,7 +388,7 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
             continue
         end
 
-        broadcast_message(state, Protocol.PipelineStats(stats, copy(ctx.input_rates)), Debug)
+        broadcast_message(state, Protocol.PipelineStats(stats, copy(ctx.input_rates), Context.run_status(ctx)), Debug)
     end
 end
 
@@ -462,7 +462,7 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
 
     elseif msg isa SetRoutingRules
         state.routing_rules = msg.rules
-        write_routing_rules(msg.rules)
+        write_settings(; routing_rules=msg.rules)
         @info "Updated routing rules" n=length(msg.rules) path=engine_settings_path()
         Protocol.server_send(ws, Ack(); reply_to)
 
@@ -554,12 +554,12 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
                 throw(Context.XfaContextException("A context cannot mix online and offline KaraboInputs"))
             end
 
-            ctx.on_train_processed = tid -> foreach(group -> release_train(group, tid), karabo_inputs)
             ctx.on_parameter_changed = function (name, value)
                 broadcast_parameter_changed(state, name, value)
                 save_parameter(ctx, name, value)
             end
             ctx.on_displayable_changed = d -> broadcast_displayable_changed(state, d)
+            ctx.damnit_enabled[] = state.ctx.damnit_enabled[]
             ctx
         catch ex
             @error "Loading context file at $(path) failed" exception=(ex, catch_backtrace())
@@ -646,6 +646,24 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
     elseif msg isa SetVariableSubscriptions
         client_state.subscriptions = msg.variables
         Protocol.server_send(ws, Ack(); reply_to)
+    elseif msg isa GetDamnitEnabled
+        Protocol.server_send(ws, DamnitEnabled(state.ctx.damnit_enabled[]); reply_to)
+    elseif msg isa SetDamnitEnabled
+        state.ctx.damnit_enabled[] = msg.enabled
+        write_settings(; damnit_enabled=msg.enabled)
+        @info "$(msg.enabled ? "Enabled" : "Disabled") saving runs to DAMNIT"
+        Protocol.server_send(ws, Ack(); reply_to)
+        broadcast_message(state, DamnitEnabled(msg.enabled))
+    elseif msg isa SetDamnitVariables
+        try
+            Context.set_damnit_entries!(state.ctx, msg.entries)
+            @info "Updated DAMNIT_VARIABLES" n=length(msg.entries)
+            Protocol.server_send(ws, Ack(); reply_to)
+            broadcast_message(state, DamnitVariables(msg.entries, sort(keys(state.ctx.saved_outputs))))
+        catch ex
+            @error "Failed to update DAMNIT_VARIABLES" exception=(ex, catch_backtrace())
+            Protocol.server_send(ws, Ack(Protocol.ExceptionMessage(ex, catch_backtrace())); reply_to)
+        end
     elseif msg isa SetDebugMode
         @info "Setting debug mode: $(msg.enable)"
         if msg.enable
@@ -721,7 +739,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
                 push!(rules, RoutingRule(topic, "*", first(names)))
             end
         end
-        write_routing_rules(rules)
+        write_settings(; routing_rules=rules)
         state.routing_rules = rules
         @info "Seeded routing rules" n=length(rules) path=engine_settings_path()
     else
@@ -731,6 +749,7 @@ function main(stop_event=Base.Event(); info_path=nothing, wait=true)
 
     state.remap_rules = load_remap_rules()
     @info "Loaded remap rules" n=length(state.remap_rules) path=engine_settings_path()
+    state.ctx.damnit_enabled[] = load_damnit_enabled()
 
     ws_server = WebSockets.listen!("0.0.0.0", state.websocket_port; maxframesize=Protocol.MAX_FRAME_SIZE) do ws
         id = create_id()
@@ -820,7 +839,7 @@ precompile(Context.get_sources, (KaraboInput,))
 @compile_workload begin
     mktempdir() do dir
         cd(dir) do
-            write_routing_rules(RoutingRule[])
+            write_settings(; routing_rules=RoutingRule[])
             with_logger(NullLogger()) do
                 state = withenv("SASE" => nothing) do
                     main(Base.Event(); info_path=joinpath(dir, "worker-info.toml"), wait=false)
@@ -832,7 +851,7 @@ precompile(Context.get_sources, (KaraboInput,))
                                 maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                     WebSockets.receive(ws)
                     for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetDevices(),
-                                GetRoutingRules(), GetRemapRules())
+                                GetRoutingRules(), GetRemapRules(), GetDamnitEnabled())
                         Protocol.client_send(ws, msg)
                         Protocol.receive(ws)
                     end

@@ -38,7 +38,7 @@ function draw_variable_content(::Val{Symbol("XfaEngine.KaraboInput")}, name, var
     if offline.value
         draw_offline_run(name, var_data, gui_state)
     else
-        draw_online_bridge(name, params, gui_state)
+        draw_online_bridge(name, var_data, gui_state)
     end
 
     return gui_state
@@ -104,8 +104,9 @@ function draw_offline_run(name, var_data, gui_state)
     end
 end
 
-function draw_online_bridge(name, params, gui_state)
+function draw_online_bridge(name, var_data, gui_state)
     client = state[].client
+    params = var_data["parameters"]
 
     tm_param = params["trainmatcher"]
     tm_modified, new_tm = draw_parameter("trainmatcher", tm_param)
@@ -120,6 +121,11 @@ function draw_online_bridge(name, params, gui_state)
     end
 
     draw_parameter("manual_configuration", params["manual_configuration"])
+    draw_parameter("track_daq", params["track_daq"])
+    proposal, run, daq_state = var_data["displayables"]["daq_status"].value
+    if isassigned(params["track_daq"]) && proposal > 0
+        ig.TextDisabled("p$(proposal), r$(run) ($(lowercase(daq_state)))")
+    end
 
     if params["manual_configuration"].value
         draw_parameter("address", params["address"])

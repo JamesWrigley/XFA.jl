@@ -599,6 +599,43 @@ function add_variable_source(source::String, spec::ctx.VariableSpec, name::Strin
     return rstrip(ensure_import(source, spec.origin)) * "\n\n" * decl * "\n"
 end
 
+# Replace the value of DAMNIT_VARIABLES with `entries` sorted by pattern, or
+# define it at the end of the source if it isn't already. The list is written
+# one entry per line if it doesn't fit on one.
+function set_damnit_entries(source::String, entries::Vector{ctx.DamnitEntry})
+    items = map(sort(entries; by=entry -> entry.pattern)) do entry
+        if isnothing(entry.override)
+            repr(entry.pattern)
+        else
+            mode = entry.override == ctx.SaveMode_PerTrain ? "per_train" : "last"
+            "$(repr(entry.pattern)) => :$(mode)"
+        end
+    end
+    single_line = "[" * join(items, ", ") * "]"
+    value = if length("const DAMNIT_VARIABLES = $(single_line)") <= 92
+        single_line
+    else
+        "[\n" * join("    $(item),\n" for item in items) * "]"
+    end
+
+    tree = parseall(SyntaxNode, source; ignore_errors=true)
+    assignments = find_nodes(tree) do node
+        if kind(node) == K"="
+            lhs = children(node)[1]
+            is_leaf(lhs) && lhs.val == :DAMNIT_VARIABLES
+        else
+            false
+        end
+    end
+
+    if isempty(assignments)
+        return rstrip(source) * "\n\nconst DAMNIT_VARIABLES = $(value)\n"
+    else
+        br = byte_range(children(first(assignments))[2])
+        return source[1:first(br)-1] * value * source[last(br)+1:end]
+    end
+end
+
 # Delete a variable's definition from the context source: the @Variable
 # macrocall, or the `name = Constructor(...)` assignment of a group/input. The
 # whole line(s) go, leaving the neighbouring declarations separated by a blank
