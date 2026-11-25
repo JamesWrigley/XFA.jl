@@ -2488,6 +2488,23 @@ function log_memory_stats(client, trim::Bool)
 end
 
 """Start the XFA GUI."""
+# GLFW clips each monitor's work area to the WM's single _NET_WORKAREA rect,
+# which mutter computes wrongly for non-rectangular multi-monitor layouts, and
+# can leave a monitor with a thin strip. ImGui caps popups to the work area, so
+# they become invisible. So in this case we fall back to the whole monitor.
+function fix_monitor_work_areas()
+    monitors = unsafe_load(ig.GetPlatformIO().Monitors)
+    for i in 0:monitors.Size - 1
+        monitor = monitors.Data + i * sizeof(ig.ImGuiPlatformMonitor)
+        main_size = unsafe_load(monitor.MainSize)
+        work_size = unsafe_load(monitor.WorkSize)
+        if work_size.x < main_size.x / 2 || work_size.y < main_size.y / 2
+            unsafe_store!(monitor.WorkPos, unsafe_load(monitor.MainPos))
+            unsafe_store!(monitor.WorkSize, main_size)
+        end
+    end
+end
+
 # Reports exceptions to Sentry when a DSN is configured
 function setup_sentry(settings)
     sentry_settings = get(settings, "Sentry", Dict{String, Any}())
@@ -2614,6 +2631,10 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
         if isnothing(gui_state.window_shadow)
             gui_state.window_shadow = build_window_shadow()
         end
+
+        # The GLFW backend rebuilds the monitor list when monitors change, so
+        # this has to be reapplied every frame.
+        fix_monitor_work_areas()
 
         if !isnothing(gui_state.render_error)
             # Occasionally an exception will occur in the middle of a disabled
