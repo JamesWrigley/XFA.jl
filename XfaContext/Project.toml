@@ -23,6 +23,9 @@ PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 [extensions]
 XfaContextPythonCallExt = "PythonCall"
 
+[sources]
+DimensionalData = {rev = "extra-lookups", url = "https://github.com/JamesWrigley/DimensionalData.jl.git"}
+
 [compat]
 Accessors = "0.1.44"
 CurveFit = "1.9.1"

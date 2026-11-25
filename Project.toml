@@ -37,6 +37,7 @@ XfaEngine = "df4d7780-7f2f-4694-8ef1-2cbac230b49a"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
+DimensionalData = {rev = "extra-lookups", url = "https://github.com/JamesWrigley/DimensionalData.jl.git"}
 ImGuiColorTextEdit = {rev = "master", url = "https://github.com/JuliaImGui/ImGuiColorTextEdit.jl.git"}
 XfaContext = {path = "XfaContext"}
 XfaEngine = {path = "XfaEngine"}

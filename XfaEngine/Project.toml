@@ -30,7 +30,9 @@ ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 ZfpCompression = "43441a71-1662-41c6-b8ea-40ed1525242b"
 
 [sources]
+DimensionalData = {rev = "extra-lookups", url = "https://github.com/JamesWrigley/DimensionalData.jl.git"}
 XfaContext = {path = "../XfaContext"}
+PythonCall = {rev = "v1-env", url = "https://github.com/JamesWrigley/PythonCall.jl.git"}
 
 [compat]
 Accessors = "0.1.44"
