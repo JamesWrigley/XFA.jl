@@ -1494,21 +1494,21 @@ end
 apply_remap_rule(::Val{RemapKind_Simple}, client, rule, source, topic, device, pattern, property_ref) =
     replace(source, pattern => SubstitutionString(rule.replacement)), nothing
 
-# Rewrite `dev:output[prop]` to `<fast>[prop]@dev:output`, where `<fast>` is
-# the sole entry of the device's `fastSources` property. Returns a pending
-# request ID instead of a rewrite while the lookup is in flight; the response
-# callback writes the value into `property_ref`.
+# Rewrite `dev:output[prop]` to `<output>[prop]@dev:output`, where `<output>`
+# is the device's `outputSource` property. Returns a pending request ID instead
+# of a rewrite while the lookup is in flight; the response callback writes the
+# value into `property_ref`.
 function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, source,
                           topic, device, pattern, property_ref::Ref{Any})
     if isnothing(property_ref[])
         id = send_with_callback(
-            client, GetDeviceProperty(topic, device, "fastSources"),
+            client, GetDeviceProperty(topic, device, "outputSource"),
             msg -> property_ref[] = msg.value)
         return nothing, id
     end
 
     value = property_ref[]
-    if !(value isa AbstractVector) || isempty(value)
+    if !(value isa AbstractString) || isempty(value)
         return nothing, nothing
     end
 
@@ -1517,7 +1517,7 @@ function apply_remap_rule(::Val{RemapKind_Proxy}, client::ClientState, rule, sou
         return nothing, nothing
     end
 
-    proxied_source = string(value[1], source[bracket:end], "@", source[1:bracket-1])
+    proxied_source = string(value, source[bracket:end], "@", source[1:bracket-1])
 
     return proxied_source, nothing
 end
