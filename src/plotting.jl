@@ -713,7 +713,7 @@ function update_fit_curve!(fit::FitSettings, ydata::AbstractVector,
     elseif name == "sin"
         x -> sinusoid(x, p[1], p[2], p[3], p[4])
     end
-    sample_model!(fit.model_x, fit.model_y, model, xmin, xmax, 200)
+    sample_model!(fit.model_x, fit.model_y, model, xmin, xmax, 500)
 end
 
 # Overlay the fitted model curve on the current ImPlot plot, if any, and the
@@ -1963,7 +1963,7 @@ function sample_curves!(view::SpecView, model::ViewModel, updated_variables)
                         end
                         xs = Float64[]
                         ys = Float64[]
-                        sample_model!(xs, ys, model_function(overlay.func, overlay.params, p), lo, hi, 200)
+                        sample_model!(xs, ys, model_function(overlay.func, overlay.params, p), lo, hi, 500)
                         label = size(values, 2) == 1 ? title : "$(title) $(k)"
                         # The fitted values go in the legend, after ### so the item ID stays stable
                         if overlay.func == ModelFunction_Linear
