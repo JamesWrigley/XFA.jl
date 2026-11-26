@@ -235,6 +235,16 @@ end
     # A named x leaves the color to the client, a positional one names the other dim
     @test only(ImageAsLines("lines"; x=:X).layers).color.field == ""
     @test only(ImageAsLines("lines"; x=2).layers).color.field == "row"
+    # A rule only has the channel its values sit on
+    vrule = Context.VRule(; subvariable="peak")
+    @test vrule.mark == Context.Mark_Rule
+    @test vrule.data == ".peak"
+    @test vrule.x.field == "value"
+    @test isnothing(vrule.y)
+    @test isnothing(Context.HRule().x)
+    # Names and layers can be mixed
+    @test PlotSpec("mixed", [".avg", vrule]).layers == [LayerSpec(; data=".avg"), vrule]
+
     @test PlotSpec("own"; ylabel="counts") == PlotSpec("own", [LayerSpec()]; ylabel="counts")
     @test VariableData(1; plot_specs=own) == VariableData(; data=1, plot_specs=[own])
 

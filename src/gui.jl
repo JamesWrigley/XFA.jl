@@ -23,7 +23,7 @@ using XfaContext: Parameter, OptionalDims, KaraboDevice, SourceInfo, Dependency,
     ArrayMetadata, VariableData, AbstractROI, RectROI, LinearROI, IndexSelection, VariableSpec, VariableKind_Variable, VariableKind_Input,
     BinnedSequence, Scalar1dScan, Scalar2dScan, positions, upstream_closure,
     PlotSpec, LayerSpec, ChannelDef, LookupTransform, RoiParam, ModelOverlay,
-    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect,
+    Mark_Line, Mark_Point, Mark_Bar, Mark_Rect, Mark_Rule,
     FieldType_Quantitative, FieldType_Nominal, FieldType_Ordinal,
     LookupKey_TrainId, LookupKey_Index, ModelFunction_Gaussian, ModelFunction_Linear,
     DamnitEntry, RunStatus

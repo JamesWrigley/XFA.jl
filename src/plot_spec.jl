@@ -132,7 +132,8 @@ function compile_mark(unit, path)
         opacity = Float64(property(mark, "opacity", Real, "$(path).mark", 1.0))
         mark = property(mark, "type", AbstractString, "$(path).mark")
     end
-    choice(("line" => Mark_Line, "point" => Mark_Point, "bar" => Mark_Bar, "rect" => Mark_Rect),
+    choice(("line" => Mark_Line, "point" => Mark_Point, "bar" => Mark_Bar, "rect" => Mark_Rect,
+            "rule" => Mark_Rule),
            mark, "$(path).mark"), opacity
 end
 
@@ -180,7 +181,8 @@ function compile_lookup(tpath, transform)
 end
 
 # Validates the channels against what each mark can draw: images are a rect
-# with colour on `value`, everything else needs quantitative axes.
+# with colour on `value`, a rule has a single quantitative x or y, and
+# everything else needs quantitative axes.
 function compile_layer(unit, path)
     data = property(unit, "data", AbstractDict, path)
     check_keys(data, ("name",), "$(path).data")
@@ -191,12 +193,28 @@ function compile_layer(unit, path)
     epath = "$(path).encoding"
     encoding = property(unit, "encoding", AbstractDict, path)
     check_keys(encoding, ("x", "y", "color"), epath)
-    x = compile_channel(property(encoding, "x", AbstractDict, epath), "$(epath).x", true)
-    y = compile_channel(property(encoding, "y", AbstractDict, epath), "$(epath).y", true)
-    color = if haskey(encoding, "color")
-        compile_channel(property(encoding, "color", AbstractDict, epath), "$(epath).color", false)
-    else
-        nothing
+    x, y, color = map(("x", "y", "color")) do key
+        if haskey(encoding, key)
+            compile_channel(property(encoding, key, AbstractDict, epath), "$(epath).$(key)", key != "color")
+        else
+            nothing
+        end
+    end
+
+    if mark == Mark_Rule
+        # With both, Vega-Lite draws a segment, which needs x2/y2
+        if isnothing(x) == isnothing(y) || !isnothing(color) || !isempty(lookups)
+            throw(SpecError("$(path): a rule takes exactly one of x or y, and no color or lookups"))
+        elseif something(x, y).type != FieldType_Quantitative
+            throw(SpecError("$(epath).$(isnothing(x) ? "y" : "x"): only quantitative axes are supported, " *
+                            "add \"type\": \"quantitative\""))
+        end
+        return LayerSpec(String(name), mark, opacity, x, y, color, lookups)
+    end
+    for (channel, axis) in ((x, "x"), (y, "y"))
+        if isnothing(channel)
+            throw(SpecError("$(epath): missing \"$(axis)\""))
+        end
     end
 
     # One lookup pairs the other variable's values with the layer's own, two

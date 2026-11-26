@@ -164,6 +164,13 @@ struct ColoredPoints <: PlotType
     label::String
 end
 
+# Lines spanning the plot at each of `values`, vertical unless `horizontal`.
+struct Rules <: PlotType
+    values
+    label::String
+    horizontal::Bool
+end
+
 # Colormapped 2D data, already rendered into `gpu`'s texture. `x_axis`/`y_axis`
 # may be nothing (defaults to pixel coords).
 struct Image <: PlotType

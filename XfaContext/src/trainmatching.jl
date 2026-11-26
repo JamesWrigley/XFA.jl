@@ -33,7 +33,7 @@ end
 # specs, with the same vocabulary (mark, encoding channels, lookup transform,
 # params).
 
-@enum Mark Mark_Line Mark_Point Mark_Bar Mark_Rect
+@enum Mark Mark_Line Mark_Point Mark_Bar Mark_Rect Mark_Rule
 @enum FieldType FieldType_Quantitative FieldType_Nominal FieldType_Ordinal
 @enum LookupKey LookupKey_TrainId LookupKey_Index
 @enum ModelFunction ModelFunction_Gaussian ModelFunction_Linear
@@ -60,12 +60,14 @@ struct LookupTransform
     as::String
 end
 
+# A rule only has the channel of the axis its values are on (`x` for a vertical
+# line, `y` for a horizontal one). Every other mark has both.
 struct LayerSpec
     data::String
     mark::Mark
     opacity::Float64
-    x::ChannelDef
-    y::ChannelDef
+    x::Union{ChannelDef, Nothing}
+    y::Union{ChannelDef, Nothing}
     color::Union{ChannelDef, Nothing}
     lookups::Tuple{Vararg{LookupTransform}}
 end
@@ -139,10 +141,10 @@ function PlotSpec(name::AbstractString, layers::AbstractVector{LayerSpec}=[Layer
                   fixed_aspect::Bool=true)
     x_title = y_title = ""
     for layer in layers
-        if x_title == ""
+        if x_title == "" && !isnothing(layer.x)
             x_title = layer.x.title
         end
-        if y_title == ""
+        if y_title == "" && !isnothing(layer.y)
             y_title = layer.y.title
         end
     end
@@ -165,9 +167,9 @@ end
 # Lets `VariableData(; plot_specs = spec)` take a lone spec.
 Base.convert(::Type{Vector{PlotSpec}}, spec::PlotSpec) = [spec]
 
-# Sugar: a vector of variable names becomes one default line layer per name.
-PlotSpec(name::AbstractString, vars::AbstractVector{<:AbstractString}; kwargs...) =
-    PlotSpec(name, [LayerSpec(; data=v) for v in vars]; kwargs...)
+# Sugar: a variable name among the layers becomes a default line layer of it.
+PlotSpec(name::AbstractString, layers::AbstractVector; kwargs...) =
+    PlotSpec(name, LayerSpec[layer isa AbstractString ? LayerSpec(; data=layer) : layer for layer in layers]; kwargs...)
 
 # Sugar for a layer drawing variable `data` (by default the one advertising the
 # spec, see bind_variable) with `mark` (:line, :scatter, :bars or :image). `x`
@@ -253,6 +255,46 @@ function ImageAsLines(name::AbstractString; x::Union{Symbol, Integer}, gradient:
     data = isnothing(subvariable) ? variable : "$(variable).$(subvariable)"
     PlotSpec(name, [LayerSpec(; data, x, color, gradient)]; kwargs...)
 end
+
+# A rule layer on `axis`. Its title is hidden so the axis label comes from the other layers.
+function rule_layer(axis, variable, subvariable)
+    data = isnothing(subvariable) ? variable : "$(variable).$(subvariable)"
+    channel = ChannelDef("value", FieldType_Quantitative, "", false, nothing, false)
+    LayerSpec(String(data), Mark_Rule, 1.0, axis == :x ? channel : nothing, axis == :y ? channel : nothing,
+              nothing, ())
+end
+
+"""
+    VRule(; variable="", subvariable=nothing)
+
+A [`LayerSpec`](@ref) that draws a vertical (`VRule`) or horizontal (`HRule`)
+line at each value of a variable, such as a peak position or a threshold. A
+scalar variable gives one line at its latest value, and a vector gives one line
+per element.
+
+The values are those of the variable advertising the spec, or of the variable
+named by `variable`. `subvariable` picks one of that variable's subvariables
+instead.
+
+# Examples
+```julia
+@Variable function spectrum(...)
+    @add_subvariable "peak_position" mu
+    VariableData(; data, plot_specs=PlotSpec("Peak", [LayerSpec(), VRule(; subvariable="peak_position"),
+                                                      HRule(; variable="threshold")]))
+end
+```
+"""
+VRule(; variable::AbstractString="", subvariable::Union{AbstractString, Nothing}=nothing) =
+    rule_layer(:x, variable, subvariable)
+
+"""
+    HRule(; variable="", subvariable=nothing)
+
+See [`VRule`](@ref).
+"""
+HRule(; variable::AbstractString="", subvariable::Union{AbstractString, Nothing}=nothing) =
+    rule_layer(:y, variable, subvariable)
 
 # How an output is saved over a run: every train, or only the last one for
 # outputs that already accumulate (e.g. a moving average or histogram).

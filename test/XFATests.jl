@@ -480,6 +480,13 @@ end
     @test XFA.lookup_names(layer) == ["m1", "m2", "a"]
     @test XFA.datasets(XFA.compile_spec("a", mesh())) == Set(["a", "m1", "m2"])
 
+    # A rule takes one of x or y
+    rule(encoding) = base("mark" => "rule", "encoding" => encoding)
+    layer = only(XFA.compile_spec("a", rule(Dict("y" => quantitative("value")))).layers)
+    @test layer.mark == XFA.Mark_Rule
+    @test isnothing(layer.x)
+    @test layer.y.field == "value"
+
     # Anything outside the subset is rejected with a message
     rejected = [
         base("width" => 300) => "spec: unsupported property",
@@ -498,6 +505,8 @@ end
         mesh("transform" => [pull("m1", "x"), pull("m2", "y", "index")]) => "must share a key",
         mesh("transform" => [pull("m1", "x"), pull("m2", "y"), pull("m3", "z")]) => "at most two lookup transforms",
         base("params" => [Dict("name" => "p", "select" => "point")]) => "only interval selections",
+        rule(Dict("x" => quantitative("value"), "y" => quantitative("value"))) => "a rule takes exactly one",
+        base("encoding" => Dict("x" => quantitative("index"))) => "encoding: missing",
     ]
     for (bad, message) in rejected
         @test_throws message XFA.compile_spec("bad", bad)

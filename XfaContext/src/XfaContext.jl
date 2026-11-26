@@ -1735,7 +1735,7 @@ function eval_context(ctx_module::Module, ctx_str::AbstractString, prelude::Vect
         using XfaContext.DimensionalData
 
         using XfaContext
-        using XfaContext: VariableData, PlotSpec, LayerSpec, ModelOverlay, Parameter, Meta
+        using XfaContext: VariableData, PlotSpec, LayerSpec, VRule, HRule, ModelOverlay, Parameter, Meta
     end
     @eval ctx_module $init_expr
 

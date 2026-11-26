@@ -1854,6 +1854,13 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
         push!(frames, Empty("$(name): unsupported array type $(typeof(store.data))"))
     elseif isempty(store.data)
         push!(frames, Empty("$(name): array has length 0, nothing to plot"))
+    elseif spec.mark == Mark_Rule
+        values = field_values(name, store, something(spec.x, spec.y).field)
+        # A scalar history is drawn at its latest value
+        if store.data isa CircularBuffer
+            values = last(values, 1)
+        end
+        push!(frames, Rules(values, store.title, isnothing(spec.x)))
     elseif spec.mark == Mark_Rect
         data = store.data
         # Rows run along Y and columns along X
@@ -1918,7 +1925,8 @@ function layers_extent(view::SpecView, tid)
     for layer in view.layers
         name = layer.spec.data
         store = view_store(view, name)
-        if isnothing(store) || store.data isa ArrayMetadata || store.trainId != tid
+        # Rules span the whole plot, so they don't widen the extent
+        if layer.spec.mark == Mark_Rule || isnothing(store) || store.data isa ArrayMetadata || store.trainId != tid
             continue
         end
         lo, hi = extrema(field_values(name, store, layer.spec.x.field))
@@ -2054,8 +2062,8 @@ function set_spec!(view::SpecView, plot::Plot, spec::PlotSpec)
 
     # The spec's scales only seed the log toggles
     if isnothing(view.spec)
-        plot.log_x[] = any(layer -> layer.x.log, spec.layers)
-        plot.log_y[] = any(layer -> layer.y.log, spec.layers)
+        plot.log_x[] = any(layer -> !isnothing(layer.x) && layer.x.log, spec.layers)
+        plot.log_y[] = any(layer -> !isnothing(layer.y) && layer.y.log, spec.layers)
     end
     view.spec = spec
 end
@@ -2087,8 +2095,11 @@ end
 function axis_label(view::SpecView, label, axis::Symbol)
     spec = view.spec
     if isnothing(label)
-        i = findfirst(layer -> isnothing(getfield(layer, axis).title), spec.layers)
-        isnothing(i) ? "" : data_label(view, spec.layers[i], getfield(spec.layers[i], axis))
+        i = findfirst(spec.layers) do layer
+            channel = getproperty(layer, axis)
+            !isnothing(channel) && isnothing(channel.title)
+        end
+        isnothing(i) ? "" : data_label(view, spec.layers[i], getproperty(spec.layers[i], axis))
     else
         label
     end
@@ -2298,6 +2309,11 @@ function plot_frame!(frame::ColoredPoints)
         spec = ImPlot.ImPlotSpec(; MarkerFillColors = colors, MarkerLineColors = colors)
         ImPlot.PlotScatter(frame.label, frame.xs, frame.ys; spec)
     end
+end
+
+function plot_frame!(frame::Rules)
+    flags = frame.horizontal ? ImPlot.ImPlotInfLinesFlags_Horizontal : ImPlot.ImPlotInfLinesFlags_None
+    ImPlot.PlotInfLines(frame.label, frame.values; spec=ImPlot.ImPlotSpec(; Flags=Cint(flags)))
 end
 
 function plot_frame!(frame::Bars)
