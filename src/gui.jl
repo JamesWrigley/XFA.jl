@@ -2487,13 +2487,14 @@ function log_memory_stats(client, trim::Bool)
     end
 end
 
-"""Start the XFA GUI."""
 # GLFW clips each monitor's work area to the WM's single _NET_WORKAREA rect,
 # which mutter computes wrongly for non-rectangular multi-monitor layouts, and
 # can leave a monitor with a thin strip. ImGui caps popups to the work area, so
 # they become invisible. So in this case we fall back to the whole monitor.
 function fix_monitor_work_areas()
     monitors = unsafe_load(ig.GetPlatformIO().Monitors)
+    fixed = false
+    min_x, min_y, max_x, max_y = Inf32, Inf32, -Inf32, -Inf32
     for i in 0:monitors.Size - 1
         monitor = monitors.Data + i * sizeof(ig.ImGuiPlatformMonitor)
         main_size = unsafe_load(monitor.MainSize)
@@ -2501,7 +2502,23 @@ function fix_monitor_work_areas()
         if work_size.x < main_size.x / 2 || work_size.y < main_size.y / 2
             unsafe_store!(monitor.WorkPos, unsafe_load(monitor.MainPos))
             unsafe_store!(monitor.WorkSize, main_size)
+            fixed = true
         end
+
+        work_pos = unsafe_load(monitor.WorkPos)
+        work_size = unsafe_load(monitor.WorkSize)
+        min_x = min(min_x, work_pos.x)
+        min_y = min(min_y, work_pos.y)
+        max_x = max(max_x, work_pos.x + work_size.x)
+        max_y = max(max_y, work_pos.y + work_size.y)
+    end
+
+    # ImGui::NewFrame() already computed the bounds of all work areas from the
+    # unfixed ones, and windows being dragged are clamped to it. Otherwise they
+    # can't be moved into the affected monitors.
+    if fixed
+        full_rect = ig.ImRect(ig.ImVec2(min_x, min_y), ig.ImVec2(max_x, max_y))
+        unsafe_store!(ig.GetCurrentContext().PlatformMonitorsFullWorkRect, full_rect)
     end
 end
 
@@ -2520,6 +2537,7 @@ end
 # lazily so ImGui keeps this pointer.
 const ICON_EXCLUDE_RANGES = ig.ImWchar[0x1, 0xdfff, 0xf900, 0x10ffff, 0]
 
+"""Start the XFA GUI."""
 function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
     # The libXcursor JLL has a build-sandbox icon path baked in, so we need to
     # point it at the system.
@@ -2632,7 +2650,7 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
             gui_state.window_shadow = build_window_shadow()
         end
 
-        # The GLFW backend rebuilds the monitor list when monitors change, so
+        # The GLFW backend rebuilds the monitor list in every NewFrame(), so
         # this has to be reapplied every frame.
         fix_monitor_work_areas()
 
