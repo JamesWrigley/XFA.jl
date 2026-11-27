@@ -109,15 +109,20 @@ struct RunStatus
     run::Int
     ntrains::Int
     nbytes::Int
+    saving::Bool
 end
 
-# Read from the context's atomics, so it doesn't take the session lock
+# Read from the context's atomics, so it doesn't take the session lock. A run
+# being saved is shown over one being recorded.
 function run_status(ctx)
+    saving = ctx.saving_run[]
     bounds = ctx.run_bounds[]
-    if isnothing(bounds)
+    if !isnothing(saving)
+        saving
+    elseif isnothing(bounds)
         nothing
     else
-        RunStatus(bounds.proposal, bounds.run, ctx.run_ntrains[], ctx.run_nbytes[])
+        RunStatus(bounds.proposal, bounds.run, ctx.run_ntrains[], ctx.run_nbytes[], false)
     end
 end
 
@@ -281,29 +286,34 @@ end
 # Write the session to DAMNIT if its run has ended. Called once the pipeline
 # has processed every train it will.
 function finish_run!(ctx)
-    session = @lock ctx.run_session begin
+    session, status = @lock ctx.run_session begin
         s = ctx.run_session[][]
         if !isnothing(s) && !isnothing(s.last_tid)
+            status = RunStatus(s.proposal, s.run, ctx.run_ntrains[], ctx.run_nbytes[], true)
             ctx.run_session[][] = nothing
             Threads.atomic_xchg!(ctx.run_bounds, nothing)
-            s
+            s, status
+        else
+            nothing, nothing
         end
     end
 
     # Saving may have been turned off during the run
     if !isnothing(session) && ctx.damnit_enabled[] && !isempty(session.buffers)
         (; proposal, run) = session
-        saved = Dict{String, Any}(damnit_name(name) => saved_value(name, buffer) for (name, buffer) in session.buffers)
-        provenance = ctx.offline ? "xfa-offline" : "xfa-online"
+        Threads.atomic_xchg!(ctx.saving_run, status)
         # A failed submission (e.g. damnit not installed) mustn't take down the pipeline
         try
+            saved = Dict{String, Any}(damnit_name(name) => saved_value(name, buffer) for (name, buffer) in session.buffers)
+            provenance = ctx.offline ? "xfa-offline" : "xfa-online"
             load_pythoncall()
             @invokelatest submit_damnit(proposal, run, saved, Dict{String, Exception}();
                                         provenance, damnit_dir=ctx.damnit_dir)
-            nbytes = sum(buffer -> sizeof(buffer.data), values(session.buffers))
-            @info "Saved run $(run) of proposal $(proposal) to DAMNIT" n=length(saved) size=Base.format_bytes(nbytes; binary=false)
+            @info "Saved run $(run) of proposal $(proposal) to DAMNIT" n=length(saved) size=Base.format_bytes(status.nbytes; binary=false)
         catch ex
             @error "Saving run $(run) of proposal $(proposal) to DAMNIT failed" exception=(ex, catch_backtrace())
+        finally
+            Threads.atomic_xchg!(ctx.saving_run, nothing)
         end
     end
 end

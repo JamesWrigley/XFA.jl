@@ -757,7 +757,7 @@ end
         @test outputs == [(-1, -1), (1234, 5)]
 
         # The progress counts the run's trains and the size of what's recorded
-        @test Context.run_status(ctx) == Context.RunStatus(1234, 5, 1, sizeof((1234, 5)))
+        @test Context.run_status(ctx) == Context.RunStatus(1234, 5, 1, sizeof((1234, 5)), false)
     end
 
     @testset "Grace window" begin

@@ -1501,10 +1501,18 @@ function draw_dag()
     end
 
     run_status = context.run_status
-    if client.damnit_enabled[] && !isnothing(run_status)
+    # A save carries on even if saving was turned off meanwhile
+    if !isnothing(run_status) && (run_status.saving || client.damnit_enabled[])
         ig.SameLine()
         nbytes = Base.format_bytes(run_status.nbytes; binary=false)
-        ig.TextDisabled("Recording p$(run_status.proposal), r$(run_status.run): $(run_status.ntrains) trains, $(nbytes)")
+        (; proposal, run, ntrains) = run_status
+        if run_status.saving
+            ig.TextDisabled("Saving p$(proposal), r$(run) to DAMNIT: $(ntrains) trains, $(nbytes)")
+            ig.SameLine()
+            Spinner()
+        else
+            ig.TextDisabled("Recording p$(proposal), r$(run): $(ntrains) trains, $(nbytes)")
+        end
     end
 
     ig.SameLine()

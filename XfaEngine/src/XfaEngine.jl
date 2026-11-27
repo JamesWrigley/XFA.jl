@@ -355,7 +355,9 @@ function broadcast_channel_stats(state::EngineState; period=1.0)
         # ContextState, so capturing it outside the loop would leave us pinned
         # to the never-running default context.
         ctx = state.ctx
-        if !ctx.is_running[] || isempty(state.clients)
+        # An offline run is saved after the pipeline has stopped, so keep
+        # reporting while it is
+        if (!ctx.is_running[] && isnothing(ctx.saving_run[])) || isempty(state.clients)
             continue
         end
 

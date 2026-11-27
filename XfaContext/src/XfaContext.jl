@@ -260,6 +260,8 @@ end
     # The session's progress, readable without its lock
     run_ntrains::Threads.Atomic{Int} = Threads.Atomic{Int}(0)
     run_nbytes::Threads.Atomic{Int} = Threads.Atomic{Int}(0)
+    # The run being submitted to DAMNIT, if any
+    saving_run::Threads.Atomic{Maybe{RunStatus}} = Threads.Atomic{Maybe{RunStatus}}(nothing)
     # Trains past a run's end to wait for before finalising it, since slow
     # devices deliver late trains
     run_grace::Int = 20

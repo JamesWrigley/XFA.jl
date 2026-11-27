@@ -216,7 +216,7 @@ struct PipelineStats <: AbstractMessage
     channel_stats::Dict{Tuple{String, String}, XfaContext.ChannelStat}
     # The smoothed Hz at which each input is pushing data, keyed by input name
     input_rates::Dict{String, Float64}
-    # The run being recorded, if any
+    # The run being recorded or saved, if any
     run_status::Union{XfaContext.RunStatus, Nothing}
 end
 
