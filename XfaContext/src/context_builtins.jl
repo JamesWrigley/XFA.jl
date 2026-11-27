@@ -592,6 +592,9 @@ mutable struct Scan <: AbstractPostprocessor
     motor_alias::String
     # Label of the running scan, nothing between scans
     scan_label::Union{Nothing, String}
+    # The followed motor's start position, and whether the running scan reached it
+    start_position::Union{Nothing, Float64}
+    reached_start::Bool
     records::OrderedDict{String, VariableData}
 end
 
@@ -602,7 +605,7 @@ function Scan(; automatic=true, scantool=nothing, motor=nothing, resolution=1e-3
          Parameter{Dependency}(; value=motor, update_handler=scan_motor_changed, optional=true),
          Parameter{Float64}(; value=resolution, update_handler=scan_rebin),
          Parameter(n_scans), Parameter(history_budget), motor_priority,
-         nothing, nothing, "", nothing, "", nothing, OrderedDict{String, VariableData}())
+         nothing, nothing, "", nothing, "", nothing, nothing, false, OrderedDict{String, VariableData}())
 end
 
 default_name(::Scan) = "scan"
@@ -638,8 +641,8 @@ function postprocessor_dependencies(s::Scan)
         dev = s.scantool[]
         topic = isempty(dev.topic) ? nothing : dev.topic
         for property in ("state", "scanEnv.scanType", "scanEnv.startPoints", "scanEnv.stopPoints",
-                         "scanEnv.steps", "deviceEnv.activeMotorDeviceIds", "deviceEnv.activeMotors",
-                         "deviceEnv.activeMotorPositionKeys")
+                         "scanEnv.steps", "scanEnv.actualStartPositions", "deviceEnv.activeMotorDeviceIds",
+                         "deviceEnv.activeMotors", "deviceEnv.activeMotorPositionKeys")
             push!(deps, karabo_dependency(topic, dev.name, property))
         end
     end
@@ -663,12 +666,21 @@ function (s::Scan)(data, position)
     return scan_output(s)
 end
 
-function (s::Scan)(data, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys,
-                   position=nothing)
-    follow_scantool!(s, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys)
+function (s::Scan)(data, state, scan_type, starts, stops, steps, start_positions, motor_ids, aliases,
+                   position_keys, position=nothing)
+    follow_scantool!(s, state, scan_type, starts, stops, steps, start_positions, motor_ids, aliases,
+                     position_keys)
     # Only the running scan is binned, along its motor
     if !isnothing(s.scan_label) && !isnothing(s.motor_idx)
-        bin_scan!(s, data, position)
+        # Skip the initial move to the start, which can cross other levels
+        if !s.reached_start && !isnothing(position) && !isnothing(s.start_position)
+            if abs(position - s.start_position) <= s.resolution[]
+                s.reached_start = true
+            end
+        end
+        if s.reached_start
+            bin_scan!(s, data, position)
+        end
     end
     return scan_output(s)
 end
@@ -694,9 +706,11 @@ end
 # state enters ACQUIRING other than from PAUSED (a resume) and ends when it's
 # back to ON, or ERROR for an aborted scan. Step scans set the resolution from
 # their step size, other scans have no useful one.
-function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys)
+function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, start_positions, motor_ids,
+                          aliases, position_keys)
     # The trainmatcher has no value for a property until it's first updated
-    if !any(isnothing, (state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys))
+    if !any(isnothing, (state, scan_type, starts, stops, steps, start_positions, motor_ids, aliases,
+                        position_keys))
         motors = String.(motor_ids)
         position_keys = String.(position_keys)
         if (scan_type, motors, position_keys) != s.motor_config
@@ -733,6 +747,9 @@ function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor
         if state == "ACQUIRING" && s.state ∉ ("ACQUIRING", "PAUSED")
             s.scan_label = "$(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ($(join(aliases, ", ")))"
             s.binner = nothing
+            # Absolute, unlike a dscan's start points
+            s.start_position = isnothing(s.motor_idx) ? nothing : Float64(start_positions[s.motor_idx])
+            s.reached_start = false
             # Half a step snaps positions onto the nearest level. Start/stop
             # points are per motor (a single one applies to every motor), the
             # step count is shared.
