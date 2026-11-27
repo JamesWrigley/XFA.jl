@@ -1317,11 +1317,12 @@ end
     # A 1-D scan moving MOTOR_X and MOTOR_A together from a shared start point,
     # the latter in steps of 0.1, which pauses after train 3 and ends at train 6
     train(tid, state, pos, intensity) =
-        tid => Dict("det" => Dict("intensity" => intensity), "MOTOR_A" => Dict("actualPosition" => pos),
+        tid => Dict("det" => Dict("intensity" => intensity), "MOTOR_A" => Dict("actualEnergy" => pos),
                     "SCAN" => Dict("state" => state, "scanEnv.scanType" => "ascan",
                                    "scanEnv.startPoints" => [0.0], "scanEnv.stopPoints" => [5.0, 1.0],
                                    "scanEnv.steps" => [10], "deviceEnv.activeMotors" => ["x", "a"],
-                                   "deviceEnv.activeMotorDeviceIds" => ["MOTOR_X", "MOTOR_A"]))
+                                   "deviceEnv.activeMotorDeviceIds" => ["MOTOR_X", "MOTOR_A"],
+                                   "deviceEnv.activeMotorPositionKeys" => ["actualPosition", "actualEnergy"]))
     @Input function input(::Context.MockInput, output)
         for (tid, data) in [train(1, "ON", 0.0, 0.0), train(2, "ACQUIRING", 0.0, 1.0),
                             train(3, "ACQUIRING", 0.1, 2.0), train(4, "PAUSED", 0.1, 3.0),
@@ -1343,7 +1344,7 @@ end
     # it, after which the scan is binned at half that motor's step size. The
     # pause doesn't start a new scan.
     @test Context.run_pipeline(ctx)
-    @test scn.motor[] == karabo_dependency("MOTOR_A", "actualPosition")
+    @test scn.motor[] == karabo_dependency("MOTOR_A", "actualEnergy")
     @test !Context.run_pipeline(ctx)
     @test scn.resolution[] ≈ 0.05
     out = last(scan_outputs())

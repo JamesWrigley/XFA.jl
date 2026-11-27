@@ -576,9 +576,6 @@ mutable struct Scan <: AbstractPostprocessor
     automatic::Parameter{Bool}
     scantool::Parameter{KaraboDevice}
     motor::Parameter{Dependency}
-    # The motors' position property. Karabacon's motor interfaces differ here
-    # (e.g. slits use actualPositionX, monochromators actualEnergy).
-    position_property::Parameter{String}
     resolution::Parameter{Float64}
     n_scans::Parameter{Int}
     history_budget::Parameter{Int}
@@ -598,12 +595,12 @@ mutable struct Scan <: AbstractPostprocessor
     records::OrderedDict{String, VariableData}
 end
 
-function Scan(; automatic=true, scantool=nothing, motor=nothing, position_property="actualPosition",
-              resolution=1e-3, n_scans=10, history_budget=64 * 1024 * 1024, motor_priority=String[])
+function Scan(; automatic=true, scantool=nothing, motor=nothing, resolution=1e-3, n_scans=10,
+              history_budget=64 * 1024 * 1024, motor_priority=String[])
     Scan(Parameter{Bool}(; value=automatic, update_handler=scan_rewire),
          Parameter{KaraboDevice}(; value=scantool, update_handler=scan_rewire, filter_device_classes=["Karabacon"]),
          Parameter{Dependency}(; value=motor, update_handler=scan_motor_changed, optional=true),
-         Parameter(position_property), Parameter{Float64}(; value=resolution, update_handler=scan_rebin),
+         Parameter{Float64}(; value=resolution, update_handler=scan_rebin),
          Parameter(n_scans), Parameter(history_budget), motor_priority,
          nothing, nothing, "", nothing, "", nothing, OrderedDict{String, VariableData}())
 end
@@ -641,7 +638,8 @@ function postprocessor_dependencies(s::Scan)
         dev = s.scantool[]
         topic = isempty(dev.topic) ? nothing : dev.topic
         for property in ("state", "scanEnv.scanType", "scanEnv.startPoints", "scanEnv.stopPoints",
-                         "scanEnv.steps", "deviceEnv.activeMotorDeviceIds", "deviceEnv.activeMotors")
+                         "scanEnv.steps", "deviceEnv.activeMotorDeviceIds", "deviceEnv.activeMotors",
+                         "deviceEnv.activeMotorPositionKeys")
             push!(deps, karabo_dependency(topic, dev.name, property))
         end
     end
@@ -665,8 +663,9 @@ function (s::Scan)(data, position)
     return scan_output(s)
 end
 
-function (s::Scan)(data, state, scan_type, starts, stops, steps, motor_ids, aliases, position=nothing)
-    follow_scantool!(s, state, scan_type, starts, stops, steps, motor_ids, aliases)
+function (s::Scan)(data, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys,
+                   position=nothing)
+    follow_scantool!(s, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys)
     # Only the running scan is binned, along its motor
     if !isnothing(s.scan_label) && !isnothing(s.motor_idx)
         bin_scan!(s, data, position)
@@ -695,16 +694,19 @@ end
 # state enters ACQUIRING other than from PAUSED (a resume) and ends when it's
 # back to ON, or ERROR for an aborted scan. Step scans set the resolution from
 # their step size, other scans have no useful one.
-function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor_ids, aliases)
+function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys)
     # The trainmatcher has no value for a property until it's first updated
-    if !any(isnothing, (state, scan_type, starts, stops, steps, motor_ids, aliases))
+    if !any(isnothing, (state, scan_type, starts, stops, steps, motor_ids, aliases, position_keys))
         motors = String.(motor_ids)
-        if (scan_type, motors) != s.motor_config
-            s.motor_config = (scan_type, motors)
+        position_keys = String.(position_keys)
+        if (scan_type, motors, position_keys) != s.motor_config
+            s.motor_config = (scan_type, motors, position_keys)
             s.motor_idx = if scan_type in ("mesh", "dmesh")
                 @warn "Scan '$(Meta.name[])': mesh scans aren't supported yet" maxlog=1
                 nothing
-            elseif scan_type == "tscan" || isempty(motors)
+            # The position keys are cleared on a motor change until the
+            # scantool is configured again
+            elseif scan_type == "tscan" || isempty(motors) || length(position_keys) != length(motors)
                 nothing
             else
                 preferred = findfirst(in(motors), s.motor_priority)
@@ -718,7 +720,7 @@ function follow_scantool!(s::Scan, state, scan_type, starts, stops, steps, motor
                 s.motor_alias = String(aliases[s.motor_idx])
                 dev = s.scantool[]
                 motor = karabo_dependency(isempty(dev.topic) ? nothing : dev.topic, motors[s.motor_idx],
-                                          s.position_property[])
+                                          position_keys[s.motor_idx])
                 if !isassigned(s.motor) || s.motor[] != motor
                     tryset(s.motor, motor; force=true)
                     @info "Scan '$(Meta.name[])' follows $(motor.source) of scantool '$(dev.name)'"
