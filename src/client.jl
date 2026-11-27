@@ -1019,7 +1019,6 @@ function apply_metadata!(store, variable::VariableData)
     store.fixed_aspect = variable.fixed_aspect
     store.plot_type = variable.plot_type
     store.plot_specs = variable.plot_specs
-    store.uncertainty = variable.uncertainty
 
     # Use explicit labels if provided, otherwise derive from DimArray or data type.
     # For 2D DimArrays the heatmap maps dim 1 → Y (rows) and dim 2 → X (cols).

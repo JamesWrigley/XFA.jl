@@ -2237,6 +2237,23 @@ end
         out = avg(DimArray([3.0, 4.0], (Dim{:energy}([11, 21]),)))
         @test parent(out) == [2.0, 3.0]
         @test lookup(out, :energy) == [11, 21]
+
+        # A run is averaged from its start whatever the window, and a new run
+        # or leaving it starts over
+        m = Context.MovingAvg(; nsamples=2)
+        in_run(run, x) = Base.ScopedValues.@with Context.Meta.proposal => 1234 Context.Meta.run_number => run avg(x)
+        @test avg(1) === 1.0
+        @test in_run(5, 3) === 3.0
+        @test in_run(5, 6) === 4.5
+        m.nsamples[] = 3
+        @test in_run(5, 9) === 6.0
+        @test in_run(6, 10) === 10.0
+        @test avg(20) === 20.0
+
+        # Unless it's disabled
+        m = Context.MovingAvg(; nsamples=2, track_daq=false)
+        @test avg(1) === 1.0
+        @test in_run(5, 3) === 2.0
     end
 
     @testset "center_of_mass" begin
@@ -2379,7 +2396,7 @@ end
         @test out.save_mode == Context.SaveMode_Last
         @test Context.DD.lookup(out.data, Symbol("mono.energy")) ≈ [mean([-0.580, -0.581, -0.580]), -0.570]
         @test collect(out.data) ≈ [mean([10.0, 20.0, 30.0]), 100.0]
-        @test out.uncertainty ≈ [std([10.0, 20.0, 30.0]; corrected=false), 0.0]
+        @test Context.DD.lookup(out.data, :uncertainty) ≈ [std([10.0, 20.0, 30.0]; corrected=false), 0.0]
         @test Context.DD.name(out.data) == :spectrum
 
         # A resolution change re-bins the history, merging the two levels
@@ -2395,7 +2412,7 @@ end
         end
         @test collect(out.data) ≈ [2.0 3.0; 5.0 6.0]
         @test Context.DD.name(Context.DD.dims(out.data)) == (Symbol("a.pos"), :spectrum)
-        @test isnothing(out.uncertainty)
+        @test isempty(Context.DD.extras(out.data, Symbol("a.pos")))
 
         # A value of a different shape resets the bins instead of failing to fold
         # into the old ones.

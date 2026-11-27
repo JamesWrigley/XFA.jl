@@ -713,8 +713,8 @@ end
         # its uncertainty as a band
         source = XFA.RecordSpec(; output="a.scan", key="first")
         plot = XFA.Plot(; id="record", view=XFA.SpecView(; source, id="record"))
-        bins = XFA.DimArray([4.0, 5.0], (XFA.DD.Dim{:position}([0.1, 0.2]),); name=:scan)
-        XFA.fill_record!(source, XFA.VariableData(; data=bins, xlabel="motor", uncertainty=[0.5, 1.0]))
+        bins = XFA.DimArray([4.0, 5.0], (XFA.DD.Dim{:position}([0.1, 0.2]; extras=(; uncertainty=[0.5, 1.0])),); name=:scan)
+        XFA.fill_record!(source, XFA.VariableData(; data=bins, xlabel="motor"))
         band = only(XFA.prepare!(plot.view, plot, Dict{String, Set{Int}}()))
         @test (band.xs, band.lower, band.upper, plot.view.spec.xlabel) == ([0.1, 0.2], [3.5, 4.0], [4.5, 6.0], "motor")
         @test isempty(gui.client.subscriptions)

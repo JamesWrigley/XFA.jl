@@ -3,7 +3,7 @@ module XfaEngine
 # The pipeline core. `Context` is kept as a back-compat alias for the module so
 # existing `Context.foo` references (here and in macro-generated code) resolve.
 using XfaContext
-using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter, Displayable
+using XfaContext: ContextState, VariableData, ArrayMetadata, KaraboDevice, @Group, @Input, Parameter, Displayable, Maybe
 const Context = XfaContext
 
 include("zfp_workspace.jl")
@@ -170,10 +170,6 @@ function client_view_for(state::EngineState, variable::VariableData, qualified::
 
     view = if new_data === variable.data
         variable
-    elseif k == METADATA_K
-        # Unsubscribed outputs only carry their shape
-        stripped = @set variable.uncertainty = nothing
-        @set stripped.data = new_data
     else
         @set variable.data = new_data
     end

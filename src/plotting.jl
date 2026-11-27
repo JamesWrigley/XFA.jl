@@ -1886,7 +1886,8 @@ function layer_frames!(frames, view::SpecView, layer::ViewLayer, updated_variabl
             if layer === view.layers[1] && fit_wanted(view.fit, haskey(updated_variables, name))
                 compute_fit!(view.fit, ys, xs)
             end
-            uncertainty = store.uncertainty
+            # A vector's `uncertainty` lookup is drawn as a band around it
+            uncertainty = store.data isa DimVector ? get(DD.extras(DD.dims(store.data, 1)), :uncertainty, nothing) : nothing
             if spec.mark == Mark_Bar
                 bar_size = length(xs) > 1 ? Float64(abs(xs[2] - xs[1])) : 1.0
                 push!(frames, Bars(xs, ys, store.title, bar_size))

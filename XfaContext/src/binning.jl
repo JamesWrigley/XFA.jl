@@ -142,9 +142,9 @@ end
 
 # Refresh the position lookups on `mean`/`count`/`std` after the bin centres drift.
 function relabel!(seq::BinnedSequence)
-    seq.mean = DD.rebuild(seq.mean; dims=(position_dims(seq)..., seq.value_dims...))
-    seq.count = DD.rebuild(seq.count; dims=position_dims(seq))
-    seq.std = DD.rebuild(seq.std; dims=position_dims(seq))
+    seq.mean = DD.DimArray(parent(seq.mean), (position_dims(seq)..., seq.value_dims...))
+    seq.count = DD.DimArray(parent(seq.count), position_dims(seq))
+    seq.std = DD.DimArray(parent(seq.std), position_dims(seq))
     return seq
 end
 

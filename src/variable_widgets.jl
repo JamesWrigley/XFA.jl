@@ -228,6 +228,20 @@ function draw_variable_content(::Val{Symbol("AttosecondFit")}, name, var_data, g
     return nothing
 end
 
+# The window doesn't apply while a run is averaged
+function draw_postprocessor_params(::Val{Symbol("XfaContext.MovingAvg")}, pp)
+    draw_parameter("track_daq", pp.params["track_daq"])
+
+    run_status = state[].client.context.run_status
+    in_run = pp.params["track_daq"].value && !isnothing(run_status)
+    @Disabled in_run begin
+        draw_parameter("nsamples", pp.params["nsamples"])
+    end
+    if in_run && ig.IsItemHovered(ig.ImGuiHoveredFlags_AllowWhenDisabled)
+        node_tooltip("Averaging over p$(run_status.proposal), r$(run_status.run)")
+    end
+end
+
 function draw_postprocessor_params(::Val{Symbol("XfaContext.Histogram1D")}, pp)
     param_order = ("nbins", "binedges", "normalize", "windowed", "buffer_size")
     for param_name in param_order

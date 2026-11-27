@@ -442,9 +442,11 @@ end
 ## MovingAvg postprocessor
 
 # Postprocessor for the mean of the last `nsamples` inputs, kept as a rolling
-# sum over a ring buffer of samples. Non-finite values are skipped.
+# sum over a ring buffer of samples. Non-finite values are skipped. With
+# `track_daq`, trains in a run are averaged over the whole run instead.
 mutable struct MovingAvg <: AbstractPostprocessor
     nsamples::Parameter{Int}
+    track_daq::Parameter{Bool}
     samples::AbstractArray
     sum::AbstractArray
     counts::Array{Int}
@@ -454,8 +456,8 @@ mutable struct MovingAvg <: AbstractPostprocessor
     buffer_key::UInt
 end
 
-MovingAvg(; nsamples::Integer=10) = MovingAvg(Parameter(Int(nsamples)), Float64[], Float64[], Int[], Float64[],
-                                              0, 1, UInt(0))
+MovingAvg(; nsamples::Integer=10, track_daq::Bool=true) =
+    MovingAvg(Parameter(Int(nsamples)), Parameter(track_daq), Float64[], Float64[], Int[], Float64[], 0, 1, UInt(0))
 
 default_name(::MovingAvg) = "moving_avg"
 
@@ -530,7 +532,10 @@ end
 
 function average!(m::MovingAvg, data::AbstractArray)
     n = m.nsamples[]
-    key = hash((size(data), eltype(data), n))
+    # In a run the inputs are averaged from its start, ignoring the window
+    in_run = m.track_daq[] && Meta.run_number[] != -1
+    window = in_run ? (Meta.proposal[], Meta.run_number[]) : n
+    key = hash((size(data), eltype(data), window))
     if key != m.buffer_key
         T = float(eltype(data))
         m.samples = Array{T}(undef, size(data)..., n)
@@ -542,10 +547,10 @@ function average!(m::MovingAvg, data::AbstractArray)
         m.buffer_key = key
     end
 
-    full = m.nfilled == n
+    full = !in_run && m.nfilled == n
     old = selectdim(m.samples, ndims(m.samples), m.slot)
     update_moving_avg!(m.avg, m.sum, m.counts, old, full, data)
-    if !full
+    if !in_run && !full
         m.nfilled += 1
     end
     m.slot = mod1(m.slot + 1, n)
@@ -764,22 +769,22 @@ function scan_bins(s::Scan)
             "position"
         end)
         # The axes are labelled by the dims: the position after the motor, the
-        # values and an anonymous value dim after the binned output. They're
-        # rebuilt since DD.set can't handle the binner's plain vector lookups.
+        # values and an anonymous value dim after the binned output
         source = Symbol(first(rsplit(Meta.name[], '.'; limit=2)))
         seq = s.binner.seq
-        dims = map(DD.dims(seq.mean)) do dim
-            if DD.name(dim) == :position
-                DD.Dim{motor}(DD.val(dim))
-            elseif DD.name(dim) == :dim_1
-                DD.Dim{source}(DD.val(dim))
-            else
-                dim
-            end
+        data = if DD.hasdim(seq.mean, :dim_1)
+            DD.set(seq.mean, :position => motor, :dim_1 => source)
+        else
+            DD.set(seq.mean, :position => motor)
         end
-        data = DD.rebuild(seq.mean; dims, name=source)
-        # The std is pooled over a vector's elements, so only scalar scans get one
-        uncertainty = ndims(seq.mean) == 1 ? DD.rebuild(seq.std; dims) : nothing
-        return VariableData(; data, uncertainty, compress=false, fixed_aspect=false, save_mode=SaveMode_Last)
+        # The std is pooled over a vector's elements, so only scalar scans get
+        # one, as an `uncertainty` lookup drawn as a band around them. It's
+        # copied since the binner keeps updating it.
+        if ndims(seq.mean) == 1
+            positions = DD.rebuild(DD.lookup(data, motor); extras=(; uncertainty=copy(parent(seq.std))))
+            data = DD.set(data, motor => positions)
+        end
+        return VariableData(; data=DD.rebuild(data; name=source), compress=false, fixed_aspect=false,
+                            save_mode=SaveMode_Last)
     end
 end

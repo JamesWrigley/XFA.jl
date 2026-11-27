@@ -314,7 +314,6 @@ end
     plot_type::Symbol = :series
     compress::Bool = true
     plot_specs::Vector{PlotSpec} = PlotSpec[]
-    uncertainty::Maybe{AbstractVector} = nothing
     # Keys of the records the output's owner holds, see request_record
     records::Vector{String} = String[]
 end
