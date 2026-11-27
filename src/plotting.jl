@@ -1719,7 +1719,8 @@ function lookup_frame(view::SpecView, layer::ViewLayer, updated_variables)
                     view.binning_resolution[d] = Cfloat(stores[d].bin_resolution)
                 end
             end
-            rebinned = set_resolution!(m, view.binning_resolution)
+            # Disabled binning keeps the resolutions for when it's re-enabled
+            rebinned = set_resolution!(m, view.binning ? view.binning_resolution : zero(view.binning_resolution))
             appended || rebinned
         else
             ingest_vector!(m, stores)
@@ -2415,15 +2416,19 @@ function bottom_controls(view::SpecView)
 
     i = findfirst(layer -> !isnothing(layer.matcher) && layer.spec.lookups[1].key == LookupKey_TrainId, view.layers)
     if !isnothing(i)
-        labels = is_mesh(view.layers[i].spec) ? ("X resolution", "Y resolution") : ("Binning resolution",)
-        for d in eachindex(labels)
-            ig.SameLine()
-            ig.SetNextItemWidth(135)
-            if ig.DragFloat("$(labels[d])##$(id)",
-                            Ref(view.binning_resolution, d), 0.01f0,
-                            0.0f0, typemax(Cfloat), "%.12f",
-                            ig.ImGuiSliderFlags_AlwaysClamp)
-                view.resolution_touched[d] = true
+        ig.SameLine()
+        @c ig.Checkbox("Binning##$(id)", &view.binning)
+        labels = is_mesh(view.layers[i].spec) ? ("X resolution", "Y resolution") : ("Resolution",)
+        @Disabled !view.binning begin
+            for d in eachindex(labels)
+                ig.SameLine()
+                ig.SetNextItemWidth(135)
+                if ig.DragFloat("$(labels[d])##$(id)",
+                                Ref(view.binning_resolution, d), 0.01f0,
+                                0.0f0, typemax(Cfloat), "%.12f",
+                                ig.ImGuiSliderFlags_AlwaysClamp)
+                    view.resolution_touched[d] = true
+                end
             end
         end
     end

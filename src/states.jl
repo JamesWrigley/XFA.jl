@@ -343,6 +343,7 @@ end
     # binning. Each follows its variable's hint until the user touches it.
     const binning_resolution::Vector{Cfloat} = Cfloat[0, 0]
     const resolution_touched::Vector{Bool} = [false, false]
+    binning::Bool = true
     # ROI parameter values updated locally during a drag, keyed by parameter
     # name. Flushed to the engine when the user releases the mouse so we don't
     # flood it with per-frame updates.
