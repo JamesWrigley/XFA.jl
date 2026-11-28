@@ -483,9 +483,11 @@ function disconnect_engine(state, shutdown_engine)
     end
 
     close(state.client)
-    # Note that we use setfield!() here to bypass the locking, which would
-    # otherwise cause locking mismatches.
-    setfield!(state, :client, ClientState(load_settings()))
+    # Swap under the GuiState lock only, so the render loop doesn't lock the old
+    # client and unlock the new one. lock(state) would take the old client's lock
+    # and release the new one's, so we take state.lock directly.
+    new_client = ClientState(load_settings())
+    @lock state.lock setfield!(state, :client, new_client)
 end
 
 # Restart the engine by shutting it down, waiting for it to die, and then
