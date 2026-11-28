@@ -1201,7 +1201,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context_path = msg.info["path"]
             client.context.context_path = msg.info["path"]
 
-            # Show the pipeline of an engine we connected to with a context loaded
+            # Switch to the pipeline tab when connecting to an engine with a context loaded
             if !isnothing(replied_to) && replied_to.msg_type == GetContextInfo
                 state.select_tab = MainTab_Pipeline
             end

@@ -64,14 +64,14 @@ const state = ScopedValue{GuiState}()
 # these callbacks. It hands us a JSON string to stash and reads it back on load;
 # save_settings writes ne_settings out to settings.toml.
 function ne_save_settings(data::Ptr{Cchar}, size::Csize_t, reason, user::Ptr{Cvoid})::Bool
-    client = unsafe_pointer_to_objref(user)::ClientState
+    client = (unsafe_pointer_to_objref(user)::GuiState).client
     client.ne_settings = unsafe_string(data, size)
     return true
 end
 
 # Called first with a null buffer to query the size, then with a buffer to fill.
 function ne_load_settings(data::Ptr{Cchar}, user::Ptr{Cvoid})::Csize_t
-    client = unsafe_pointer_to_objref(user)::ClientState
+    client = (unsafe_pointer_to_objref(user)::GuiState).client
     blob = client.ne_settings
     if data != C_NULL && !isempty(blob)
         unsafe_copyto!(Ptr{UInt8}(data), pointer(blob), ncodeunits(blob))
@@ -81,8 +81,8 @@ end
 
 # Create the editor with our save/load callbacks wired up. ne_settings must hold
 # the current context's blob first so the editor's initial LoadSettings restores
-# the layout. The editor is recreated this way whenever the context changes.
-function create_node_editor!(client)
+# the layout. The editor is recreated this way by switch_layout!.
+function create_node_editor!(state::GuiState)
     save_cb = @cfunction(ne_save_settings, Bool, (Ptr{Cchar}, Csize_t, ne.SaveReasonFlags, Ptr{Cvoid}))
     load_cb = @cfunction(ne_load_settings, Csize_t, (Ptr{Cchar}, Ptr{Cvoid}))
 
@@ -90,12 +90,59 @@ function create_node_editor!(client)
     config.SettingsFile = Ptr{Cchar}(C_NULL)
     config.SaveSettings = save_cb
     config.LoadSettings = load_cb
-    config.UserPointer = pointer_from_objref(client)
+    config.UserPointer = pointer_from_objref(state)
 
     # CreateEditor copies the config by value, so the transient one can go.
-    client.ne_editor = ne.CreateEditor(config)
+    state.ne_editor = ne.CreateEditor(config)
     ne.Destroy(config)
-    client.ne_editor_path = client.context_path
+end
+
+# Swap in the node editor, plots and window layout saved for the context the
+# engine has loaded, after saving those of the previous context.
+function switch_layout!(state::GuiState)
+    client = state.client
+    path = client.context.context_path
+    if path == client.layout_path && state.ne_editor != C_NULL
+        return
+    end
+
+    save_settings(client)
+    if state.ne_editor != C_NULL
+        ne.DestroyEditor(state.ne_editor)
+    end
+    foreach(close, client.plots)
+    empty!(client.plots)
+
+    saved = load_context_settings(path)
+    client.ne_settings = get(saved, "node_editor_state", "")
+    client.ne_node_widths = Dict{String, Float32}(name => w for (name, w) in get(saved, "node_widths", Dict()))
+    create_node_editor!(state)
+
+    for entry in get(saved, "plots", [])
+        plot = restore_plot(entry)
+        if !isnothing(plot)
+            push!(client.plots, plot)
+        end
+    end
+    client.plot_counter = get(saved, "plot_counter", 0)
+
+    layout = get(saved, "saved_layout", "")
+    if !isempty(layout)
+        client.pending_layout = layout
+    end
+    client.layout_path = path
+end
+
+# NewFramePre hook that loads the layout set by switch_layout!. Loading it in
+# the middle of a frame breaks docking.
+function load_pending_layout(ctx::Ptr{Cvoid}, hook::Ptr{ig.lib.ImGuiContextHook})::Cvoid
+    # The client is replaced on disconnect, so look it up through the GuiState
+    client = (unsafe_pointer_to_objref(unsafe_load(hook).UserData)::GuiState).client
+    if !isnothing(client.pending_layout)
+        ig.LoadIniSettingsFromMemory(client.pending_layout)
+        client.pending_layout = nothing
+    end
+    return nothing
 end
 
 # The graph can only be edited while the pipeline is idle or fully running,
@@ -1473,7 +1520,6 @@ function draw_dag()
     @Disabled context.pipeline_status in changing_states begin
         if ig.Button("Load context")
             load_context(state[])
-            restore_plots(state[])
         end
     end
 
@@ -1540,22 +1586,11 @@ function draw_dag()
 
     ig.Dummy(0, 10)
 
-    # (Re)create the editor whenever the loaded context changes so it restores
-    # that context's saved layout. Persist the outgoing context's layout first.
-    if client.ne_editor_path != client.context_path
-        if client.ne_editor != C_NULL
-            save_node_editor_state(client.ne_editor_path, client.ne_settings, client.ne_node_widths)
-            ne.DestroyEditor(client.ne_editor)
-        end
-        client.ne_settings, client.ne_node_widths = load_node_editor_state(client.context_path)
-        create_node_editor!(client)
-    end
-
     # Left edge of the canvas in screen space, used to keep deferred popups from
     # spilling off the side of the window.
     canvas_min_x = ig.GetCursorScreenPos().x
 
-    @NodeEditor client.ne_editor "dag-editor" begin
+    @NodeEditor state[].ne_editor "dag-editor" begin
         # The editor zooms by scaling the draw list, which blurs text baked at the
         # base size. Match the font rasterizer density to the magnification (snapped
         # up to a power of two so the bake cache stays warm) to keep text crisp.
@@ -1857,49 +1892,6 @@ function draw_ssh_auth()
     end
 end
 
-function restore_plots(state::GuiState)
-    client = state.client
-    ctx_path = client.context_path
-    if !haskey(state.saved_contexts, ctx_path)
-        return
-    end
-
-    ctx = state.saved_contexts[ctx_path]
-
-    ## Code to restore plots is buggy, so it's disabled for now
-
-    # # Close existing plots before restoring
-    # for plot in gui_state.client.plots
-    #     close(plot)
-    # end
-    # empty!(gui_state.client.plots)
-
-    # for p in get(ctx, "plots", [])
-    #     dock_id = UInt32(get(p, "dock_id", 0))
-    #     if p["type"] == "Plot"
-    #         push!(gui_state.client.plots, variable_plot(p["name"], p["id"], dock_id))
-    #     else
-    #         push!(gui_state.client.plots, correlation_plot(p["id"], dock_id))
-    #     end
-    # end
-
-    # gui_state.plot_counter = Int(get(ctx, "plot_counter", 0))
-
-    # layout = get(ctx, "saved_layout", "")
-    # if !isempty(layout)
-    #     # Load the INI to restore dock node topology, then explicitly assign
-    #     # each window to its saved dock node. DockBuilderDockWindow stores the
-    #     # assignment in ImGui's window settings; it takes effect on the next
-    #     # frame once the dock nodes are recreated from the INI.
-    #     ig.LoadIniSettingsFromMemory(layout)
-    #     # for plot in gui_state.client.plots
-    #     #     if plot.dock_id != 0
-    #     #         ig.DockBuilderDockWindow(plot.id, plot.dock_id)
-    #     #     end
-    #     # end
-    # end
-end
-
 # Decode one array frame, reusing `spare` in place when its shape/eltype match.
 # Runs on a background task, so it touches only `ws`, `ca`, and `spare` — never
 # the store's live `data`.
@@ -2013,9 +2005,11 @@ function draw_plots()
         end
     end
 
-    # Draw plot windows
-    for plot in client.plots
-        draw_plot(plot, updated_variables)
+    # Don't draw restored plots until their layout is loaded
+    if isnothing(client.pending_layout)
+        for plot in client.plots
+            draw_plot(plot, updated_variables)
+        end
     end
 
     # Remove closed plots
@@ -2191,6 +2185,8 @@ function tab_flags(tab::MainTab)
 end
 
 function draw_gui()
+    switch_layout!(state[])
+
     # Dock the main window by default
     viewport = ig.igGetMainViewport()
     central_dock_id = ig.DockSpaceOverViewport(ig.GetWindowDockID(), viewport, ig.ImGuiDockNodeFlags_PassthruCentralNode)
@@ -2664,6 +2660,10 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
 
     # Disable built-in INI file — we manage layout persistence ourselves
     io.IniFilename = C_NULL
+    layout_cb = @cfunction(load_pending_layout, Cvoid, (Ptr{Cvoid}, Ptr{ig.lib.ImGuiContextHook}))
+    layout_hook = ig.lib.ImGuiContextHook(0, ig.lib.ImGuiContextHookType_NewFramePre, 0, layout_cb,
+                                          pointer_from_objref(gui_state))
+    ig.AddContextHook(imgui_ctx, Ref(layout_hook))
 
     on_exit = () -> begin
         client = gui_state.client
@@ -2695,8 +2695,8 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
         destroy_heatmap_context!()
 
         ImPlot.DestroyContext(implot_ctx)
-        if client.ne_editor != C_NULL
-            ne.DestroyEditor(client.ne_editor)
+        if gui_state.ne_editor != C_NULL
+            ne.DestroyEditor(gui_state.ne_editor)
         end
         empty!(safe_input_text_cache)
         close(gui_state)

@@ -358,9 +358,10 @@ end
 end
 
 # A plot window: the view, and the state of the plot's axes. `id` is also the
-# `##` suffix of the view's widgets.
+# `##` suffix of the view's widgets, and ends with `counter`.
 @kwdef mutable struct Plot
     const id::String
+    const counter::Int = 0
     const view::SpecView
     const open::Ref{Bool} = Ref(true)
     const autoscale_x::Ref{Bool} = Ref(true)
@@ -368,7 +369,6 @@ end
     const log_x::Ref{Bool} = Ref(false)
     const log_y::Ref{Bool} = Ref(false)
     const show_side_panel::Ref{Bool} = Ref(false)
-    dock_id::UInt32 = 0
     error::Maybe{String} = nothing
 end
 
@@ -641,6 +641,8 @@ end
 
 @kwdef mutable struct ContextState
     context_state::Dict{String, Any} = Dict()
+    # The path the engine has loaded, unlike ClientState.context_path which
+    # also follows edits to the path field.
     context_path::String = ""
     source::String = ""
     input_topics::Dict{String, Union{String, Nothing}} = Dict()
@@ -677,12 +679,6 @@ end
     lock::ReentrantLock = ReentrantLock()
 end
 
-function ContextState(settings::Dict; kwargs...)
-    client_settings = get(settings, "ClientState", Dict{String, Any}())
-    context_path = get(client_settings, "context_path", "")
-
-    ContextState(; context_path, kwargs...)
-end
 
 Base.lock(ctx::ContextState) = lock(ctx.lock)
 Base.unlock(ctx::ContextState) = unlock(ctx.lock)
@@ -796,8 +792,12 @@ end
     # Monotonic counter for minting unique pending-node ids.
     pending_node_counter::UInt = 0
 
-    ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
-    ne_editor_path::String = ""
+    # The context whose node editor, plots and window layout are shown, see
+    # switch_layout!
+    layout_path::String = ""
+    # Window layout for the NewFramePre hook to load, see load_pending_layout
+    pending_layout::Maybe{String} = nothing
+
     # User-set node widths keyed by variable name, and the right edge of the node
     # being drawn so parameter widgets can fill up to it.
     ne_node_widths::Dict{String, Float32} = Dict{String, Float32}()
@@ -907,9 +907,8 @@ end
 function ClientState(settings::Dict; kwargs...)
     client_settings = get(settings, "ClientState", Dict{String, Any}())
     context_path = get(client_settings, "context_path", "")
-    context = ContextState(settings)
 
-    ClientState(; context_path, context, kwargs...)
+    ClientState(; context_path, kwargs...)
 end
 
 function Base.lock(state::ClientState)
@@ -997,20 +996,17 @@ end
     jump_hops::Maybe{Vector{String}} = nothing
     detecting_jump_hops::Bool = false
     client::ClientState = ClientState()
+    ne_editor::Ptr{ne.EditorContext} = Ptr{ne.EditorContext}(C_NULL)
     julia_module::String = "exfel xfa"
     engine_environment::String = ""
     engine_working_dir::String = "~/xfa"
     client_type_current_item::Cint = Cint(0)
-
-    # Plot layout persistence, keyed by context path
-    saved_contexts::Dict{String, Dict{String, Any}} = Dict()
 
     lock::ReentrantLock = ReentrantLock()
 end
 
 function GuiState(settings::Dict; kwargs...)
     gui = get(settings, "GuiState", Dict{String, Any}())
-    client_settings = get(settings, "ClientState", Dict{String, Any}())
 
     address = get(gui, "address", "$(Sys.username())@sa2-onc-mid.desy.de")
     julia_module = get(gui, "julia_module", "exfel xfa")
@@ -1018,14 +1014,11 @@ function GuiState(settings::Dict; kwargs...)
     engine_working_dir = get(gui, "engine_working_dir", "~/xfa")
     client_type_current_item = Cint(get(gui, "client_type", 0))
     font_percent = Cint(get(gui, "font_percent", 100))
-    saved_contexts = Dict{String, Dict{String, Any}}(
-        k => Dict{String, Any}(v) for (k, v)
-            in get(client_settings, "contexts", Dict()))
 
     client = ClientState(settings; embedded_engine = client_type_current_item == 1)
 
     GuiState(; address, julia_module, engine_environment, engine_working_dir,
-             client_type_current_item, font_percent, saved_contexts, client, kwargs...)
+             client_type_current_item, font_percent, client, kwargs...)
 end
 
 function Base.setproperty!(state::GuiState, sym::Symbol, x)

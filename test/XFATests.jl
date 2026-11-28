@@ -41,85 +41,33 @@ ig.set_backend(:GlfwOpenGL3)
         end
     end
 
-    @testset "GuiState constructor reads contexts from sections" begin
+    @testset "GuiState constructor reads its section" begin
         settings = Dict(
             "GuiState" => Dict(
                 "address" => "testhost",
                 "engine_environment" => "@test-env",
                 "client_type" => 1,
             ),
-            "ClientState" => Dict(
-                "contexts" => Dict(
-                    "/path/to/ctx.jl" => Dict(
-                        "plots" => [
-                            Dict("type" => "Plot", "name" => "var1", "id" => "var1##plot-1"),
-                            Dict("type" => "CorrelationPlot", "id" => "CorrelationPlot##plot-2"),
-                        ],
-                        "plot_counter" => 5,
-                        "saved_layout" => "[Window][Main]\nPos=0,0\n",
-                    ),
-                ),
-            ),
         )
 
         gui = XFA.GuiState(settings)
         @test gui.address == "testhost"
         @test gui.engine_environment == "@test-env"
-        @test haskey(gui.saved_contexts, "/path/to/ctx.jl")
-        @test length(gui.saved_contexts["/path/to/ctx.jl"]["plots"]) == 2
         @test isempty(gui.client.plots)
     end
 
-    @testset "GuiState constructor with empty settings uses defaults" begin
-        gui = XFA.GuiState(Dict{String,Any}())
-        @test isempty(gui.saved_contexts)
+    @testset "Plot entries round-trip" begin
+        plot = XFA.correlation_plot(3)
+        plot.view.source.selected .= ["x", "y", ""]
+        entry = merge(XFA.plot_entry(plot.view.source), Dict("counter" => plot.counter))
+
+        restored = XFA.restore_plot(entry)
+        @test restored.id == plot.id
+        @test restored.view.source.selected == ["x", "y", ""]
+
+        # Entries in the old format are skipped
+        @test isnothing(XFA.restore_plot(Dict("type" => "Plot", "name" => "x", "id" => "x##plot-1")))
     end
-
-    # @testset "restore_plots looks up by context path" begin
-    #     gui = XFA.GuiState(Dict(
-    #         "ClientState" => Dict("contexts" => Dict(
-    #             "ctx_a.jl" => Dict(
-    #                 "plot_counter" => 3,
-    #                 "saved_layout" => "",
-    #                 "plots" => [
-    #                     Dict("type" => "Plot", "name" => "x", "id" => "x##plot-1"),
-    #                     Dict("type" => "CorrelationPlot", "id" => "CorrelationPlot##plot-2"),
-    #                 ],
-    #             ),
-    #             "ctx_b.jl" => Dict(
-    #                 "plot_counter" => 1,
-    #                 "saved_layout" => "",
-    #                 "plots" => [
-    #                     Dict("type" => "Plot", "name" => "y", "id" => "y##plot-1"),
-    #                 ],
-    #             ),
-    #         )),
-    #     ))
-
-    #     # Restore context A
-    #     gui.client.context_path = "ctx_a.jl"
-    #     XFA.restore_plots(gui)
-
-    #     @test length(gui.client.plots) == 2
-    #     @test gui.client.plots[1].id == "x##plot-1"
-    #     @test gui.client.plots[2].id == "CorrelationPlot##plot-2"
-    #     @test gui.plot_counter == 3
-
-    #     # Switch to context B
-    #     gui.client.context_path = "ctx_b.jl"
-    #     XFA.restore_plots(gui)
-
-    #     @test length(gui.client.plots) == 1
-    #     @test gui.client.plots[1].id == "y##plot-1"
-    #     @test gui.plot_counter == 1
-    # end
-
-    # @testset "restore_plots with unknown context is a no-op" begin
-    #     gui = XFA.GuiState(Dict{String,Any}())
-    #     gui.client.context_path = "unknown.jl"
-    #     XFA.restore_plots(gui)
-    #     @test isempty(gui.client.plots)
-    # end
 end
 
 @testset "Dependency completions" begin

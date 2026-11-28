@@ -70,21 +70,11 @@ function save_settings(client::ClientState, updated_field=nothing)
         return
     end
 
-    plots = map(client.plots) do plot
-        # Only default and correlation plots have a stable round-trip format
-        # today; advertised specs stay in-memory only.
-        source = plot.view.source
-        if source isa DefaultSpec
-            Dict("type" => "Plot", "name" => source.variable,
-                 "id" => plot.id, "dock_id" => plot.dock_id)
-        elseif source isa CorrelationSpec
-            Dict("type" => "CorrelationPlot", "id" => plot.id, "dock_id" => plot.dock_id)
-        else
-            nothing
-        end
+    if isempty(client.layout_path)
+        return
     end
-    filter!(!isnothing, plots)
 
+    plots = [merge(plot_entry(plot.view.source), Dict("counter" => plot.counter)) for plot in client.plots]
     ini_data = unsafe_string(ig.SaveIniSettingsToMemory(C_NULL))
 
     @lock SETTINGS_LOCK begin
@@ -94,7 +84,7 @@ function save_settings(client::ClientState, updated_field=nothing)
         client_settings["context_path"] = client.context_path
         contexts = get!(client_settings, "contexts", Dict{String, Any}())
 
-        contexts[client.context_path] = Dict(
+        contexts[client.layout_path] = Dict(
             "plots" => plots,
             "plot_counter" => client.plot_counter,
             "saved_layout" => ini_data,
@@ -106,30 +96,33 @@ function save_settings(client::ClientState, updated_field=nothing)
     end
 end
 
-# The node editor's serialized state (positions, pan, zoom) for a context.
-function load_node_editor_state(context_path)
+# The saved entry of a context, empty if it has none.
+function load_context_settings(context_path)
     settings = load_settings()
     contexts = get(get(settings, "ClientState", Dict()), "contexts", Dict())
-    ctx = get(contexts, context_path, Dict())
-    widths = Dict{String, Float32}(name => Float32(w) for (name, w) in get(ctx, "node_widths", Dict()))
-    return get(ctx, "node_editor_state", ""), widths
+    return get(contexts, context_path, Dict{String, Any}())
 end
 
-# Persist just the editor state for a context without touching its other
-# entries; used when switching away from a context before recreating the editor.
-function save_node_editor_state(context_path, blob, widths)
-    if isempty(context_path)
-        return
-    end
+# The settings entry that restore_plot rebuilds a plot from
+plot_entry(source::DefaultSpec) = Dict("type" => "Default", "variable" => source.variable)
+plot_entry(source::CorrelationSpec) = Dict("type" => "Correlation", "selected" => copy(source.selected))
+plot_entry(source::AdvertisedSpec) = Dict("type" => "Advertised", "variable" => source.variable, "name" => source.name)
+plot_entry(source::RecordSpec) = Dict("type" => "Record", "output" => source.output, "key" => source.key)
 
-    @lock SETTINGS_LOCK begin
-        settings = load_settings()
-        client_settings = get!(settings, "ClientState", Dict{String, Any}())
-        contexts = get!(client_settings, "contexts", Dict{String, Any}())
-        ctx = get!(contexts, context_path, Dict{String, Any}())
-        ctx["node_editor_state"] = blob
-        ctx["node_widths"] = widths
-
-        write_settings(settings)
+# Rebuild a plot from its plot_entry, or nothing for entries in an older format
+function restore_plot(entry)
+    type = get(entry, "type", "")
+    if type == "Default"
+        variable_plot(entry["variable"], entry["counter"])
+    elseif type == "Correlation"
+        plot = correlation_plot(entry["counter"])
+        copyto!(plot.view.source.selected, entry["selected"])
+        plot
+    elseif type == "Advertised"
+        spec_plot(entry["variable"], entry["name"], entry["counter"])
+    elseif type == "Record"
+        record_plot(entry["output"], entry["key"], entry["counter"])
+    else
+        nothing
     end
 end

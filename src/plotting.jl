@@ -831,19 +831,19 @@ function variable_plot(name::AbstractString, counter::Integer, models = ModelOve
     # Its spec can only be synthesised once there's data
     subscribe_variable(state[], name)
     push!(view.subscribed, name)
-    return Plot(; id, view)
+    return Plot(; id, counter, view)
 end
 
 # A plot correlating two variables picked in its window.
 function correlation_plot(counter::Integer)
     id = "CorrelationPlot##plot-$(counter)"
-    Plot(; id, view = SpecView(; source = CorrelationSpec(), id))
+    Plot(; id, counter, view = SpecView(; source = CorrelationSpec(), id))
 end
 
 # A plot of the spec `variable` advertises as `name`.
 function spec_plot(variable::AbstractString, name::AbstractString, counter::Integer)
     id = "$(variable)/$(name)##plot-$(counter)"
-    Plot(; id, view = SpecView(; source = AdvertisedSpec(String(variable), String(name)), id))
+    Plot(; id, counter, view = SpecView(; source = AdvertisedSpec(String(variable), String(name)), id))
 end
 
 # A static plot of the record `key` of `output`, fetched from the engine. It's
@@ -852,7 +852,7 @@ function record_plot(output::AbstractString, key::AbstractString, counter::Integ
     source = RecordSpec(; output = String(output), key = String(key))
     request_record(state[].client, source)
     id = "$(source.name)##plot-$(counter)"
-    Plot(; id, view = SpecView(; source, id))
+    Plot(; id, counter, view = SpecView(; source, id))
 end
 
 Base.close(plot::Plot) = close(plot.view)
@@ -2576,11 +2576,10 @@ function draw_plot(plot::Plot, updated_variables)
 
     view = plot.view
     title = isnothing(view.spec) ? "" : view.spec.title
-    win_id = isempty(title) ? plot.id : "$(title)##$(plot.id)"
+    # Use ### so the window ID doesn't change when the title arrives
+    win_id = isempty(title) ? plot.id : "$(title)###$(plot.id)"
 
     if ig.Begin(win_id, plot.open)
-        plot.dock_id = ig.GetWindowDockID()
-
         if isnothing(plot.error)
             try
                 @imgui_recover draw_plot_contents(plot, updated_variables)
