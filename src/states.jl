@@ -977,6 +977,9 @@ end
     mono_font::Ptr{ig.lib.ImFont} = C_NULL
     font_percent::Cint = Cint(100)
 
+    # Each undocked viewport's (Pos, Size) at the last sync_viewport_geometry() check
+    viewport_geometry::Dict{ig.ImGuiID, Tuple{ImVec2, ImVec2}} = Dict{ig.ImGuiID, Tuple{ImVec2, ImVec2}}()
+
     # Showing external tool windows
     show_imgui_demo::Bool = false
     show_imgui_metrics::Bool = false

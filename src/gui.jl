@@ -2530,6 +2530,58 @@ function fix_monitor_work_areas()
     end
 end
 
+# The WM may refuse geometry that ImGui asks for: mutter pushes windows that
+# were fully on screen back inside its work areas. The GLFW backend ignores the
+# resulting events, so ImGui draws the window offset from where it really is
+# (ocornut/imgui#9398). When a viewport's real geometry stays different from
+# ImGui's, we adopt it the way NewFrame() would for a platform move/resize. This
+# must run before any Begin(), which then syncs the windows to their viewports.
+function sync_viewport_geometry(last_geometry::Dict{ig.ImGuiID, Tuple{ImVec2, ImVec2}})
+    # Don't fight drags and resizes, and only check every few frames because
+    # each query is an X server round trip. It also gives the WM time to
+    # answer ImGui's last request.
+    if ig.IsAnyMouseDown() || ig.GetFrameCount() % 4 != 0
+        return
+    end
+
+    viewports = unsafe_load(ig.GetPlatformIO().Viewports)
+    # The first viewport is the main one, which ImGui syncs from the platform itself
+    for i in 2:viewports.Size
+        viewport = unsafe_load(viewports.Data, i)
+        minimized = (unsafe_load(viewport.Flags) & ig.ImGuiViewportFlags_IsMinimized) != 0
+        if !unsafe_load(viewport.PlatformWindowCreated) || minimized
+            continue
+        end
+
+        handle = unsafe_load(viewport.PlatformHandle)
+        x, y, w, h = Ref{Cint}(), Ref{Cint}(), Ref{Cint}(), Ref{Cint}()
+        @ccall GLFW.libglfw.glfwGetWindowPos(handle::Ptr{Cvoid}, x::Ref{Cint}, y::Ref{Cint})::Cvoid
+        @ccall GLFW.libglfw.glfwGetWindowSize(handle::Ptr{Cvoid}, w::Ref{Cint}, h::Ref{Cint})::Cvoid
+
+        id = unsafe_load(viewport.ID)
+        pos = unsafe_load(viewport.Pos)
+        size = unsafe_load(viewport.Size)
+        # ImGui may have just changed the geometry, and the WM may not have
+        # applied that yet, so only act when it's the same as at the last check
+        unchanged = haskey(last_geometry, id) && last_geometry[id] == (pos, size)
+
+        # The backend truncates when it sets the geometry
+        moved = trunc(Cint, pos.x) != x[] || trunc(Cint, pos.y) != y[]
+        resized = trunc(Cint, size.x) != w[] || trunc(Cint, size.y) != h[]
+        if unchanged && moved
+            pos = ImVec2(x[], y[])
+            unsafe_store!(viewport.Pos, pos)
+            unsafe_store!(viewport.PlatformRequestMove, true)
+        end
+        if unchanged && resized
+            size = ImVec2(w[], h[])
+            unsafe_store!(viewport.Size, size)
+            unsafe_store!(viewport.PlatformRequestResize, true)
+        end
+        last_geometry[id] = (pos, size)
+    end
+end
+
 # Reports exceptions to Sentry when a DSN is configured
 function setup_sentry(settings)
     sentry_settings = get(settings, "Sentry", Dict{String, Any}())
@@ -2661,6 +2713,7 @@ function main(; test_engine=nothing, fps_limit=nothing, memory_log=false)
         # The GLFW backend rebuilds the monitor list in every NewFrame(), so
         # this has to be reapplied every frame.
         fix_monitor_work_areas()
+        sync_viewport_geometry(gui_state.viewport_geometry)
 
         if !isnothing(gui_state.render_error)
             # Occasionally an exception will occur in the middle of a disabled
