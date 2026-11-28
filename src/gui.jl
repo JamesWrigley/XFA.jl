@@ -214,16 +214,20 @@ end
 
 ## Helper functions for the GUI
 
+function revise()
+    Revise.retry()
+
+    client = state[].client
+    if client.status == RemoteStatus_Connected
+        revise_engine(state[])
+    end
+end
+
 function draw_revise()
     can_revise = length(Revise.revision_queue) > 0
     @Disabled !can_revise begin
         if ig.Button(can_revise ? "Revise*" : "Revise")
-            Revise.retry()
-
-            client = state[].client
-            if client.status == RemoteStatus_Connected
-                revise_engine(state[])
-            end
+            revise()
         end
     end
 end
@@ -232,19 +236,19 @@ function draw_main_menubar()
     client = state[].client
 
     if ig.BeginMenuBar()
-        draw_revise()
+        if ig.BeginMenu("Tools")
+            can_revise = length(Revise.revision_queue) > 0
+            if ig.MenuItem(can_revise ? "Revise*" : "Revise", C_NULL, false, can_revise)
+                revise()
+            end
 
-        can_sync = client.status == RemoteStatus_Connected && !client.syncing
-        @Disabled !can_sync begin
-            if ig.Button("Sync")
+            can_sync = client.status == RemoteStatus_Connected && !client.syncing
+            if ig.MenuItem("Sync", C_NULL, false, can_sync)
                 @guiasync sync_files()
             end
-            if client.syncing
-                Spinner()
-            end
-        end
 
-        if ig.BeginMenu("Tools")
+            ig.Separator()
+
             if ig.BeginMenu("Demos")
                 @c MenuItem("ImGui demo", &state[].show_imgui_demo)
                 ig.EndMenu()
@@ -259,6 +263,10 @@ function draw_main_menubar()
             end
 
             ig.EndMenu()
+        end
+
+        if client.syncing
+            Spinner()
         end
 
         # This scales all fonts, including the size pushed by the context editor
@@ -2416,11 +2424,10 @@ function draw_gui()
         end
 
         ig.EndTabBar()
-
-        draw_plots()
-
-        ig.End()
     end
+    ig.End()
+
+    draw_plots()
 
     # The Karabo source editor, opened by any inline KaraboDepText widget. Drawn
     # here at the top level so it escapes the node canvas and works from any tab.
