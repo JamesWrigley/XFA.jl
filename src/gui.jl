@@ -2449,6 +2449,17 @@ function draw_gui()
         end
     end
 
+    # If the main window is split off from an emptied central node, the
+    # passthrough node leaves a hole in the viewport, so move it back in. This
+    # runs after all windows are drawn so the central node's contents are known.
+    central_node = ig.DockBuilderGetCentralNode(central_dock_id)
+    main_node = unsafe_load(ig.FindWindowByName("Main window").DockNode)
+    if main_node != C_NULL && main_node != central_node && unsafe_load(central_node.Windows).Size == 0
+        if unsafe_load(ig.DockNodeGetRootNode(main_node).ID) == central_dock_id
+            ig.DockBuilderDockWindow("Main window", unsafe_load(central_node.ID))
+        end
+    end
+
     # Save layout when ImGui signals changes
     io = ig.GetIO()
     if unsafe_load(io.WantSaveIniSettings) && !isempty(state[].client.plots)
