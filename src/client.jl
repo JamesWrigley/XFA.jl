@@ -1191,6 +1191,7 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.source = msg.source
             client.context.input_topics = msg.info["input_topics"]
             client.context.variable_postprocessors = msg.info["postprocessors"]
+
             saveable_outputs = Set{String}(keys(msg.info["dag"]))
             for subvariables in values(msg.info["subvariables"])
                 union!(saveable_outputs, subvariables)
@@ -1198,11 +1199,20 @@ function handle_msg(state, msg, replied_to::Union{PendingRequest, Nothing}=nothi
             client.context.saveable_outputs = saveable_outputs
             set_damnit_variables!(client.context, msg.info["damnit_entries"], msg.info["saved_outputs"])
             client.context_path = msg.info["path"]
+            client.context.context_path = msg.info["path"]
+
+            # Show the pipeline of an engine we connected to with a context loaded
+            if !isnothing(replied_to) && replied_to.msg_type == GetContextInfo
+                state.select_tab = MainTab_Pipeline
+            end
+
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_data)
             filter!(kv -> haskey(client.context.context_state, kv.first), client.variable_logs)
+
             # The new context has its own inputs, so the sources we complete
             # against have changed.
             get_input_sources(client)
+
             # A newly loaded context may pull in packages that register more
             # variables, so refresh the add-variable palette.
             get_available_variables(client)
