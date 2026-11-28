@@ -181,6 +181,10 @@ end
             Protocol.client_send(ws, Protocol.Ping())
             @test Protocol.receive(ws).msg isa Protocol.Pong
 
+            # No context is loaded yet
+            Protocol.client_send(ws, Protocol.GetContextInfo())
+            @test Protocol.receive(ws).msg isa Protocol.Ack
+
             # Test GetInputSources
             Protocol.client_send(ws, Protocol.GetInputSources())
             @test Protocol.receive(ws).msg isa Protocol.InputSources
@@ -232,6 +236,11 @@ end
                 @test msg isa Protocol.ContextInfo
                 @test msg.info isa Dict
                 @test haskey(msg.info["dag"], "x")
+
+                Protocol.client_send(ws, Protocol.GetContextInfo())
+                msg = Protocol.receive(ws).msg
+                @test msg isa Protocol.ContextInfo
+                @test msg.info["path"] == path
 
                 # Changes to the loaded file are broadcast. The watcher only picks up
                 # a newly loaded path when its 1s watch_file() timeout expires.

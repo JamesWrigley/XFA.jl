@@ -1365,6 +1365,7 @@ function handle_server(state)
                 get_routing_rules(client)
                 send(client, GetRemapRules())
                 send(client, GetDamnitEnabled())
+                send(client, GetContextInfo())
 
                 for msg_bytes in ws
                     buffer = IOBuffer(msg_bytes)

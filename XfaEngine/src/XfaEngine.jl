@@ -458,6 +458,13 @@ function handle_message(msg::AbstractMessage, state::EngineState, id, request_id
     elseif msg isa GetRemapRules
         Protocol.server_send(ws, RemapRules(state.remap_rules); reply_to)
 
+    elseif msg isa GetContextInfo
+        if isempty(state.ctx.path)
+            Protocol.server_send(ws, Ack(); reply_to)
+        else
+            Protocol.server_send(ws, ContextInfo(state.ctx, read(state.ctx.path, String)); reply_to)
+        end
+
     elseif msg isa SetRoutingRules
         state.routing_rules = msg.rules
         write_settings(; routing_rules=msg.rules)
@@ -685,11 +692,6 @@ function handle_client(state::EngineState, id)
     WebSockets.send(ws, id)
     @info "Connected to new client: $(id) 🙋"
 
-    # If a context is already loaded, send it to the new client
-    if !isempty(state.ctx.path)
-        Protocol.server_send(ws, ContextInfo(state.ctx, read(state.ctx.path, String)))
-    end
-
     try
         for msg_bytes in ws
             buffer = IOBuffer(msg_bytes)
@@ -849,7 +851,7 @@ precompile(Context.get_sources, (KaraboInput,))
                                 maxframesize=Protocol.MAX_FRAME_SIZE) do ws
                     WebSockets.receive(ws)
                     for msg in (GetPackageDirs(), GetInputSources(), GetVariables(), GetDevices(),
-                                GetRoutingRules(), GetRemapRules(), GetDamnitEnabled())
+                                GetRoutingRules(), GetRemapRules(), GetDamnitEnabled(), GetContextInfo())
                         Protocol.client_send(ws, msg)
                         Protocol.receive(ws)
                     end

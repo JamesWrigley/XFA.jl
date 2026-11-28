@@ -7,7 +7,7 @@ export AbstractMessage, Ping, Shutdown,
     GetPackageDirs, PackageDirs,
     GetVariables, AvailableVariables,
     GetRoutingRules, SetRoutingRules, RoutingRules,
-    GetRemapRules, RemapRules,
+    GetRemapRules, RemapRules, GetContextInfo,
     SetVariableSubscriptions,
     ChangeParameter, InvokeCallback, Start, Stop,
     SetDebugMode, GetDamnitEnabled, SetDamnitEnabled, DamnitEnabled,
@@ -79,6 +79,9 @@ end
 struct GetRoutingRules <: AbstractMessage end
 
 struct GetRemapRules <: AbstractMessage end
+
+# Replied to with a ContextInfo, or an Ack if no context is loaded
+struct GetContextInfo <: AbstractMessage end
 
 struct SetRoutingRules <: AbstractMessage
     rules::Vector{RoutingRule}
